@@ -43,6 +43,9 @@ htmlcov/
 .coverage
 .coverage.*
 .cache
+.cursor/
+.idea/
+outputs/
 nosetests.xml
 coverage.xml
 *.cover
@@ -69,7 +72,7 @@ instance/
 .scrapy
 
 # Sphinx documentation
-docs/_build/
+markdowns/_build/
 
 # PyBuilder
 .pybuilder/
@@ -193,6 +196,7 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+.DS_Store
 
 # Cursor
 #  Cursor is an AI-powered code editor. `.cursorignore` specifies files/directories to
@@ -205,3 +209,5 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+/resources/
+markdowns/

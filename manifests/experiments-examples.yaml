@@ -1,0 +1,636 @@
+# ==============================================================================
+# EXPERIMENT CONFIGURATION EXAMPLES
+# ==============================================================================
+# This is an example template that demonstrates how to configure experiments.
+# When you run 'experiment-launcher init', this file is copied to experiments.yaml
+# in your working directory for you to customize.
+#
+# Experiments defined here will be launched as Kubernetes jobs using template.yaml
+# as a base. The experiment launcher will:
+# 1. Load your experiments.yaml configuration
+# 2. Use template.yaml as the Kubernetes job template
+# 3. Override template values with experiment-specific settings
+# 4. Generate unique job names with timestamps
+#
+# PARAMETER GRIDS:
+# Use the 'grid' key to automatically generate multiple experiments:
+#   grid:
+#     learning_rate: [0.001, 0.01, 0.1]
+#     batch_size: [16, 32, 64]
+# This creates 9 experiments (3x3) with all combinations
+#
+# USAGE:
+# experiment-launcher experiments.yaml --template template.yaml [experiment_name]
+# ==============================================================================
+
+# Global configuration (applied to all experiments unless overridden)
+config:
+  image: "nvcr.io/nvidia/pytorch:25.02-py3"
+
+  # REQUIRED: AWS cost tracking labels (automatically added to all jobs)
+  team: "nlp"      # Options: "nlp" or "vision" (REQUIRED for cost allocation)
+  project: "your-project-name"  # Your project identifier (REQUIRED for cost tracking)
+
+  capacityType: "on-demand"  # Options: "on-demand", "spot", "reserved" (default: on-demand)
+  nodeSelector:
+    node.kubernetes.io/instance-type: "g5.4xlarge"
+  # Configuration is automatically loaded from:
+  # 1. Home directory: ~/.rs-ai-training/credentials (recommended)
+  # 2. Local project: .env file in current directory (fallback)
+  # Includes: AWS_PROFILE, CLEARML_API_ACCESS_KEY, CLEARML_API_SECRET_KEY
+  # Run 'experiment-launcher init' to configure
+
+  # Package cache configuration (optional)
+  # EmptyDir volume for pip cache and temp files (enabled by default at 50Gi)
+  # Prevents pod evictions when installing large Python packages
+  # Increase size if installing very large packages or multiple ML frameworks
+  # packageCache:
+  #   size: 100Gi  # Override default 50Gi
+
+  # Custom environment variables (optional)
+  # The following are set by default (all user work goes to /workspace volume):
+  #   HOME: /workspace
+  #   PIP_CACHE_DIR: /workspace/.cache/pip
+  #   TMPDIR: /workspace/tmp
+  # You can override them or add more:
+  # env:
+  #   MY_CUSTOM_VAR: "value"
+  #   ANOTHER_VAR: "another_value"
+
+  # Slack notifications (optional) - Get notified when your jobs start running
+  # IMPORTANT: Join #ml-job-alerts to receive notifications: https://riversidefm.slack.com/archives/C09NZQ9L5B2
+  # The webhook URL is pre-configured for the team - you only need to set your user_id below
+  slack:
+    enabled: false  # Set to true to enable Slack notifications
+    user_id: "U123456789"  # Your Slack user ID for @mentions (find at: Slack Profile → ... → Copy member ID)
+
+  # S3 Access (optional) - Enable S3 bucket access via IRSA service account
+  # Uses IAM Roles for Service Accounts (IRSA) to grant S3 access without static credentials
+  # s3Access:
+  #  enabled: true  # Set to true to enable S3 access for all experiments
+
+  # EBS volumes (optional) - Fast local storage with two modes:
+  # 1. Ephemeral (default): Auto-cleanup after job completes (each job gets dedicated volume)
+  # 2. Persistent: Reusable storage that survives across jobs (shared cache, requires manual cleanup)
+  # Note: Only gp3-ebs-sc storage class is supported on the cluster
+  ebs:
+    enabled: false        # Set to true to enable EBS for all experiments
+    persistent: false     # false = ephemeral (default), true = persistent
+    size: 100Gi          # Volume size (default: 100Gi) - can override per-experiment
+    mountPath: /workspace  # Mount path (default: /workspace)
+    # volumeName: nlp-project-training-cache  # REQUIRED for persistent mode
+    #                                         # Use descriptive, project-specific names!
+    #                                         # Same volumeName = reuse the same storage across jobs
+    #                                # Different volumeName = create a new volume
+    # volumeId: vol-xxx  # Optional: bind to existing AWS EBS volume by ID
+    #                    # To create new volume: rs-ai-training create-pvc-from-ebs \
+    #                    #   --create-volume --pvc-name my-training-cache --size 100Gi
+
+# ==============================================================================
+# DATA PREPARATION EXPERIMENTS
+# ==============================================================================
+experiments:
+  - name: "data-preprocessing"
+    category: "data-prep"
+    description: "Process raw data into training format"
+    cmd: "bash"
+    args:
+      - "-c"
+      - |
+        echo "Starting data preprocessing pipeline...";
+        python preprocess.py --input /data/raw --output /data/processed;
+        echo "Data preprocessing completed";
+        ls -la /data/processed;
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "256Mi"
+      limits:
+        cpu: "500m"
+        memory: "1Gi"
+
+# ==============================================================================
+# TRAINING EXPERIMENTS
+# ==============================================================================
+  - name: "lightweight-training"
+    category: "training"
+    description: "Quick training run for testing"
+    cmd: "python"
+    args: ["train.py", "--lr", "0.001", "--epochs", "5", "--batch-size", "16"]
+    resources:
+      requests:
+        cpu: "50m"
+        memory: "128Mi"
+      limits:
+        cpu: "200m"
+        memory: "512Mi"
+
+  - name: "intensive-training"
+    category: "training"
+    description: "Full training with more resources"
+    cmd: "python"
+    args: ["train.py", "--lr", "0.01", "--epochs", "20", "--batch-size", "64"]
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "256Mi"
+      limits:
+        cpu: "500m"
+        memory: "1Gi"
+
+  # PARAMETER GRID EXAMPLE - This will create multiple experiments
+  - name: "hyperparameter-sweep"
+    category: "training"
+    description: "Automated hyperparameter search using parameter grids"
+    cmd: "python"
+    args: ["train.py", "--lr", "{learning_rate}", "--batch-size", "{batch_size}", "--epochs", "10"]
+    grid:
+      learning_rate: [0.001, 0.01, 0.1]
+      batch_size: [16, 32, 64]
+    # NEW: Proportional GPU allocation - request 1 GPU, get proportional CPU/RAM
+    gpus: 1  # Resources auto-calculated: 1/8 of g5.48xlarge = 21.6 CPU, 86Gi RAM
+    # Resources are automatically calculated based on GPU count - no need to specify!
+    # If you need the old behavior (full instance), just omit 'gpus' field
+
+  # MULTI-GPU TRAINING EXAMPLE - Request multiple GPUs with proportional resources
+  - name: "multi-gpu-training"
+    category: "training"
+    description: "Distributed training across 4 GPUs with proportional resources"
+    cmd: "python"
+    args: ["train.py", "--distributed", "--world-size", "4"]
+    nodeSelector:
+      node.kubernetes.io/instance-type: "g5.48xlarge"  # 8-GPU machine
+    gpus: 4  # Request 4 GPUs → get 4/8 of resources = 86.4 CPU, 345.6Gi RAM
+    # Resources automatically calculated - allows 2 users to share the same 8-GPU node!
+
+  # CUSTOM CPU ALLOCATION - Request specific CPU amount
+  - name: "cpu-intensive-training"
+    category: "training"
+    description: "Training that needs extra CPU (e.g., heavy data preprocessing)"
+    cmd: "python"
+    args: ["train.py", "--workers", "32"]
+    nodeSelector:
+      node.kubernetes.io/instance-type: "g5.48xlarge"
+    gpus: 1
+    cpu: "50"  # Request 50 CPU cores (default would be 21.6)
+    # Memory stays at proportional default (86Gi)
+
+  # CUSTOM MEMORY ALLOCATION - Request specific RAM amount
+  - name: "memory-intensive-training"
+    category: "training"
+    description: "Training with large batch sizes requiring extra memory"
+    cmd: "python"
+    args: ["train.py", "--batch-size", "512"]
+    nodeSelector:
+      node.kubernetes.io/instance-type: "g5.48xlarge"
+    gpus: 1
+    memory: "200Gi"  # Request 200Gi RAM (default would be 86Gi)
+    # CPU stays at proportional default (21.6)
+
+  # CUSTOM CPU AND MEMORY - Request both
+  - name: "resource-intensive-training"
+    category: "training"
+    description: "Training requiring both extra CPU and RAM"
+    cmd: "python"
+    args: ["train.py", "--batch-size", "512", "--workers", "32"]
+    nodeSelector:
+      node.kubernetes.io/instance-type: "g5.48xlarge"
+    gpus: 1
+    cpu: "50"      # Custom CPU allocation
+    memory: "200Gi"  # Custom memory allocation
+
+  # SPOT INSTANCE EXAMPLE - Cost-effective training with spot instances
+  - name: "spot-training"
+    category: "training"
+    description: "Cost-effective training using spot instances (may be interrupted)"
+    cmd: "python"
+    args: ["train.py", "--lr", "0.01", "--epochs", "50", "--batch-size", "32", "--checkpoint-freq", "5"]
+    capacityType: "spot"  # Override global config to use spot instances
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "512Mi"
+        nvidia.com/gpu: "1"
+      limits:
+        cpu: "1"
+        memory: "2Gi"
+        nvidia.com/gpu: "1"
+
+  # CPU-ONLY EXAMPLE - Using CPU instances (x86 or ARM)
+  - name: "cpu-training"
+    category: "training"
+    description: "CPU-only training on latest generation CPU instances"
+    cmd: "python"
+    args: ["train.py", "--lr", "0.01", "--epochs", "10", "--batch-size", "32"]
+    # Simply specify the CPU instance type - node pool and tolerations are auto-configured!
+    nodeSelector:
+      node.kubernetes.io/instance-type: "c7i.xlarge"  # or "m7i.2xlarge", "r7i.large", "c7g.xlarge" (ARM)
+    # Resources are auto-configured to 90% of instance capacity
+    # You can override if needed:
+    # resources:
+    #   requests:
+    #     cpu: "100m"
+    #     memory: "256Mi"
+
+  # MULTIPLE INSTANCE TYPES - Use whatever is available first
+  - name: "flexible-cpu-training"
+    category: "training"
+    description: "CPU training with fallback instance types for better availability"
+    cmd: "python"
+    args: ["train.py", "--lr", "0.01", "--epochs", "10"]
+    # Specify multiple instance types - Karpenter will provision whichever is available first
+    # This is useful when a specific instance type has capacity issues
+    instanceTypes: ["m7i.48xlarge", "m6i.48xlarge", "c6i.32xlarge"]
+    # All instance types should be the same category (GPU or CPU)
+    # Resources are auto-configured based on the first instance type in the list
+
+  # EPHEMERAL EBS + S3 ACCESS EXAMPLE - Fast local storage with S3 access
+  - name: "training-with-ebs"
+    category: "training"
+    description: "Training with fast ephemeral EBS storage and S3 access"
+    cmd: "python"
+    args: ["train.py", "--data-dir", "/workspace/data", "--checkpoint-dir", "/workspace/checkpoints"]
+    # Enable S3 access (uses IRSA - no credentials needed)
+    s3Access:
+      enabled: true
+    # Enable ephemeral EBS for this experiment (overrides global config)
+    ebs:
+      enabled: false
+      persistent: false  # Ephemeral mode (default) - auto-cleanup after job completes
+      size: 200Gi  # Larger volume for this specific experiment
+      mountPath: /workspace
+    # This experiment will have:
+    # - /efs (shared EFS across all jobs) - for input datasets, final model outputs
+    # - /workspace (dedicated 200Gi EBS for this job only) - for fast local I/O, checkpoints
+    # - EBS volume automatically deleted when job completes
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "512Mi"
+        nvidia.com/gpu: "1"
+
+  - name: "training-with-persistent-cache"
+    category: "training"
+    description: "Training with persistent EBS cache that survives across job runs"
+    cmd: "python"
+    args: ["train.py", "--cache-dir", "/workspace/cache"]
+    # Enable persistent EBS - creates reusable PVC
+    ebs:
+      enabled: false
+      persistent: true   # Persistent mode - PVC survives across jobs
+      size: 150Gi       # Volume size
+      mountPath: /workspace
+      volumeName: nlp-model-weights-cache  # Use descriptive names!
+    # This experiment will have:
+    # - /efs (shared EFS) - for datasets and final outputs
+    # - /workspace (persistent 150Gi EBS PVC) - reusable cache across multiple job runs
+    # - PVC persists after job completes (manual cleanup with: kubectl delete pvc model-cache -n <namespace>)
+    # - Multiple jobs can use the same PVC (one at a time, ReadWriteOnce)
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "512Mi"
+        nvidia.com/gpu: "1"
+
+  - name: "spot-training-with-persistent-ebs"
+    category: "training"
+    description: "Cost-effective spot training with persistent EBS cache (user-managed cleanup)"
+    cmd: "python"
+    args: ["train.py", "--cache-dir", "/workspace/cache", "--checkpoint-freq", "5"]
+    capacityType: "spot"  # Use spot instances for cost savings
+    # Enable persistent EBS with spot instances
+    ebs:
+      enabled: false
+      persistent: true   # Persistent mode - you must manually delete the PVC
+      volumeName: vision-spot-training-cache  # REQUIRED - use descriptive names!
+      size: 200Gi       # Volume size
+      mountPath: /workspace
+      # NOTE: PVCs are created in the same namespace as your job
+    # ⚠️ IMPORTANT: With persistent EBS, YOU are responsible for cleanup!
+    # Cleanup command: kubectl delete pvc <volumeName> -n <namespace>
+    # This experiment will have:
+    # - /efs (shared EFS) - for datasets and final outputs
+    # - /workspace (persistent 200Gi EBS PVC) - fast cache that survives spot interruptions
+    # - WARNING: EBS charges continue until YOU manually delete the PVC
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "512Mi"
+        nvidia.com/gpu: "1"
+
+
+# ==============================================================================
+# EVALUATION EXPERIMENTS  
+# ==============================================================================
+  - name: "model-evaluation"
+    category: "evaluation"
+    description: "Evaluate trained model performance"
+    cmd: "python"
+    args: ["evaluate.py", "--model-path", "/data/laugh_detection/1/model.pt", "--test-data", "/data/test_set"]
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "512Mi"
+      limits:
+        cpu: "1"
+        memory: "2Gi"
+
+# ==============================================================================
+# UTILITY EXPERIMENTS
+# ==============================================================================
+  - name: "model-upload-prep"
+    category: "utility"
+    description: "Prepare container for manual model uploads"
+    cmd: "/bin/bash"
+    args:
+      - "-c"
+      - |
+        echo "[model-upload] Python container started";
+        echo "[model-upload] Installing required packages...";
+        pip install requests boto3 awscli;
+        echo "[model-upload] Current directory contents:";
+        ls -la /data;
+        echo "[model-upload] Creating model directory structure...";
+        mkdir -p /data/laugh_detection/1;
+        echo "[model-upload] Container ready for model upload";
+        echo "[model-upload] You can now kubectl exec into this pod to upload models";
+        echo "[model-upload] Pod will sleep for 2 hours to allow model upload";
+        sleep 7200;
+
+# ==============================================================================
+# GPU RESOURCE ALLOCATION - NEW PROPORTIONAL SYSTEM
+# ==============================================================================
+# The system now supports TWO modes for GPU resource allocation:
+#
+# MODE 1: PROPORTIONAL ALLOCATION (Recommended for multi-GPU instances)
+# -----------------------------------------------------------------------
+# Specify the 'gpus' field to request a specific number of GPUs.
+# CPU and RAM are automatically calculated proportionally to GPU count.
+#
+# Example: g5.48xlarge (8 GPUs, 192 CPU, 768Gi RAM)
+#   gpus: 1 → 21.6 CPU, 86Gi RAM   (allows 8 users to share the node!)
+#   gpus: 2 → 43.2 CPU, 173Gi RAM  (allows 4 users to share the node!)
+#   gpus: 4 → 86.4 CPU, 345Gi RAM  (allows 2 users to share the node!)
+#   gpus: 8 → 172.8 CPU, 691Gi RAM (full node, 1 user)
+#
+# Example configuration:
+#   nodeSelector:
+#     node.kubernetes.io/instance-type: "g5.48xlarge"
+#   gpus: 1  # Request 1 GPU with proportional CPU/RAM
+#
+# MODE 2: FULL INSTANCE (Legacy/backward compatible)
+# ---------------------------------------------------
+# Omit the 'gpus' field to use the old behavior: request full instance resources.
+# This prevents other users from sharing the node.
+#
+# Example configuration:
+#   nodeSelector:
+#     node.kubernetes.io/instance-type: "g5.4xlarge"
+#   # No 'gpus' field → gets all resources (15.3 CPU, 60Gi RAM, 1 GPU)
+#
+# CUSTOM RESOURCE OVERRIDES
+# --------------------------
+# Use cpu and memory fields to directly specify resource amounts:
+#
+#   gpus: 1
+#   cpu: "50"       # Request 50 CPU cores (overrides proportional)
+#   memory: "200Gi" # Request 200Gi RAM (overrides proportional)
+#
+# Example: g5.48xlarge with 1 GPU and cpu: "50"
+#   → 50 CPU (instead of proportional 21.6), 86Gi RAM, 1 GPU
+#
+# WHEN TO USE WHICH MODE?
+# -----------------------
+# Use PROPORTIONAL (gpus: N):
+#   ✓ Multi-GPU instances (g5.12xlarge, g5.48xlarge, p4d.24xlarge, etc.)
+#   ✓ When you want efficient resource sharing
+#   ✓ When you only need 1-2 GPUs from an 8-GPU machine
+#   ✓ Cost optimization (multiple users share expensive nodes)
+#
+# Use FULL INSTANCE (no gpus field):
+#   ✓ Single-GPU instances (g5.xlarge, g5.4xlarge, etc.)
+#   ✓ When you need all resources on the machine
+#   ✓ When you're using all GPUs on the instance anyway
+#   ✓ Backward compatibility with existing configs
+#
+# ==============================================================================
+# GPU INSTANCE TYPES & FAMILIES
+# ==============================================================================
+# Configure GPU instances via nodeSelector in global config or per-experiment:
+#
+# nodeSelector:
+#   node.kubernetes.io/instance-type: "g5.4xlarge" # Specific instance type
+#
+# Note: karpenter.k8s.aws/instance-family is optional. The instance-type already
+# determines the family. Add instance-family only if you want to allow any instance
+# size within a family instead of a specific type.
+#
+# AVAILABLE GPU FAMILIES:
+#
+# G5 Family (NVIDIA A10G) - Recommended for most ML workloads
+#   Instance Type    | GPUs | GPU Memory | vCPUs | RAM   | Use Case
+#   -----------------|------|------------|-------|-------|-------------------------
+#   g5.xlarge        | 1    | 24 GB      | 4     | 16GB  | Small training/inference
+#   g5.2xlarge       | 1    | 24 GB      | 8     | 32GB  | Medium training
+#   g5.4xlarge       | 1    | 24 GB      | 16    | 64GB  | Standard training (default)
+#   g5.8xlarge       | 1    | 24 GB      | 32    | 128GB | Large single-GPU training
+#   g5.12xlarge      | 4    | 96 GB      | 48    | 192GB | Multi-GPU training
+#   g5.16xlarge      | 1    | 24 GB      | 64    | 256GB | Very large single-GPU
+#   g5.24xlarge      | 4    | 96 GB      | 96    | 384GB | Large multi-GPU training
+#   g5.48xlarge      | 8    | 192 GB     | 192   | 768GB | Distributed training
+#
+# G6 Family (NVIDIA L4) - Cost-effective for inference & light training
+#   g6.xlarge        | 1    | 24 GB      | 4     | 16GB  | Inference & light training
+#   g6.2xlarge       | 1    | 24 GB      | 8     | 32GB  | Cost-effective training
+#   g6.4xlarge       | 1    | 24 GB      | 16    | 64GB  | Medium workloads
+#   g6.8xlarge       | 1    | 24 GB      | 32    | 128GB | Large workloads
+#   g6.12xlarge      | 4    | 96 GB      | 48    | 192GB | Multi-GPU workloads
+#   g6.16xlarge      | 1    | 24 GB      | 64    | 256GB | Very large workloads
+#   g6.24xlarge      | 4    | 96 GB      | 96    | 384GB | Distributed workloads
+#   g6.48xlarge      | 8    | 192 GB     | 192   | 768GB | Large-scale distributed
+#
+# G6e Family (NVIDIA L40S) - High-performance for training & inference
+#   g6e.xlarge       | 1    | 48 GB      | 4     | 32GB  | High-memory inference
+#   g6e.2xlarge      | 1    | 48 GB      | 8     | 64GB  | Medium training
+#   g6e.4xlarge      | 1    | 48 GB      | 16    | 128GB | Standard training
+#   g6e.8xlarge      | 1    | 48 GB      | 32    | 256GB | Large training
+#   g6e.12xlarge     | 4    | 192 GB     | 48    | 384GB | Multi-GPU training
+#   g6e.16xlarge     | 1    | 48 GB      | 64    | 512GB | Very large training
+#   g6e.24xlarge     | 4    | 192 GB     | 96    | 768GB | Large distributed
+#   g6e.48xlarge     | 8    | 384 GB     | 192   | 1536GB| Enterprise-scale training
+#
+# P4d Family (NVIDIA A100) - Premium performance for large-scale training
+#   p4d.24xlarge     | 8    | 320 GB     | 96    | 1152GB| Large-scale distributed training
+#
+# P5 Family (NVIDIA H100) - Cutting-edge for frontier AI research
+#   p5.4xlarge       | 1    | 80 GB      | 16    | 256GB | Premium single-GPU H100
+#   p5.48xlarge      | 8    | 640 GB     | 192   | 2048GB| State-of-the-art training
+#
+# SELECTING THE RIGHT GPU:
+# - Development/Testing:     g5.xlarge or g6.xlarge
+# - Standard Training:       g5.4xlarge (default, best balance)
+# - Cost-Optimized:          g6.2xlarge or g6.4xlarge
+# - High GPU Memory:         g6e.4xlarge or g6e.8xlarge
+# - Premium Single-GPU:      p5.4xlarge (H100, 80GB GPU memory)
+# - Multi-GPU Training:      g5.12xlarge or g6e.12xlarge
+# - Large-Scale Distributed: p4d.24xlarge or p5.48xlarge
+#
+# EXAMPLE CONFIGURATION:
+#   nodeSelector:
+#     node.kubernetes.io/instance-type: "g6e.4xlarge"
+#   resources:
+#     requests:
+#       nvidia.com/gpu: "1"
+#
+# ==============================================================================
+# CPU INSTANCES & NODE POOL AUTO-CONFIGURATION
+# ==============================================================================
+# The experiment launcher automatically detects GPU vs CPU instances and
+# configures the correct node pool (karpenter label) and tolerations.
+#
+# FOR CPU-ONLY JOBS:
+#   Simply specify a CPU instance type - everything else is auto-configured!
+#
+#   Example:
+#     nodeSelector:
+#       node.kubernetes.io/instance-type: "c7i.xlarge"
+#
+#   Auto-configured:
+#     - karpenter: ai-workers-cpu (node pool label)
+#     - tolerations for CPU node pool
+#     - resources at 90% of instance capacity
+#
+# FOR GPU JOBS:
+#   Specify a GPU instance type - GPU node pool auto-configured!
+#
+#   Example:
+#     nodeSelector:
+#       node.kubernetes.io/instance-type: "g5.4xlarge"
+#
+#   Auto-configured:
+#     - karpenter: ai-workers-gpu (node pool label)
+#     - tolerations for GPU node pool (including nvidia.com/gpu)
+#     - resources at 90% of instance capacity
+#
+# CPU INSTANCE FAMILIES:
+#   Supported families: c6a, c6i, c7a, c7i, c7g, m6a, m6i, m7a, m7i, r6i, r7i
+#
+#   - c6a, c6i, c7a, c7i series: Compute-optimized (x86)
+#     * .large:    2 CPU,  4Gi memory
+#     * .xlarge:   4 CPU,  8Gi memory
+#     * .2xlarge:  8 CPU, 16Gi memory
+#     * .4xlarge: 16 CPU, 32Gi memory
+#
+#   - m6a, m6i, m7a, m7i series: General-purpose (x86)
+#     * .large:    2 CPU,  8Gi memory
+#     * .xlarge:   4 CPU, 16Gi memory
+#     * .2xlarge:  8 CPU, 32Gi memory
+#     * .4xlarge: 16 CPU, 64Gi memory
+#
+#   - r6i, r7i series: Memory-optimized (x86)
+#     * .large:    2 CPU, 16Gi memory
+#     * .xlarge:   4 CPU, 32Gi memory
+#     * .2xlarge:  8 CPU, 64Gi memory
+#
+#   - c7g series: ARM-based Graviton3 (best price/performance)
+#     * .large:    2 CPU,  4Gi memory
+#     * .xlarge:   4 CPU,  8Gi memory
+#     * .2xlarge:  8 CPU, 16Gi memory
+#
+# ADVANCED: Manual Override
+#   If you need custom tolerations, you can override auto-detection:
+#     tolerations:
+#       - key: "custom-key"
+#         operator: "Equal"
+#         value: "custom-value"
+#
+# ==============================================================================
+# RESOURCE SIZING GUIDELINES
+# ==============================================================================
+# CPU:
+#   - "50m"  = 0.05 CPU (very light tasks)
+#   - "100m" = 0.1 CPU  (light tasks)
+#   - "500m" = 0.5 CPU  (medium tasks)
+#   - "1"    = 1 CPU    (heavy tasks)
+#
+# Memory:
+#   - "128Mi" = 128 MB (very light)
+#   - "256Mi" = 256 MB (light)
+#   - "512Mi" = 512 MB (medium)
+#   - "1Gi"   = 1 GB   (heavy)
+#   - "2Gi"   = 2 GB   (very heavy)
+#
+# GPU (if needed):
+#   - nvidia.com/gpu: "1" (request 1 GPU)
+#   - nvidia.com/gpu: "4" (request 4 GPUs for multi-GPU training)
+#   - nvidia.com/gpu: "8" (request 8 GPUs for distributed training)
+#
+# CAPACITY TYPES (Karpenter):
+#   - "on-demand" (default): Guaranteed instances with standard pricing
+#   - "spot": Cost-effective but can be interrupted (up to 90% cost savings)
+#   - "reserved": Use reserved instance capacity (pre-purchased commitments)
+#
+# CAPACITY TYPE USAGE:
+#   - Global default: Set config.capacityType in this file
+#   - Per-experiment override: Set capacityType in individual experiments
+#   - Spot instances are ideal for:
+#     * Fault-tolerant workloads that can handle interruption
+#     * Training jobs with frequent checkpointing
+#     * Batch processing tasks
+#     * Cost-sensitive workloads
+#   - On-demand instances are ideal for:
+#     * Critical production workloads
+#     * Time-sensitive experiments
+#     * Jobs that cannot be easily restarted
+#   - Reserved instances are ideal for:
+#     * Predictable, long-running workloads
+#     * Cost optimization with pre-purchased capacity
+#     * Guaranteed availability for specific instance types
+#
+# SHARED MEMORY CONFIGURATION:
+#   - Default: 8Gi shared memory volume mounted at /dev/shm (configured in template.yaml)
+#   - Good for PyTorch DataLoader with multiple workers and most ML workloads
+#   - To customize: Copy template.yaml locally and modify the shm volume sizeLimit:
+#     * 2Gi for lightweight training with small datasets
+#     * 8Gi (default) for most ML workloads
+#     * 16Gi for large batch processing or extensive data loading
+#     * 32Gi for very large-scale training requiring significant shared memory
+#   - Then use: experiment-launcher experiments.yaml --template template.yaml
+#   - Note: Shared memory size should not exceed container memory limits
+#
+# EXPOSED PORTS CONFIGURATION:
+#   - Use expose_ports to make container ports accessible for debugging and development
+#   - Ports are declared in the pod spec and accessible via kubectl port-forward
+#   - Example usage:
+#     expose_ports: [22, 8888]  # SSH and Jupyter
+#   - Common use cases:
+#     * Port 22: SSH access for remote development and IDE SSH interpreters
+#     * Port 8888: Jupyter notebook server
+#     * Port 6006: TensorBoard
+#     * Port 8000: HTTP servers for debugging
+#   - Access ports via kubectl:
+#     kubectl port-forward <pod-name> 22:22 8888:8888 -n <namespace>
+#   - Then connect to localhost:22 (SSH) or localhost:8888 (Jupyter)
+# ==============================================================================
+# AWS COST TRACKING LABELS
+# ==============================================================================
+# The experiment launcher automatically adds the following labels to all jobs:
+#   - owner: Your AWS IAM username (extracted from 'aws sts get-caller-identity')
+#   - team: The team value from config.team (REQUIRED: must be "nlp" or "vision")
+#   - project: The project value from config.project (REQUIRED: your project name)
+#
+# These labels enable AWS Cost Explorer to break down EKS costs by:
+#   - User/owner (track individual spending)
+#   - Team (nlp vs vision team spending)
+#   - Project (allocate costs to specific projects)
+#
+# REQUIREMENTS:
+#   - config.team and config.project MUST be specified in the config section above
+#   - config.team must be one of: "nlp", "vision"
+#   - Jobs will not launch if these fields are missing or invalid
+#
+# USAGE IN AWS COST EXPLORER:
+#   - Filter costs by: kubernetes.io/label/owner=<username>
+#   - Filter costs by: kubernetes.io/label/team=nlp
+#   - Filter costs by: kubernetes.io/label/project=<project-name>
+# ==============================================================================

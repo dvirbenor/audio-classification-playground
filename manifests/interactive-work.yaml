@@ -1,0 +1,101 @@
+# ==============================================================================
+# SIMPLE EXPERIMENT CONFIGURATION - For Interactive Development
+# ==============================================================================
+# Minimal configuration for quick interactive work and development.
+#
+# Quick start:
+#   1. Update team/project (namespace will be auto-generated as {team}-{project})
+#   2. (Optional) Enable Slack notifications
+#   3. Launch: experiment-launcher launch interactive-work.yaml
+# ==============================================================================
+
+# Global configuration
+config:
+  image: "690765672468.dkr.ecr.us-east-1.amazonaws.com/ml-dev-containers:a81a0e22f43c84e57f941860c8d547561b96332b"
+
+  # REQUIRED: Cost tracking labels
+  team: "nlp"                      # UPDATE THIS: "nlp" or "vision"
+  project: "development"           # UPDATE THIS: your project name
+
+  # Instance configuration
+  capacityType: "on-demand"        # Options: "on-demand", "spot", "reserved"
+  nodeSelector:
+    node.kubernetes.io/instance-type: "g5.4xlarge"  # UPDATE THIS: choose your instance type
+
+  # Custom environment variables (optional)
+  # The following are set by default (all user work goes to /workspace volume):
+  #   HOME: /workspace
+  #   PIP_CACHE_DIR: /workspace/.cache/pip
+  #   TMPDIR: /workspace/tmp
+  # You can override them or add more:
+  # env:
+  #   MY_CUSTOM_VAR: "value"
+  #   ANOTHER_VAR: "another_value"
+
+  # Slack notifications (optional) - Get notified when pod starts running
+  # Join channel: https://riversidefm.slack.com/archives/C09NZQ9L5B2
+  slack:
+    enabled: false                 # Set to true to enable notifications
+    user_id: "U123456789"          # UPDATE THIS: Your Slack user ID (Profile → ... → Copy member ID)
+
+  # S3 Access (optional) - Enable S3 bucket access via IRSA service account
+  s3Access:
+    enabled: false  # Set to true to enable S3 access
+  # EBS volumes (optional) - Fast local storage with two modes
+  # NOTE: EmptyDir volume (50Gi) is enabled by default for package cache!
+  # This prevents pod evictions without needing EBS. Only enable EBS if you need:
+  #   - Persistent cache across pod restarts (use persistent: true)
+  #   - More than 50Gi of package storage
+  #   - Dedicated isolated storage
+  ebs:
+    enabled: false                # Default: false (emptyDir is sufficient for most cases)
+    persistent: false              # false = ephemeral (auto-cleanup), true = persistent PVC
+    size: 100Gi                    # Volume size
+    mountPath: /workspace          # Mount path (default: /workspace)
+    # volumeName: my-project-cache # REQUIRED for persistent mode - use descriptive names!
+    # NOTE: PVCs are created in the same namespace as your job (auto-generated from team/project)
+    # Cleanup: kubectl delete pvc <volumeName> -n <namespace>
+
+# ==============================================================================
+# INTERACTIVE DEVELOPMENT POD
+# ==============================================================================
+experiments:
+  - name: "interactive-dev"
+    description: "Interactive development pod with long sleep for manual work"
+    cmd: "/start.sh"
+#    cmd: "bash"
+#    args:
+#      - "-c"
+#      - |
+#        echo "🚀 Interactive development pod started!";
+#        echo "To connect to this pod:";
+#        echo "  kubectl get pods -n your-namespace";
+#        echo "  kubectl exec -it <pod-name> -n your-namespace -- /bin/bash";
+#        echo "";
+#        echo "Port forwarding (for SSH interpreter and Jupyter):";
+#        echo "  kubectl port-forward <pod-name> 22:22 8888:8888 -n your-namespace";
+#        echo "";
+#        echo "Available directories:";
+#        echo "  /efs - Shared EFS storage (persistent across jobs)";
+#        echo "";
+#        sleep infinity;
+
+    # Expose ports for SSH interpreter (22) and Jupyter notebook (8888)
+    # Access via: kubectl port-forward <pod-name> 22:22 8888:8888 -n <namespace>
+    expose_ports: [22, 8888]
+
+    # EBS for fast local storage (optional, uncomment to enable)
+    # Two modes: ephemeral (auto-cleanup) or persistent (reusable cache)
+    # ebs:
+    #   enabled: true
+    #   persistent: false  # false = ephemeral, true = persistent PVC
+    #   size: 200Gi
+    #   mountPath: /workspace
+
+    # Resources auto-configured from instance type (90% capacity)
+    # g5.4xlarge: 16 vCPU, 64Gi RAM, 1 GPU A10G
+    # Storage:
+    #   /efs - Shared EFS storage (persistent across jobs)
+    #   /workspace - Ephemeral EBS (if enabled, auto-deleted when pod terminates)
+    #   S3 - Enable s3Access in config to access S3 buckets via IRSA (no credentials needed)
+
