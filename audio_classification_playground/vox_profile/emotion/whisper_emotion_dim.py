@@ -249,16 +249,16 @@ class WhisperWrapper(
                 sampling_rate=16000,
                 max_length=max_audio_len
             )
-            features = features.input_features.cuda()
+            features = features.input_features.to(x.device)
         else:
             max_audio_len = 15*16000
             features = self.feature_extractor(
-                x[0].detach().cpu(), 
+                x.detach().cpu().numpy(),
                 return_tensors="pt", 
                 sampling_rate=16000,
                 max_length=max_audio_len
             )
-            features = features.input_features.cuda()
+            features = features.input_features.to(x.device)
         
         # 2. get length and mask
         if length is not None:
@@ -267,7 +267,7 @@ class WhisperWrapper(
             self.backbone_model.encoder.embed_positions = self.backbone_model.encoder.embed_positions.from_pretrained(self.embed_positions[:750])
         else:
             # Replace positional embeddings
-            length = torch.tensor([len(x[0])])
+            length = torch.tensor([x.shape[1]] * x.shape[0])
             length = self._get_feat_extract_output_lengths(length)
             self.backbone_model.encoder.embed_positions = self.backbone_model.encoder.embed_positions.from_pretrained(self.embed_positions[:750])
             
@@ -306,7 +306,7 @@ class WhisperWrapper(
             gender_outputs = self.gender_layer(features)
             return arousal, valence, dominance, gender_outputs
         if return_feature:
-            features, arousal, valence, dominance
+            return features, arousal, valence, dominance
         return arousal, valence, dominance
         
     # From huggingface
