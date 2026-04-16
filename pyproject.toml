@@ -32,14 +32,8 @@ dependencies = [
     "transformers>=4.57.6",
 ]
 
-[tool.setuptools]
-packages = ["audio_classification_playground"]
-
-[tool.setuptools.package-data]
-audio_classification_playground = ["**/*.csv"]
-
-
 [tool.hatch.build.targets.wheel]
+packages = ["audio_classification_playground"]
 include = ["audio_classification_playground/**/*.csv"]
 
 [build-system]
