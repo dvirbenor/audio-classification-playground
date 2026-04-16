@@ -1,0 +1,29 @@
+config:
+  team: nlp
+  project: audio-understanding
+  image: 690765672468.dkr.ecr.us-east-1.amazonaws.com/ai-content-provenance:latest
+  workloadType: pod
+  capacityType: on-demand
+  nodeSelector:
+    node.kubernetes.io/instance-type: g6e.4xlarge
+  env:
+    CLEARML_API_ACCESS_KEY: ''
+    CLEARML_API_SECRET_KEY: ''
+    CLEARML_WEB_HOST: http://clearml-webserver.clearml:8080
+    CLEARML_API_HOST: http://clearml-apiserver.clearml:8008
+    CLEARML_FILES_HOST: https://clearml-fileserver.ai-dev.riverside.fm
+    RS_OWNER: dvirbenor
+  ebs:
+    enabled: true
+    size: 1000Gi
+    persistent: false
+    mountPath: /workspace
+  s3Access:
+    enabled: true
+experiments:
+- name: interactive
+  expose_ports:
+  - 22
+  - 8888
+  memory: 109Gi
+  memoryLimit: 109Gi
