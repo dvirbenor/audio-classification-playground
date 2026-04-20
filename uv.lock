@@ -375,6 +375,7 @@ source = { editable = "." }
 dependencies = [
     { name = "addict" },
     { name = "datasets" },
+    { name = "einops" },
     { name = "flair" },
     { name = "funasr" },
     { name = "huggingface-hub" },
@@ -415,6 +416,7 @@ dependencies = [
 requires-dist = [
     { name = "addict", specifier = ">=2.4.0" },
     { name = "datasets", specifier = ">=4.5.0" },
+    { name = "einops", specifier = ">=0.8.2" },
     { name = "flair", specifier = ">=0.15.1" },
     { name = "funasr", specifier = ">=1.3.1" },
     { name = "huggingface-hub", specifier = ">=0.36.1" },
@@ -1314,6 +1316,15 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/9c/ac/890a9abd8487254042a67ec9bd9f3dd64c3bd8f34c0b4015db0c4ad93890/editdistance-0.8.1-pp39-pypy39_pp73-manylinux_2_5_i686.manylinux1_i686.manylinux_2_17_i686.manylinux2014_i686.whl", hash = "sha256:7f4f19a829aff230377041acb77afec73becbebafe35b7e322be00cdb3122ddb", size = 89054, upload-time = "2024-02-10T07:44:50.736Z" },
     { url = "https://files.pythonhosted.org/packages/91/cf/3130100071e1447c5607abe050986320617e8f6157856b101f5caa25b453/editdistance-0.8.1-pp39-pypy39_pp73-manylinux_2_5_x86_64.manylinux1_x86_64.manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:b978c5927100a57791131dd2418040f4e5d33970d37b97a84c1a530ec481f557", size = 84637, upload-time = "2024-02-10T07:44:51.735Z" },
     { url = "https://files.pythonhosted.org/packages/98/c5/2ab098d1f2b7ecc1e7dfdd534be7af615732c54b46e7ca2e53a908ad457b/editdistance-0.8.1-pp39-pypy39_pp73-win_amd64.whl", hash = "sha256:0c96a8e981f385f0b7392d047c5caab8e0b24f94b71120787fd78241efc34237", size = 77383, upload-time = "2024-02-10T07:44:52.73Z" },
+]
+
+[[package]]
+name = "einops"
+version = "0.8.2"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/2c/77/850bef8d72ffb9219f0b1aac23fbc1bf7d038ee6ea666f331fa273031aa2/einops-0.8.2.tar.gz", hash = "sha256:609da665570e5e265e27283aab09e7f279ade90c4f01bcfca111f3d3e13f2827", size = 56261, upload-time = "2026-01-26T04:13:17.638Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/2a/09/f8d8f8f31e4483c10a906437b4ce31bdf3d6d417b73fe33f1a8b59e34228/einops-0.8.2-py3-none-any.whl", hash = "sha256:54058201ac7087911181bfec4af6091bb59380360f069276601256a76af08193", size = 65638, upload-time = "2026-01-26T04:13:18.546Z" },
 ]
 
 [[package]]
