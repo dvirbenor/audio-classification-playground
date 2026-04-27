@@ -14,6 +14,8 @@ dependencies = [
     "ipython>=8.18.1",
     "ipywidgets>=8.1.8",
     "jupyterlab>=4.5.3",
+    "fastapi>=0.110.0",
+    "uvicorn[standard]>=0.27.0",
     "k2>=0.3.0",
     "librosa>=0.11.0",
     "loralib>=0.1.2",
@@ -36,7 +38,10 @@ dependencies = [
 
 [tool.hatch.build.targets.wheel]
 packages = ["audio_classification_playground"]
-include = ["audio_classification_playground/**/*.csv"]
+include = [
+    "audio_classification_playground/**/*.csv",
+    "audio_classification_playground/affective_events/review/static/*",
+]
 
 [build-system]
 requires = ["hatchling"]

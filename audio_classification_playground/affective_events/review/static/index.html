@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Affective Events Review</title>
+    <link rel="stylesheet" href="/assets/style.css">
+    <script src="https://cdn.plot.ly/plotly-2.32.0.min.js" defer></script>
+</head>
+<body>
+    <header id="topbar">
+        <div id="banner">
+            <span id="recording-id" class="muted">…</span>
+            <span id="config-hash" class="muted"></span>
+            <span id="event-position" class="primary">—</span>
+            <span id="save-indicator" class="muted"></span>
+        </div>
+        <div id="filterbar">
+            <label>signal
+                <select id="filter-signal"><option value="">all</option></select>
+            </label>
+            <label>type
+                <select id="filter-type"><option value="">all</option></select>
+            </label>
+            <label>min conf
+                <input id="filter-conf" type="range" min="0" max="1" step="0.05" value="0">
+                <span id="filter-conf-display">0.00</span>
+            </label>
+            <label><input id="filter-unlabeled" type="checkbox"> unlabeled only</label>
+            <label>sort
+                <select id="sort-by">
+                    <option value="time">time</option>
+                    <option value="strength">strength</option>
+                    <option value="confidence">confidence</option>
+                </select>
+            </label>
+            <span id="filter-count" class="muted"></span>
+        </div>
+        <div id="event-meta"></div>
+    </header>
+
+    <div id="minimap" title="Click a tick to jump to that event"></div>
+
+    <main>
+        <div id="plot"></div>
+        <div id="audio-controls">
+            <audio id="audio" controls preload="metadata"></audio>
+            <div class="audio-actions">
+                <button id="play-event" title="Seek to event start and play (E)">⏵ event start</button>
+                <button id="play-context" title="Seek to context start and play">⏪ context start</button>
+                <button id="back-2s">−2s</button>
+                <button id="fwd-2s">+2s</button>
+            </div>
+        </div>
+    </main>
+
+    <aside id="labelbar">
+        <div id="verdict-group" role="radiogroup" aria-label="verdict">
+            <button data-verdict="tp" title="True positive (1)">TP</button>
+            <button data-verdict="fp" title="False positive (2)">FP</button>
+            <button data-verdict="unclear" title="Unclear (3)">?</button>
+            <button data-verdict="partial" title="Partial (4)">partial</button>
+            <button data-verdict="" title="Clear verdict (0)">clear</button>
+        </div>
+        <input id="tags" placeholder="tags (comma-separated)" autocomplete="off" list="tag-suggestions">
+        <datalist id="tag-suggestions"></datalist>
+        <textarea id="comment" placeholder="comment" rows="2"></textarea>
+        <div id="label-meta" class="muted"></div>
+    </aside>
+
+    <nav id="navbar">
+        <button id="prev" title="Previous (K)">◀ prev</button>
+        <button id="next" title="Next (J)">next ▶</button>
+        <span id="keyboard-hint" class="muted">
+            keys: J/K next/prev · 1-4 verdict · 0 clear · SPACE play/pause · E event start · ENTER save (auto)
+        </span>
+    </nav>
+
+    <script src="/assets/app.js" defer></script>
+</body>
+</html>
