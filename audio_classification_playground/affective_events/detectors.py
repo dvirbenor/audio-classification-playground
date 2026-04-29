@@ -7,9 +7,9 @@ joint merging happen in :mod:`fusion`.
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from itertools import count
-from typing import Iterable
 
 import numpy as np
 from scipy.stats import theilslopes
@@ -57,6 +57,103 @@ class SignalContext:
         if only_core and idx.size:
             idx = idx[self.core[idx]]
         return idx
+
+    def interior_frames(self, block_id: int) -> np.ndarray:
+        """Core frames whose full receptive field falls within the block."""
+        idx = self.block_frames(block_id, only_core=True)
+        if idx.size == 0:
+            return idx
+        half_win = self.signal.window_sec / 2
+        centers = self.centers[idx]
+        b = next(b for b in self.blocks if b.block_id == block_id)
+        mask = (centers - half_win >= b.start_sec) & (centers + half_win <= b.end_sec)
+        return idx[mask]
+
+
+# ---------------------------------------------------------------------------
+# Shadow model-selection diagnostics (Phase 1: compute-only, no gating)
+# ---------------------------------------------------------------------------
+
+
+def _fit_block_models(
+    ts: np.ndarray,
+    vals: np.ndarray,
+    block_start: float,
+    block_end: float,
+    edge_margin: float,
+    min_pre: float,
+    min_post: float,
+) -> dict:
+    """Fit M0/M1/M2 to a block's interior core frames and return RSS values.
+
+    Returns a dict with keys ``rss_m0``, ``rss_m1``, ``rss_m2``,
+    ``m1_split_k``, ``m1_pre_median``, ``m1_post_median``,
+    ``m2_slope``, ``m2_intercept``.
+    """
+    n = len(vals)
+    m0_med = float(np.median(vals))
+    rss_m0 = float(np.sum(np.abs(vals - m0_med)))
+
+    best_rss_m1 = float("inf")
+    best_k = -1
+    best_pre_med = m0_med
+    best_post_med = m0_med
+    for k in range(1, n):
+        t_split = ts[k]
+        if t_split - block_start < edge_margin or block_end - t_split < edge_margin:
+            continue
+        if t_split - ts[0] < min_pre or ts[-1] - t_split < min_post:
+            continue
+        pre_med = float(np.median(vals[:k]))
+        post_med = float(np.median(vals[k:]))
+        rss = float(
+            np.sum(np.abs(vals[:k] - pre_med))
+            + np.sum(np.abs(vals[k:] - post_med))
+        )
+        if rss < best_rss_m1:
+            best_rss_m1 = rss
+            best_k = k
+            best_pre_med = pre_med
+            best_post_med = post_med
+    if best_k < 0:
+        best_rss_m1 = rss_m0
+
+    slope = intercept = 0.0
+    if n >= 2:
+        slope, intercept, *_ = theilslopes(vals, ts)
+        fitted = intercept + slope * ts
+        rss_m2 = float(np.sum(np.abs(vals - fitted)))
+    else:
+        rss_m2 = rss_m0
+
+    return {
+        "rss_m0": rss_m0,
+        "rss_m1": best_rss_m1,
+        "rss_m2": rss_m2,
+        "m1_split_k": best_k,
+        "m1_pre_median": best_pre_med,
+        "m1_post_median": best_post_med,
+        "m2_slope": slope,
+        "m2_intercept": intercept,
+    }
+
+
+def _model_selection(rss_m0: float, rss_m1: float, rss_m2: float,
+                     scale: float, n: int,
+                     c: float = 1.0) -> tuple[str, float]:
+    """Return ``(winner, margin)`` under BIC-analog model selection.
+
+    Under a Laplace residual assumption, ``c=1.0`` is the principled default.
+    ``margin`` is the fractional score improvement of the winner over M0.
+    """
+    lam = c * scale * math.log(max(n, 2)) / 2
+    score_m0 = rss_m0 + lam * 1
+    score_m1 = rss_m1 + lam * 3
+    score_m2 = rss_m2 + lam * 2
+    scores = {"M0": score_m0, "M1": score_m1, "M2": score_m2}
+    winner = min(scores, key=scores.get)
+    margin = (score_m0 - scores[winner]) / max(score_m0, 1e-9)
+    return winner, margin
 
 
 # ---------------------------------------------------------------------------
@@ -124,55 +221,7 @@ def _make_event(
 
 
 # ---------------------------------------------------------------------------
-# Detector 1: speech-block deviation
-# ---------------------------------------------------------------------------
-
-
-def detect_block_deviations(ctx: SignalContext) -> list[Event]:
-    out: list[Event] = []
-    for b in ctx.blocks:
-        idx = ctx.block_frames(b.block_id, only_core=True)
-        core_dur = idx.size * ctx.signal.hop_sec
-        if core_dur < ctx.config.min_block_for_deviation_sec:
-            continue
-        block_value = float(np.median(ctx.smoothed[idx]))
-        baseline = local_baseline(
-            b.start_sec, b.end_sec, ctx.centers, ctx.smoothed, ctx.core,
-            ctx.signal.hop_sec, ctx.global_stats, ctx.config,
-        )
-        scale = local_scale(
-            b.start_sec, b.end_sec, ctx.centers, ctx.smoothed, ctx.core,
-            ctx.global_stats, ctx.config,
-        )
-        delta = block_value - baseline.value
-        delta_z = delta / scale
-        if abs(delta_z) < ctx.config.block_deviation_z_threshold:
-            continue
-
-        # Sign consistency across the block
-        residuals = ctx.smoothed[idx] - baseline.value
-        sign_match = float((np.sign(residuals) == np.sign(delta)).mean())
-
-        out.append(
-            _make_event(
-                ctx,
-                event_id=ctx.next_id("blkdev"),
-                event_type="block_deviation",
-                start_sec=b.start_sec,
-                end_sec=b.end_sec,
-                block_ids=(b.block_id,),
-                delta=delta,
-                delta_z=delta_z,
-                baseline=baseline,
-                frames_for_quality=idx,
-                shape_score_value=sign_match,
-            )
-        )
-    return out
-
-
-# ---------------------------------------------------------------------------
-# Detector 2: within-block excursion (hysteresis on residual energy)
+# Detector: within-block excursion (hysteresis on residual energy)
 # ---------------------------------------------------------------------------
 
 
@@ -208,7 +257,10 @@ def _merge_close_intervals(
     return [(s, e) for s, e in merged]
 
 
-def detect_within_block_excursions(ctx: SignalContext) -> list[Event]:
+def detect_within_block_excursions(
+    ctx: SignalContext,
+    block_residuals: dict[int, np.ndarray] | None = None,
+) -> list[Event]:
     out: list[Event] = []
     hop = ctx.signal.hop_sec
     min_dur_frames = max(1, int(round(ctx.config.excursion_min_duration_sec / hop)))
@@ -230,9 +282,12 @@ def detect_within_block_excursions(ctx: SignalContext) -> list[Event]:
             ctx.global_stats, ctx.config,
         )
 
-        residuals = ctx.smoothed[block_idx] - baseline.value
+        if block_residuals is not None and b.block_id in block_residuals:
+            residuals = block_residuals[b.block_id]
+        else:
+            residuals = ctx.smoothed[block_idx] - baseline.value
+
         z_abs = np.abs(residuals / scale)
-        # Don't trigger on frames with low coverage
         z_abs = np.where(ctx.usable[block_idx], z_abs, 0.0)
 
         intervals = _hysteresis_intervals(
@@ -241,13 +296,26 @@ def detect_within_block_excursions(ctx: SignalContext) -> list[Event]:
         intervals = _merge_close_intervals(intervals, merge_gap_frames)
         intervals = [(s, e) for s, e in intervals if (e - s + 1) >= min_dur_frames]
 
+        exit_z = ctx.config.excursion_exit_z
+
         for s_loc, e_loc in intervals:
-            ev_idx = block_idx[s_loc : e_loc + 1]
+            seg_det = residuals[s_loc : e_loc + 1]
+            peak_pos_det = int(np.argmax(np.abs(seg_det)))
+            peak_loc = s_loc + peak_pos_det
+
+            left = peak_loc
+            while left > 0 and z_abs[left - 1] >= exit_z:
+                left -= 1
+            right = peak_loc
+            while right < len(z_abs) - 1 and z_abs[right + 1] >= exit_z:
+                right += 1
+
+            ev_idx = block_idx[left : right + 1]
             ev_start = float(ctx.centers[ev_idx[0]])
             ev_end = float(ctx.centers[ev_idx[-1]])
-            seg = ctx.smoothed[ev_idx] - baseline.value
-            # Direction = sign of the largest |residual|
-            peak = seg[np.argmax(np.abs(seg))]
+            seg = residuals[left : right + 1]
+            peak_pos = int(np.argmax(np.abs(seg)))
+            peak = seg[peak_pos]
             delta = float(peak)
             delta_z = delta / scale
 
@@ -256,9 +324,35 @@ def detect_within_block_excursions(ctx: SignalContext) -> list[Event]:
             event_type = "block_deviation" if covers_block else "within_block_excursion"
             id_prefix = "blkdev" if covers_block else "excurs"
 
-            # Shape: how peaked is it? Peak / mean ratio of |residuals| in [0,1].
-            mean_abs = float(np.mean(np.abs(seg)))
-            shape = float(min(1.0, mean_abs / max(abs(peak), 1e-9)))
+            int_idx = ctx.interior_frames(b.block_id)
+            if int_idx.size > 0:
+                int_local = np.searchsorted(block_idx, int_idx)
+                int_local = int_local[int_local < len(residuals)]
+                block_mean_abs_z = float(np.mean(np.abs(residuals[int_local] / scale)))
+            else:
+                block_mean_abs_z = float(np.mean(np.abs(seg / scale)))
+            peak_z_val = float(np.max(np.abs(seg / scale)))
+            shape = max(0.0, 1.0 - block_mean_abs_z / max(peak_z_val, 1e-9))
+
+            peak_time = float(ctx.centers[ev_idx[peak_pos]])
+            half_peak = 0.5 * peak_z_val
+            ev_z_abs_full = np.abs(seg / scale)
+            fwhm_left = peak_pos
+            while fwhm_left > 0 and ev_z_abs_full[fwhm_left - 1] >= half_peak:
+                fwhm_left -= 1
+            fwhm_right = peak_pos
+            while fwhm_right < len(ev_z_abs_full) - 1 and ev_z_abs_full[fwhm_right + 1] >= half_peak:
+                fwhm_right += 1
+
+            extra: dict = {
+                "peak_z": peak_z_val,
+                "peak_time_sec": peak_time,
+                "mean_abs_z": float(np.mean(np.abs(seg / scale))),
+                "block_mean_abs_z": block_mean_abs_z,
+                "n_core_frames": int(ev_idx.size),
+                "fwhm_start_sec": float(ctx.centers[ev_idx[fwhm_left]]),
+                "fwhm_end_sec": float(ctx.centers[ev_idx[fwhm_right]]),
+            }
 
             out.append(
                 _make_event(
@@ -273,159 +367,14 @@ def detect_within_block_excursions(ctx: SignalContext) -> list[Event]:
                     baseline=baseline,
                     frames_for_quality=ev_idx,
                     shape_score_value=shape,
+                    extra=extra,
                 )
             )
     return out
 
 
 # ---------------------------------------------------------------------------
-# Detector 3: within-block regime shift (single split-point scan)
-# ---------------------------------------------------------------------------
-
-
-def detect_within_block_regime_shifts(ctx: SignalContext) -> list[Event]:
-    out: list[Event] = []
-    hop = ctx.signal.hop_sec
-    min_pre = ctx.config.regime_shift_min_pre_sec
-    min_post = ctx.config.regime_shift_min_post_sec
-    edge = ctx.config.regime_shift_edge_margin_sec
-
-    for b in ctx.blocks:
-        if b.duration_sec < ctx.config.min_block_for_regime_shift_sec:
-            continue
-        idx = ctx.block_frames(b.block_id, only_core=True)
-        if idx.size < 6:
-            continue
-        ts = ctx.centers[idx]
-        vals = ctx.smoothed[idx]
-
-        # Candidate split positions: indices in `idx` honoring edge margins.
-        scale = local_scale(
-            b.start_sec, b.end_sec, ctx.centers, ctx.smoothed, ctx.core,
-            ctx.global_stats, ctx.config,
-        )
-        baseline = local_baseline(
-            b.start_sec, b.end_sec, ctx.centers, ctx.smoothed, ctx.core,
-            hop, ctx.global_stats, ctx.config,
-        )
-
-        best = None  # (abs_z, split_pos, pre_med, post_med)
-        for k in range(1, idx.size):
-            t_split = ts[k]
-            if t_split - b.start_sec < edge or b.end_sec - t_split < edge:
-                continue
-            if t_split - ts[0] < min_pre or ts[-1] - t_split < min_post:
-                continue
-            pre_med = float(np.median(vals[:k]))
-            post_med = float(np.median(vals[k:]))
-            delta = post_med - pre_med
-            abs_z = abs(delta) / scale
-            if best is None or abs_z > best[0]:
-                best = (abs_z, k, pre_med, post_med)
-
-        if best is None:
-            continue
-        abs_z, k, pre_med, post_med = best
-        if abs_z < ctx.config.regime_shift_min_effect_z:
-            continue
-
-        delta = post_med - pre_med
-        delta_z = delta / scale
-        ev_start = float(ts[0])
-        ev_end = float(ts[-1])
-
-        # Shape: stability of pre/post (lower internal MAD relative to global => higher score)
-        pre_var = float(np.median(np.abs(vals[:k] - pre_med))) if k > 0 else 0.0
-        post_var = float(np.median(np.abs(vals[k:] - post_med))) if k < idx.size else 0.0
-        instab = (pre_var + post_var) / max(abs(delta), 1e-9)
-        shape = float(max(0.0, 1.0 - instab))
-
-        out.append(
-            _make_event(
-                ctx,
-                event_id=ctx.next_id("regime"),
-                event_type="within_block_regime_shift",
-                start_sec=ev_start,
-                end_sec=ev_end,
-                block_ids=(b.block_id,),
-                delta=delta,
-                delta_z=delta_z,
-                baseline=baseline,
-                frames_for_quality=idx,
-                shape_score_value=shape,
-                extra={"split_sec": float(ts[k]), "pre_median": pre_med, "post_median": post_med},
-            )
-        )
-    return out
-
-
-# ---------------------------------------------------------------------------
-# Detector 4: within-block ramp (robust slope + monotonicity)
-# ---------------------------------------------------------------------------
-
-
-def detect_within_block_ramps(ctx: SignalContext) -> list[Event]:
-    out: list[Event] = []
-    hop = ctx.signal.hop_sec
-
-    for b in ctx.blocks:
-        if b.duration_sec < ctx.config.min_block_for_ramp_sec:
-            continue
-        idx = ctx.block_frames(b.block_id, only_core=True)
-        if idx.size < 8:
-            continue
-        ts = ctx.centers[idx]
-        vals = ctx.smoothed[idx]
-
-        scale = local_scale(
-            b.start_sec, b.end_sec, ctx.centers, ctx.smoothed, ctx.core,
-            ctx.global_stats, ctx.config,
-        )
-        baseline = local_baseline(
-            b.start_sec, b.end_sec, ctx.centers, ctx.smoothed, ctx.core,
-            hop, ctx.global_stats, ctx.config,
-        )
-
-        # Theil-Sen slope on (time, value) over the whole block.
-        slope, intercept, *_ = theilslopes(vals, ts)
-        duration = float(ts[-1] - ts[0])
-        if duration < ctx.config.ramp_min_duration_sec:
-            continue
-        total_change = slope * duration
-        total_change_z = total_change / scale
-        if abs(total_change_z) < ctx.config.ramp_min_total_change_z:
-            continue
-
-        # Monotonicity: fraction of consecutive deltas with the same sign as total_change.
-        diffs = np.diff(vals)
-        sign = np.sign(total_change) if total_change != 0 else 0
-        if sign == 0:
-            continue
-        mono = float((np.sign(diffs) == sign).mean())
-        if mono < ctx.config.ramp_min_monotonicity:
-            continue
-
-        out.append(
-            _make_event(
-                ctx,
-                event_id=ctx.next_id("ramp"),
-                event_type="within_block_ramp",
-                start_sec=float(ts[0]),
-                end_sec=float(ts[-1]),
-                block_ids=(b.block_id,),
-                delta=float(total_change),
-                delta_z=float(total_change_z),
-                baseline=baseline,
-                frames_for_quality=idx,
-                shape_score_value=mono,
-                extra={"slope_per_sec": float(slope), "monotonicity": mono},
-            )
-        )
-    return out
-
-
-# ---------------------------------------------------------------------------
-# Detector 5: short-gap block transition (adjacent-block contrast)
+# Detector: short-gap block transition (adjacent-block contrast)
 # ---------------------------------------------------------------------------
 
 
@@ -491,15 +440,293 @@ def detect_short_gap_transitions(ctx: SignalContext) -> list[Event]:
 
 
 # ---------------------------------------------------------------------------
+# Unified block characterization via model selection (Phase 5)
+# ---------------------------------------------------------------------------
+
+
+def characterize_block(
+    ctx: SignalContext, b: Block,
+) -> tuple[list[Event], np.ndarray]:
+    """Fit M0/M1/M2 to one block, emit at most one block-level event, return residuals.
+
+    Returns ``(events, residuals)`` where *residuals* are computed over **all**
+    block frames (core=False) from the winning model's fit so that the
+    excursion detector can operate on them.
+    """
+    hop = ctx.signal.hop_sec
+    int_idx = ctx.interior_frames(b.block_id)
+    core_idx = ctx.block_frames(b.block_id, only_core=True)
+    all_idx = ctx.block_frames(b.block_id, only_core=False)
+
+    if all_idx.size == 0:
+        return [], np.array([])
+
+    baseline = local_baseline(
+        b.start_sec, b.end_sec, ctx.centers, ctx.smoothed, ctx.core,
+        hop, ctx.global_stats, ctx.config,
+    )
+    scale = local_scale(
+        b.start_sec, b.end_sec, ctx.centers, ctx.smoothed, ctx.core,
+        ctx.global_stats, ctx.config,
+    )
+
+    fit_idx = int_idx if int_idx.size >= 6 else core_idx
+    if fit_idx.size < 2:
+        residuals = ctx.smoothed[all_idx] - baseline.value
+        return [], residuals
+
+    ts_fit = ctx.centers[fit_idx]
+    vals_fit = ctx.smoothed[fit_idx]
+    ts_all = ctx.centers[all_idx]
+    vals_all = ctx.smoothed[all_idx]
+
+    edge = ctx.config.regime_shift_edge_margin_sec
+    min_pre = ctx.config.regime_shift_min_pre_sec
+    min_post = ctx.config.regime_shift_min_post_sec
+
+    models = _fit_block_models(
+        ts_fit, vals_fit, b.start_sec, b.end_sec, edge, min_pre, min_post,
+    )
+    c = ctx.config.model_penalty_c
+    winner, margin = _model_selection(
+        models["rss_m0"], models["rss_m1"], models["rss_m2"],
+        scale, fit_idx.size, c=c,
+    )
+
+    min_eff = ctx.config.min_absolute_effect
+    events: list[Event] = []
+
+    if winner == "M1" and b.duration_sec >= ctx.config.min_block_for_regime_shift_sec:
+        k = models["m1_split_k"]
+        pre_med = models["m1_pre_median"]
+        post_med = models["m1_post_median"]
+        delta = post_med - pre_med
+
+        if min_eff and abs(delta) < min_eff.get(ctx.signal.name, 0.0):
+            winner = "M0"
+        else:
+            delta_z = delta / scale
+            split_t = float(ts_fit[k])
+            tau = ctx.signal.window_sec / 2
+            ev_start = max(split_t - tau, b.start_sec)
+            ev_end = min(split_t + tau, b.end_sec)
+
+            transition_mask = (ctx.centers[fit_idx] >= ev_start) & (ctx.centers[fit_idx] <= ev_end)
+            transition_idx = fit_idx[transition_mask]
+            if transition_idx.size == 0:
+                transition_idx = fit_idx
+
+            pre_var = float(np.median(np.abs(vals_fit[:k] - pre_med))) if k > 0 else 0.0
+            post_var = float(np.median(np.abs(vals_fit[k:] - post_med))) if k < fit_idx.size else 0.0
+            shape = max(0.0, 1.0 - models["rss_m1"] / max(models["rss_m0"], 1e-9))
+            within_seg_z = abs(delta) / max(math.sqrt(pre_var**2 + post_var**2), 1e-9)
+
+            extra: dict = {
+                "split_sec": split_t,
+                "pre_median": pre_med,
+                "post_median": post_med,
+                "pre_mad": pre_var,
+                "post_mad": post_var,
+                "within_segment_z": within_seg_z,
+                "n_core_frames": int(core_idx.size),
+                "n_interior_frames": int(int_idx.size),
+                "rss_m0": models["rss_m0"],
+                "rss_m1": models["rss_m1"],
+                "rss_m2": models["rss_m2"],
+                "model_selection_winner": winner,
+                "model_selection_margin": margin,
+            }
+
+            events.append(
+                _make_event(
+                    ctx,
+                    event_id=ctx.next_id("regime"),
+                    event_type="within_block_regime_shift",
+                    start_sec=ev_start,
+                    end_sec=ev_end,
+                    block_ids=(b.block_id,),
+                    delta=delta,
+                    delta_z=delta_z,
+                    baseline=baseline,
+                    frames_for_quality=transition_idx,
+                    shape_score_value=shape,
+                    extra=extra,
+                )
+            )
+
+            split_all = np.searchsorted(ts_all, split_t)
+            residuals = vals_all.copy()
+            residuals[:split_all] -= pre_med
+            residuals[split_all:] -= post_med
+            return events, residuals
+
+    if winner == "M2" and b.duration_sec >= ctx.config.min_block_for_ramp_sec:
+        slope = models["m2_slope"]
+        intercept = models["m2_intercept"]
+        duration = float(ts_fit[-1] - ts_fit[0])
+        total_change = slope * duration
+
+        if min_eff and abs(total_change) < min_eff.get(ctx.signal.name, 0.0):
+            winner = "M0"
+        elif duration < ctx.config.ramp_min_duration_sec:
+            winner = "M0"
+        else:
+            total_change_z = total_change / scale
+            shape = max(0.0, 1.0 - models["rss_m2"] / max(models["rss_m0"], 1e-9))
+
+            diffs = np.diff(vals_fit)
+            sign = np.sign(total_change)
+            mono = float((np.sign(diffs) == sign).mean()) if sign != 0 else 0.0
+
+            extra = {
+                "slope_per_sec": float(slope),
+                "monotonicity": mono,
+                "n_core_frames": int(core_idx.size),
+                "n_interior_frames": int(int_idx.size),
+                "rss_m0": models["rss_m0"],
+                "rss_m2": models["rss_m2"],
+                "model_selection_winner": winner,
+                "model_selection_margin": margin,
+            }
+
+            events.append(
+                _make_event(
+                    ctx,
+                    event_id=ctx.next_id("ramp"),
+                    event_type="within_block_ramp",
+                    start_sec=float(ts_fit[0]),
+                    end_sec=float(ts_fit[-1]),
+                    block_ids=(b.block_id,),
+                    delta=float(total_change),
+                    delta_z=float(total_change_z),
+                    baseline=baseline,
+                    frames_for_quality=int_idx if int_idx.size >= 6 else core_idx,
+                    shape_score_value=shape,
+                    extra=extra,
+                )
+            )
+
+            fitted_all = intercept + slope * ts_all
+            residuals = vals_all - fitted_all
+            return events, residuals
+
+    m0_med = float(np.median(vals_fit))
+    residuals = vals_all - m0_med
+
+    min_dur = ctx.config.min_block_for_deviation_sec + ctx.signal.window_sec
+    if b.duration_sec >= min_dur and int_idx.size > 0:
+        delta = m0_med - baseline.value
+        delta_z = delta / scale
+        if abs(delta_z) >= ctx.config.baseline_departure_z:
+            if not (min_eff and abs(delta) < min_eff.get(ctx.signal.name, 0.0)):
+                res_int = ctx.smoothed[int_idx] - baseline.value
+                sign_match = float((np.sign(res_int) == np.sign(delta)).mean())
+                z_abs = np.abs(res_int / scale)
+                block_mad = float(np.median(np.abs(ctx.smoothed[int_idx] - m0_med)))
+                core_value = float(np.median(ctx.smoothed[core_idx])) if core_idx.size else m0_med
+                edge_contribution = abs(core_value - m0_med) / max(abs(delta), 1e-9)
+
+                extra = {
+                    "peak_z": float(np.max(z_abs)),
+                    "mean_abs_z": float(np.mean(z_abs)),
+                    "n_core_frames": int(core_idx.size),
+                    "n_interior_frames": int(int_idx.size),
+                    "block_mad": block_mad,
+                    "interior_median": m0_med,
+                    "edge_contribution": edge_contribution,
+                    "rss_m0": models["rss_m0"],
+                    "rss_m1": models["rss_m1"],
+                    "rss_m2": models["rss_m2"],
+                    "model_selection_winner": winner,
+                    "model_selection_margin": margin,
+                }
+
+                events.append(
+                    _make_event(
+                        ctx,
+                        event_id=ctx.next_id("blkdev"),
+                        event_type="block_deviation",
+                        start_sec=b.start_sec,
+                        end_sec=b.end_sec,
+                        block_ids=(b.block_id,),
+                        delta=delta,
+                        delta_z=delta_z,
+                        baseline=baseline,
+                        frames_for_quality=int_idx,
+                        shape_score_value=sign_match,
+                        extra=extra,
+                    )
+                )
+
+    return events, residuals
+
+
+# ---------------------------------------------------------------------------
 # Top-level: run all detectors for one signal
 # ---------------------------------------------------------------------------
 
 
-def run_all_detectors(ctx: SignalContext) -> list[Event]:
+def run_all_detectors(
+    ctx: SignalContext, *, diagnostics: bool = False,
+) -> list[Event] | tuple[list[Event], list[dict]]:
     events: list[Event] = []
-    events.extend(detect_block_deviations(ctx))
-    events.extend(detect_within_block_excursions(ctx))
-    events.extend(detect_within_block_regime_shifts(ctx))
-    events.extend(detect_within_block_ramps(ctx))
+
+    block_residuals: dict[int, np.ndarray] = {}
+    for b in ctx.blocks:
+        block_events, resid = characterize_block(ctx, b)
+        events.extend(block_events)
+        if resid.size > 0:
+            block_residuals[b.block_id] = resid
+    events.extend(detect_within_block_excursions(ctx, block_residuals=block_residuals))
     events.extend(detect_short_gap_transitions(ctx))
-    return events
+
+    if not diagnostics:
+        return events
+
+    fired_by_block: dict[int, list[str]] = {}
+    for e in events:
+        for bid in e.block_ids:
+            fired_by_block.setdefault(bid, []).append(e.event_type)
+
+    block_diag: list[dict] = []
+    for b in ctx.blocks:
+        idx = ctx.block_frames(b.block_id, only_core=True)
+        int_idx = ctx.interior_frames(b.block_id)
+        if idx.size < 2:
+            continue
+        fit_idx = int_idx if int_idx.size >= 6 else idx
+        ts = ctx.centers[fit_idx]
+        vals = ctx.smoothed[fit_idx]
+        scale = local_scale(
+            b.start_sec, b.end_sec, ctx.centers, ctx.smoothed, ctx.core,
+            ctx.global_stats, ctx.config,
+        )
+        models = _fit_block_models(
+            ts, vals, b.start_sec, b.end_sec,
+            ctx.config.regime_shift_edge_margin_sec,
+            ctx.config.regime_shift_min_pre_sec,
+            ctx.config.regime_shift_min_post_sec,
+        )
+        winner, margin = _model_selection(
+            models["rss_m0"], models["rss_m1"], models["rss_m2"],
+            scale, fit_idx.size, c=ctx.config.model_penalty_c,
+        )
+        int_med = float(np.median(ctx.smoothed[int_idx])) if int_idx.size else float(np.median(vals))
+        block_diag.append({
+            "block_id": b.block_id,
+            "signal_name": ctx.signal.name,
+            "block_start_sec": b.start_sec,
+            "block_end_sec": b.end_sec,
+            "block_duration_sec": b.duration_sec,
+            "n_interior_frames": int(int_idx.size),
+            "n_core_frames": int(idx.size),
+            "interior_median": int_med,
+            "rss_m0": models["rss_m0"],
+            "rss_m1": models["rss_m1"],
+            "rss_m2": models["rss_m2"],
+            "model_selection_would_choose": winner,
+            "model_selection_margin": margin,
+            "current_detectors_fired": fired_by_block.get(b.block_id, []),
+        })
+
+    return events, block_diag

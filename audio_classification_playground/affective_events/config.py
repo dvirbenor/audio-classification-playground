@@ -32,7 +32,6 @@ class Config:
 
     # --- Detector: block deviation ------------------------------------------
     min_block_for_deviation_sec: float = 3.5
-    block_deviation_z_threshold: float = 1.75
 
     # --- Detector: within-block excursion -----------------------------------
     min_block_for_excursion_sec: float = 8.0
@@ -46,18 +45,24 @@ class Config:
     min_block_for_regime_shift_sec: float = 20.0
     regime_shift_min_pre_sec: float = 6.0
     regime_shift_min_post_sec: float = 6.0
-    regime_shift_min_effect_z: float = 1.25
     regime_shift_edge_margin_sec: float = 2.0
 
     # --- Detector: within-block ramp ----------------------------------------
     min_block_for_ramp_sec: float = 20.0
     ramp_min_duration_sec: float = 12.0
-    ramp_min_total_change_z: float = 1.25
-    ramp_min_monotonicity: float = 0.65
+
+    # --- Unified block characterization (model selection) -------------------
+    model_penalty_c: float = 1.0
+    baseline_departure_z: float = 1.75
+    min_absolute_effect: dict | None = None
 
     # --- Detector: short-gap block transition -------------------------------
     short_gap_max_sec: float = 3.0
     short_gap_min_delta_z: float = 1.5
+
+    # --- Cross-block validation (confidence modifier only) -----------------
+    cross_block_consistency_z: float = 1.0
+    cross_block_max_gap_sec: float = 60.0
 
     # --- Per-signal episode aggregation -------------------------------------
     enable_episode_aggregation: bool = True
@@ -79,6 +84,7 @@ class Config:
         ("context", 0.6),
         ("shape", 0.5),
         ("boundary", 0.4),
+        ("cross_block", 0.3),
     )
 
     # ------------------------------------------------------------------ presets
@@ -91,11 +97,10 @@ class Config:
     def exploratory(cls) -> "Config":
         return replace(
             cls(),
-            block_deviation_z_threshold=1.4,
+            baseline_departure_z=1.4,
+            model_penalty_c=0.7,
             excursion_enter_z=1.7,
             excursion_exit_z=0.8,
-            regime_shift_min_effect_z=1.0,
-            ramp_min_total_change_z=1.0,
             short_gap_min_delta_z=1.2,
         )
 
@@ -103,10 +108,9 @@ class Config:
     def conservative(cls) -> "Config":
         return replace(
             cls(),
-            block_deviation_z_threshold=2.1,
+            baseline_departure_z=2.1,
+            model_penalty_c=1.4,
             excursion_enter_z=2.4,
             excursion_exit_z=1.2,
-            regime_shift_min_effect_z=1.6,
-            ramp_min_total_change_z=1.6,
             short_gap_min_delta_z=1.9,
         )

@@ -25,13 +25,16 @@ from .preprocessing import (
     smooth_within_blocks,
 )
 from .types import Event, Signal, Vad
+from .validation import cross_block_validate
 
 
 def extract_events(
     signals: Sequence[Signal],
     vad: Vad,
     config: Config | None = None,
-) -> list[Event]:
+    *,
+    diagnostics: bool = False,
+) -> list[Event] | tuple[list[Event], pd.DataFrame]:
     """Run the full per-signal detection + fusion pipeline.
 
     Parameters
@@ -45,23 +48,53 @@ def extract_events(
         probabilities on a different grid.
     config
         Optional :class:`Config`; defaults to :meth:`Config.balanced`.
+    diagnostics
+        When ``True``, return a tuple ``(events, block_diagnostics)`` where
+        ``block_diagnostics`` is a :class:`~pandas.DataFrame` with per-block
+        per-signal evidence including shadow model-selection results.
 
     Returns
     -------
-    list[Event]
-        Leaf events (one per detection) plus episode parents (per signal,
-        when applicable) and joint parents (cross-signal). Children carry
-        their ``parent_id`` back-reference. The list is sorted by
-        ``(start_sec, signal_name)``.
+    list[Event] | tuple[list[Event], pandas.DataFrame]
+        Leaf events plus parents.  When *diagnostics* is ``True``, a
+        ``(events, block_diagnostics_df)`` tuple is returned instead.
     """
     config = config or Config.balanced()
     blocks = build_blocks(vad, config)
     id_counter = count()
 
     per_signal_events: dict[str, list[Event]] = {}
+    all_block_diag: list[dict] = []
+    block_interior_medians: dict[tuple[str, int], float] = {}
     for sig in signals:
         ctx = _build_context(sig, blocks, config, id_counter)
-        per_signal_events[sig.name] = run_all_detectors(ctx)
+        if diagnostics:
+            events, block_diag = run_all_detectors(ctx, diagnostics=True)
+            per_signal_events[sig.name] = events
+            all_block_diag.extend(block_diag)
+        else:
+            per_signal_events[sig.name] = run_all_detectors(ctx)
+
+        for b in blocks:
+            int_idx = ctx.interior_frames(b.block_id)
+            if int_idx.size > 0:
+                block_interior_medians[(sig.name, b.block_id)] = float(
+                    np.median(ctx.smoothed[int_idx])
+                )
+            else:
+                core_idx = ctx.block_frames(b.block_id, only_core=True)
+                if core_idx.size > 0:
+                    block_interior_medians[(sig.name, b.block_id)] = float(
+                        np.median(ctx.smoothed[core_idx])
+                    )
+
+    for sig_name in per_signal_events:
+        per_signal_events[sig_name] = cross_block_validate(
+            per_signal_events[sig_name],
+            block_interior_medians,
+            blocks,
+            config,
+        )
 
     leaves = [e for evs in per_signal_events.values() for e in evs]
     episode_parents = aggregate_episodes(per_signal_events, config, id_counter)
@@ -72,6 +105,14 @@ def extract_events(
 
     all_events = leaves + parents
     all_events.sort(key=lambda e: (e.start_sec, e.signal_name, e.event_id))
+
+    if diagnostics:
+        diag_df = pd.DataFrame(all_block_diag)
+        if not diag_df.empty:
+            diag_df = diag_df.sort_values(
+                ["signal_name", "block_start_sec"]
+            ).reset_index(drop=True)
+        return all_events, diag_df
     return all_events
 
 
