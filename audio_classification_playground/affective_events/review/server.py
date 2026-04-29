@@ -17,7 +17,7 @@ from fastapi.staticfiles import StaticFiles
 from .audio_serving import serve_with_range
 from .models import VERDICTS, Label
 from .storage import clear_label, load_session_json, update_label
-from .waveform import cached_peaks
+from .waveform import cached_peaks, compute_peaks_window
 
 
 _STATIC_DIR = Path(__file__).parent / "static"
@@ -83,12 +83,20 @@ def make_app(session_path: str | Path) -> FastAPI:
         sess = state["session"]
         return serve_with_range(sess["audio_path"], request)
 
-    # ---- Waveform peaks (cached on disk) --------------------------------
+    # ---- Waveform peaks (cached on disk, or windowed high-res) -----------
     @app.get("/api/waveform")
-    async def get_waveform() -> JSONResponse:
+    async def get_waveform(
+        t0: float | None = None,
+        t1: float | None = None,
+        n_peaks: int | None = None,
+    ) -> JSONResponse:
         sess = state["session"]
-        cache_path = state["path"].with_suffix(".peaks.json")
-        peaks = cached_peaks(sess["audio_path"], cache_path)
+        if t0 is not None and t1 is not None:
+            capped = min(n_peaks or 2000, 4000)
+            peaks = compute_peaks_window(sess["audio_path"], t0, t1, n_peaks=capped)
+        else:
+            cache_path = state["path"].with_suffix(".peaks.json")
+            peaks = cached_peaks(sess["audio_path"], cache_path)
         return JSONResponse(peaks)
 
     # ---- Labels ---------------------------------------------------------

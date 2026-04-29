@@ -1,30 +1,101 @@
-/* Affective Events Review — UI styles. */
+/* Affective Events Review — UI styles.
+ * Dark/light theme via CSS custom properties on [data-theme]. */
 
-:root {
-    --bg: #fafafa;
-    --bg-elev: #ffffff;
-    --fg: #1a1a1a;
-    --muted: #6b7280;
-    --primary: #2563eb;
-    --border: #e5e7eb;
-    --tp: #16a34a;
-    --fp: #dc2626;
-    --unclear: #d97706;
-    --partial: #7c3aed;
-    --unlabeled: #9ca3af;
-    --row-gap: 8px;
+/* === Theme tokens === */
+
+:root, [data-theme="dark"] {
+    --bg-base:    #0f1117;
+    --bg-surface: #1a1d27;
+    --bg-raised:  #242836;
+    --bg-hover:   #2e3345;
+    --fg:         #e2e4e9;
+    --fg-muted:   #8b8fa3;
+    --fg-dim:     #5c6070;
+    --border:     #2e3345;
+    --border-subtle: #242836;
+    --primary:    #3b82f6;
+    --primary-hover: #60a5fa;
+    --ring:       rgba(59,130,246,0.35);
+    --tp:         #22c55e;
+    --fp:         #ef4444;
+    --unclear:    #f59e0b;
+    --partial:    #a78bfa;
+    --unlabeled:  #4b5068;
+    --shadow:     0 1px 3px rgba(0,0,0,0.4);
+    --shadow-lg:  0 4px 12px rgba(0,0,0,0.5);
+    --plot-bg:    #141720;
+    --plot-grid:  #1e2230;
+    --plot-zero:  #2a2e3d;
+    --plot-tick:  #8b8fa3;
+    --plot-title: #e2e4e9;
+    --plot-hover-bg: #242836;
+    --plot-hover-fg: #e2e4e9;
+    --waveform-fill: rgba(160,170,200,0.22);
+    --waveform-line: rgba(160,170,200,0.45);
+    --event-current-fill:   rgba(251,146,60,0.18);
+    --event-current-band:   rgba(251,146,60,0.32);
+    --event-current-border: rgba(234,88,12,0.8);
+    --event-current-edge:   rgba(234,88,12,0.6);
+    --event-other-fill:     rgba(160,160,180,0.10);
+    --event-playhead:       rgba(255,255,255,0.7);
+    --event-speech-block:   rgba(34,197,94,0.08);
+    --event-detection-tint: rgba(59,130,246,0.07);
+    --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
 }
+
+[data-theme="light"] {
+    --bg-base:    #f3f4f6;
+    --bg-surface: #ffffff;
+    --bg-raised:  #f9fafb;
+    --bg-hover:   #f3f4f6;
+    --fg:         #111827;
+    --fg-muted:   #6b7280;
+    --fg-dim:     #9ca3af;
+    --border:     #e5e7eb;
+    --border-subtle: #f3f4f6;
+    --primary:    #2563eb;
+    --primary-hover: #3b82f6;
+    --ring:       rgba(37,99,235,0.3);
+    --tp:         #16a34a;
+    --fp:         #dc2626;
+    --unclear:    #d97706;
+    --partial:    #7c3aed;
+    --unlabeled:  #9ca3af;
+    --shadow:     0 1px 3px rgba(0,0,0,0.08);
+    --shadow-lg:  0 4px 12px rgba(0,0,0,0.1);
+    --plot-bg:    #ffffff;
+    --plot-grid:  #f0f0f0;
+    --plot-zero:  #e0e0e0;
+    --plot-tick:  #6b7280;
+    --plot-title: #374151;
+    --plot-hover-bg: #ffffff;
+    --plot-hover-fg: #111827;
+    --waveform-fill: rgba(120,120,120,0.25);
+    --waveform-line: rgba(100,100,100,0.5);
+    --event-current-fill:   rgba(234,88,12,0.10);
+    --event-current-band:   rgba(234,88,12,0.20);
+    --event-current-border: rgba(234,88,12,0.7);
+    --event-current-edge:   rgba(234,88,12,0.5);
+    --event-other-fill:     rgba(150,150,150,0.10);
+    --event-playhead:       rgba(0,0,0,0.6);
+    --event-speech-block:   rgba(34,197,94,0.08);
+    --event-detection-tint: rgba(37,99,235,0.06);
+}
+
+/* === Reset & global === */
 
 * { box-sizing: border-box; }
 
 html, body {
     margin: 0;
     padding: 0;
-    background: var(--bg);
+    background: var(--bg-base);
     color: var(--fg);
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    font-family: var(--font-sans);
     font-size: 13px;
     line-height: 1.4;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
 }
 
 body {
@@ -33,19 +104,22 @@ body {
     min-height: 100vh;
 }
 
+/* === Topbar === */
+
 #topbar {
-    background: var(--bg-elev);
-    border-bottom: 1px solid var(--border);
-    padding: 8px 16px;
+    background: var(--bg-surface);
+    box-shadow: var(--shadow);
+    padding: 10px 20px;
     display: flex;
     flex-direction: column;
-    gap: 4px;
+    gap: 6px;
+    z-index: 10;
 }
 
 #banner {
     display: flex;
     gap: 16px;
-    align-items: baseline;
+    align-items: center;
     flex-wrap: wrap;
 }
 
@@ -57,7 +131,23 @@ body {
 #banner #event-position {
     margin-left: auto;
     font-variant-numeric: tabular-nums;
+    font-weight: 500;
 }
+
+#theme-toggle {
+    background: var(--bg-raised);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 4px 10px;
+    font: inherit;
+    color: var(--fg-muted);
+    cursor: pointer;
+    transition: all 0.15s ease;
+    line-height: 1;
+}
+#theme-toggle:hover { background: var(--bg-hover); color: var(--fg); }
+
+/* === Filterbar === */
 
 #filterbar {
     display: flex;
@@ -65,6 +155,7 @@ body {
     align-items: center;
     flex-wrap: wrap;
     font-size: 12px;
+    color: var(--fg-muted);
 }
 
 #filterbar label {
@@ -73,13 +164,31 @@ body {
     gap: 4px;
 }
 
-#filterbar select, #filterbar input[type=range] {
+#filterbar select,
+#filterbar input[type=range] {
     font: inherit;
+    background: var(--bg-raised);
+    color: var(--fg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 2px 6px;
+    cursor: pointer;
 }
+#filterbar select:focus,
+#filterbar input:focus {
+    outline: none;
+    box-shadow: 0 0 0 2px var(--ring);
+}
+
+#filterbar input[type=checkbox] {
+    accent-color: var(--primary);
+}
+
+/* === Event meta === */
 
 #event-meta {
     font-size: 12px;
-    color: var(--muted);
+    color: var(--fg-muted);
     font-variant-numeric: tabular-nums;
 }
 
@@ -87,9 +196,9 @@ body {
     display: inline-block;
     padding: 1px 6px;
     border: 1px solid var(--border);
-    border-radius: 3px;
+    border-radius: 4px;
     margin-right: 6px;
-    background: var(--bg);
+    background: var(--bg-raised);
     color: var(--fg);
     font-weight: 500;
 }
@@ -99,10 +208,12 @@ body {
     color: var(--primary);
 }
 
+/* === Minimap === */
+
 #minimap {
     height: 18px;
-    background: var(--bg-elev);
-    border-bottom: 1px solid var(--border);
+    background: var(--bg-surface);
+    border-bottom: 1px solid var(--border-subtle);
     position: relative;
     cursor: pointer;
     overflow: hidden;
@@ -113,7 +224,7 @@ body {
     top: 2px;
     bottom: 2px;
     width: 3px;
-    border-radius: 1px;
+    border-radius: 2px;
     background: var(--unlabeled);
     opacity: 0.6;
 }
@@ -125,24 +236,37 @@ body {
 
 #minimap .tick.current {
     width: 5px;
-    box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.35);
+    box-shadow: 0 0 0 2px var(--ring);
     z-index: 2;
 }
+
+/* === Main / Plot === */
 
 main {
     padding: 8px 16px;
     display: flex;
     flex-direction: column;
     gap: 8px;
+    min-height: 0;
+    overflow: hidden;
 }
 
 #plot {
     width: 100%;
-    height: 540px;
-    background: var(--bg-elev);
+    flex: 1;
+    min-height: 300px;
+    background: var(--bg-surface);
     border: 1px solid var(--border);
-    border-radius: 4px;
+    border-radius: 8px;
+    box-shadow: var(--shadow);
 }
+
+/* Plotly modebar integration */
+#plot .modebar { background: transparent !important; }
+#plot .modebar-btn path { fill: var(--fg-dim) !important; }
+#plot .modebar-btn:hover path { fill: var(--fg) !important; }
+
+/* === Audio controls === */
 
 #audio-controls {
     display: flex;
@@ -162,19 +286,26 @@ main {
 }
 
 .audio-actions button {
-    background: var(--bg-elev);
+    background: var(--bg-raised);
     border: 1px solid var(--border);
-    border-radius: 3px;
+    border-radius: 6px;
     padding: 4px 10px;
     font: inherit;
+    color: var(--fg);
     cursor: pointer;
+    transition: all 0.15s ease;
 }
-.audio-actions button:hover { background: var(--bg); }
+.audio-actions button:hover {
+    background: var(--bg-hover);
+    box-shadow: var(--shadow);
+}
+
+/* === Label bar === */
 
 #labelbar {
-    background: var(--bg-elev);
-    border-top: 1px solid var(--border);
-    padding: 10px 16px;
+    background: var(--bg-surface);
+    border-top: 1px solid var(--border-subtle);
+    padding: 10px 20px;
     display: grid;
     grid-template-columns: auto 1fr;
     gap: 8px 12px;
@@ -189,15 +320,20 @@ main {
 
 #verdict-group button {
     border: 1px solid var(--border);
-    background: var(--bg-elev);
+    background: var(--bg-raised);
     padding: 6px 10px;
-    border-radius: 3px;
+    border-radius: 6px;
     cursor: pointer;
     font: inherit;
     font-weight: 600;
+    color: var(--fg);
+    transition: all 0.15s ease;
 }
 
-#verdict-group button:hover { background: var(--bg); }
+#verdict-group button:hover {
+    background: var(--bg-hover);
+    box-shadow: var(--shadow);
+}
 
 #verdict-group button.active[data-verdict=tp]      { background: var(--tp); color: white; border-color: var(--tp); }
 #verdict-group button.active[data-verdict=fp]      { background: var(--fp); color: white; border-color: var(--fp); }
@@ -210,9 +346,17 @@ main {
     width: 100%;
     font: inherit;
     border: 1px solid var(--border);
-    border-radius: 3px;
+    border-radius: 6px;
     padding: 6px 8px;
-    background: var(--bg-elev);
+    background: var(--bg-base);
+    color: var(--fg);
+    transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+#labelbar #tags:focus,
+#labelbar #comment:focus {
+    outline: none;
+    border-color: var(--primary);
+    box-shadow: 0 0 0 2px var(--ring);
 }
 
 #labelbar #tags { grid-row: 1 / 2; }
@@ -222,12 +366,15 @@ main {
     grid-row: 3 / 4;
     font-size: 11px;
     font-style: italic;
+    color: var(--fg-dim);
 }
 
+/* === Navbar === */
+
 #navbar {
-    background: var(--bg-elev);
-    border-top: 1px solid var(--border);
-    padding: 8px 16px;
+    background: var(--bg-surface);
+    border-top: 1px solid var(--border-subtle);
+    padding: 8px 20px;
     display: flex;
     gap: 8px;
     align-items: center;
@@ -235,23 +382,31 @@ main {
 
 #navbar button {
     border: 1px solid var(--border);
-    background: var(--bg-elev);
+    background: var(--bg-raised);
     padding: 6px 12px;
-    border-radius: 3px;
+    border-radius: 6px;
     cursor: pointer;
     font: inherit;
+    color: var(--fg);
+    transition: all 0.15s ease;
 }
 
-#navbar button:hover { background: var(--bg); }
+#navbar button:hover {
+    background: var(--bg-hover);
+    box-shadow: var(--shadow);
+}
 
 #keyboard-hint {
     margin-left: auto;
     font-size: 11px;
     font-variant-numeric: tabular-nums;
+    color: var(--fg-dim);
 }
 
+/* === Utilities === */
+
 .muted {
-    color: var(--muted);
+    color: var(--fg-muted);
     font-size: 12px;
 }
 
@@ -264,8 +419,8 @@ main {
 
 /* Brief flash when audio enters event zone */
 @keyframes event-entry-flash {
-    0%   { box-shadow: inset 0 0 0 3px rgba(220, 50, 50, 0.6); }
-    100% { box-shadow: inset 0 0 0 0  rgba(220, 50, 50, 0.0); }
+    0%   { box-shadow: inset 0 0 0 3px var(--event-current-border); }
+    100% { box-shadow: inset 0 0 0 0  rgba(0,0,0,0); }
 }
 #plot.event-entered {
     animation: event-entry-flash 0.7s ease-out;

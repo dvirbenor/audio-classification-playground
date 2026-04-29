@@ -1,9 +1,13 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="dark">
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Affective Events Review</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap"
+          rel="stylesheet" media="print" onload="this.media='all'">
     <link rel="stylesheet" href="/assets/style.css">
     <script src="https://cdn.plot.ly/plotly-2.32.0.min.js" defer></script>
 </head>
@@ -14,6 +18,7 @@
             <span id="config-hash" class="muted"></span>
             <span id="event-position" class="primary">—</span>
             <span id="save-indicator" class="muted"></span>
+            <button id="theme-toggle" title="Toggle dark/light theme">◐</button>
         </div>
         <div id="filterbar">
             <label>signal
@@ -32,6 +37,16 @@
                     <option value="time">time</option>
                     <option value="strength">strength</option>
                     <option value="confidence">confidence</option>
+                </select>
+            </label>
+            <label>context
+                <select id="context-zoom">
+                    <option value="10">10 s</option>
+                    <option value="30" selected>30 s</option>
+                    <option value="60">1 min</option>
+                    <option value="120">2 min</option>
+                    <option value="300">5 min</option>
+                    <option value="0">full</option>
                 </select>
             </label>
             <span id="filter-count" class="muted"></span>

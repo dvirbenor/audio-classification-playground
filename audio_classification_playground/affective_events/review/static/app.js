@@ -17,36 +17,100 @@ const state = {
     signals: null,        // {arousal: [...], valence: [...], dominance: [...]}
     signalsMeta: null,    // {arousal: {hop_sec, window_sec, n_frames}, ...}
     waveform: null,       // {min, max, n_peaks, sample_rate, duration_sec}
+    windowedWaveform: null, // high-res waveform for current view (from /api/waveform?t0=&t1=)
     eventsById: {},       // id -> event
     filtered: [],         // ordered list of event ids after filter+sort
     currentIndex: 0,      // index into filtered
     filter: { signal: '', type: '', minConf: 0, unlabeledOnly: false },
     sort: 'time',
+    contextZoom: 30,      // view window in seconds (10, 30, 60, 120, 300), 0 = full
     playheadSec: 0,
     lastEventEnteredId: null,
     knownTags: new Set(),
+    panels: null,         // built by buildPanelConfig()
+    signalNames: [],      // ordered signal names
 };
 
-// Panel y-axis layout (top→bottom): arousal, valence, dominance, waveform.
-// Maps signal name → axis suffix used by Plotly (yaxis, yaxis2, ...).
-const PANEL_DOMAINS = {
-    arousal:   [0.78, 1.00],
-    valence:   [0.55, 0.76],
-    dominance: [0.32, 0.53],
-    waveform:  [0.00, 0.28],
-};
-const PANEL_AXIS = {
-    arousal:   'y4',
-    valence:   'y3',
-    dominance: 'y2',
-    waveform:  'y',
-};
-const SIGNAL_COLORS = {
-    arousal:   '#2563eb',  // blue
-    valence:   '#ea580c',  // orange
-    dominance: '#16a34a',  // green
-};
 const VERDICTS = ['tp', 'fp', 'unclear', 'partial'];
+
+// ---------------------------------------------------------------------------
+// Dynamic panel config — derived from loaded signals at runtime
+// ---------------------------------------------------------------------------
+
+const KNOWN_ORDER = ['arousal', 'valence', 'dominance'];
+const PALETTE = ['#2563eb', '#ea580c', '#16a34a', '#8b5cf6', '#0891b2', '#db2777'];
+const WAVEFORM_FRAC = 0.22;
+const PANEL_GAP = 0.02;
+
+function resolveSignalNames(signalsMeta, loadedSignals) {
+    const metaKeys = new Set(Object.keys(signalsMeta));
+    const loadedKeys = new Set(Object.keys(loadedSignals));
+    const valid = [...metaKeys].filter(k => {
+        if (!loadedKeys.has(k)) { console.warn(`signal "${k}" in meta but missing from data — skipped`); return false; }
+        return true;
+    });
+    for (const k of loadedKeys) {
+        if (!metaKeys.has(k)) console.warn(`signal "${k}" in data but missing from meta — skipped`);
+    }
+    const known = KNOWN_ORDER.filter(k => valid.includes(k));
+    const extras = valid.filter(k => !KNOWN_ORDER.includes(k)).sort();
+    return [...known, ...extras];
+}
+
+function buildPanelConfig(signalNames) {
+    const n = signalNames.length;
+    if (n === 0) {
+        return { _waveform: { domain: [0, 1], axis: 'y', color: '#888' } };
+    }
+    const availableHeight = 1 - WAVEFORM_FRAC - PANEL_GAP;
+    const panelH = (availableHeight - PANEL_GAP * Math.max(0, n - 1)) / n;
+
+    const panels = {};
+    panels._waveform = { domain: [0, WAVEFORM_FRAC], axis: 'y', color: '#888' };
+
+    const reversed = [...signalNames].reverse();
+    reversed.forEach((name, i) => {
+        const lo = WAVEFORM_FRAC + PANEL_GAP + i * (panelH + PANEL_GAP);
+        panels[name] = {
+            domain: [lo, lo + panelH],
+            axis: `y${i + 2}`,
+            color: PALETTE[signalNames.indexOf(name) % PALETTE.length],
+        };
+    });
+    return panels;
+}
+
+// ---------------------------------------------------------------------------
+// View-local y-axis ranges — computed from visible data for each render
+// ---------------------------------------------------------------------------
+
+function computeLocalSignalRanges(t0View, t1View) {
+    const ranges = {};
+    for (const name of state.signalNames) {
+        const meta = state.signalsMeta[name];
+        const arr = state.signals[name];
+        if (!meta || !arr || !arr.length) { ranges[name] = [0, 1]; continue; }
+
+        const dt = meta.hop_sec;
+        const offset = meta.window_sec / 2;
+        const i0 = Math.max(0, Math.floor((t0View - offset) / dt));
+        const i1 = Math.min(arr.length - 1, Math.ceil((t1View - offset) / dt));
+
+        let lo = Infinity, hi = -Infinity;
+        for (let i = i0; i <= i1; i++) {
+            const v = arr[i];
+            if (!Number.isFinite(v)) continue;
+            if (v < lo) lo = v;
+            if (v > hi) hi = v;
+        }
+        if (!Number.isFinite(lo)) { ranges[name] = [0, 1]; continue; }
+
+        const span = hi - lo;
+        const margin = Math.max(span * 0.15, 0.02);
+        ranges[name] = [lo - margin, hi + margin];
+    }
+    return ranges;
+}
 
 // ---------------------------------------------------------------------------
 // API
@@ -147,8 +211,11 @@ function currentEvent() {
 
 function buildSignalTraces() {
     const traces = [];
-    for (const name of Object.keys(state.signals)) {
+    for (const name of state.signalNames) {
         const meta = state.signalsMeta[name];
+        if (!meta) continue;
+        const panel = state.panels[name];
+        if (!panel) continue;
         const ts = frameTimes(meta);
         traces.push({
             type: 'scattergl',
@@ -157,8 +224,8 @@ function buildSignalTraces() {
             x: Array.from(ts),
             y: state.signals[name],
             xaxis: 'x',
-            yaxis: PANEL_AXIS[name] || 'y2',
-            line: { color: SIGNAL_COLORS[name] || '#666', width: 1.4 },
+            yaxis: panel.axis,
+            line: { color: panel.color, width: 1.4 },
             hovertemplate: `${name}: %{y:.3f}<br>t=%{x:.2f}s<extra></extra>`,
             showlegend: false,
         });
@@ -167,26 +234,52 @@ function buildSignalTraces() {
 }
 
 function buildWaveformTrace() {
-    const wf = state.waveform;
+    const wf = state.windowedWaveform || state.waveform;
     if (!wf || !wf.n_peaks) return null;
-    const dt = wf.duration_sec / wf.n_peaks;
-    const x = new Array(wf.n_peaks * 3);
-    const y = new Array(wf.n_peaks * 3);
-    for (let i = 0; i < wf.n_peaks; i++) {
-        const t = i * dt + dt / 2;
-        x[3 * i]     = t; y[3 * i]     = wf.min[i];
-        x[3 * i + 1] = t; y[3 * i + 1] = wf.max[i];
-        x[3 * i + 2] = null; y[3 * i + 2] = null;
+    const tStart = wf.t0_sec || 0;
+    const dt = (wf.duration_sec || wf.duration_sec) / wf.n_peaks;
+    const n = wf.n_peaks;
+    const x = new Array(2 * n);
+    const y = new Array(2 * n);
+    for (let i = 0; i < n; i++) {
+        const t = tStart + i * dt + dt / 2;
+        x[i] = t;             y[i] = wf.max[i];
+        x[2 * n - 1 - i] = t; y[2 * n - 1 - i] = wf.min[i];
     }
+    const cs = getComputedStyle(document.documentElement);
     return {
-        type: 'scattergl',
+        type: 'scatter',
         mode: 'lines',
         x, y,
+        fill: 'toself',
+        fillcolor: cs.getPropertyValue('--waveform-fill').trim() || 'rgba(120,120,120,0.25)',
+        line: { color: cs.getPropertyValue('--waveform-line').trim() || 'rgba(100,100,100,0.5)', width: 0.5 },
         xaxis: 'x',
         yaxis: 'y',
-        line: { color: '#888', width: 1 },
         hoverinfo: 'skip',
         showlegend: false,
+    };
+}
+
+function getThemeColors() {
+    const cs = getComputedStyle(document.documentElement);
+    const v = (name, fallback) => cs.getPropertyValue(name).trim() || fallback;
+    return {
+        eventCurrentFill:   v('--event-current-fill',   'rgba(251,146,60,0.18)'),
+        eventCurrentBand:   v('--event-current-band',   'rgba(251,146,60,0.32)'),
+        eventCurrentBorder: v('--event-current-border', 'rgba(234,88,12,0.8)'),
+        eventCurrentEdge:   v('--event-current-edge',   'rgba(234,88,12,0.6)'),
+        eventOtherFill:     v('--event-other-fill',     'rgba(160,160,180,0.10)'),
+        eventPlayhead:      v('--event-playhead',       'rgba(0,0,0,0.6)'),
+        eventSpeechBlock:   v('--event-speech-block',   'rgba(34,197,94,0.08)'),
+        eventDetectionTint: v('--event-detection-tint', 'rgba(59,130,246,0.07)'),
+        plotBg:             v('--plot-bg',    '#ffffff'),
+        plotGrid:           v('--plot-grid',  '#eee'),
+        plotZero:           v('--plot-zero',  '#ddd'),
+        plotTick:           v('--plot-tick',  '#666'),
+        plotTitle:          v('--plot-title', '#333'),
+        plotHoverBg:        v('--plot-hover-bg', '#fff'),
+        plotHoverFg:        v('--plot-hover-fg', '#333'),
     };
 }
 
@@ -194,63 +287,64 @@ function buildShapes(ev) {
     const shapes = [];
     if (!ev) return shapes;
 
+    const tc = getThemeColors();
+
     // (1) Highlight detection signal panel — full-width tinted rect.
-    const detDomain = PANEL_DOMAINS[ev.signal_name];
-    if (detDomain) {
+    const detPanel = state.panels[ev.signal_name];
+    if (detPanel) {
         shapes.push({
             type: 'rect',
             xref: 'paper', yref: 'paper',
             x0: 0, x1: 1,
-            y0: detDomain[0], y1: detDomain[1],
-            fillcolor: 'rgba(37, 99, 235, 0.07)',
+            y0: detPanel.domain[0], y1: detPanel.domain[1],
+            fillcolor: tc.eventDetectionTint,
             line: { width: 0 },
             layer: 'below',
         });
     }
 
-    // (2) Speech-block bands — visible behind data lines on every panel.
-    const t0 = ev.review_audio_start_sec;
-    const t1 = ev.review_audio_end_sec;
+    // (2) Speech-block bands.
+    const viewRange = getViewRange(ev);
     for (const b of state.session.blocks) {
-        if (b.end_sec < t0 || b.start_sec > t1) continue;
+        if (b.end_sec < viewRange[0] || b.start_sec > viewRange[1]) continue;
         shapes.push({
             type: 'rect',
             xref: 'x', yref: 'paper',
             x0: b.start_sec, x1: b.end_sec,
             y0: 0, y1: 1,
-            fillcolor: 'rgba(34, 197, 94, 0.08)',
+            fillcolor: tc.eventSpeechBlock,
             line: { width: 0 },
             layer: 'below',
         });
     }
 
-    // (3) Other events in the visible window (pale, so the user sees them).
+    // (3) Other events — gray, on their own signal panel only.
     for (const other of state.session.events) {
         if (other.event_id === ev.event_id) continue;
         if (other.event_type === 'joint' || other.event_type === 'affective_episode') continue;
-        if (other.end_sec < t0 || other.start_sec > t1) continue;
-        const otherDomain = PANEL_DOMAINS[other.signal_name];
-        if (!otherDomain) continue;
+        if (other.end_sec < viewRange[0] || other.start_sec > viewRange[1]) continue;
+        const otherPanel = state.panels[other.signal_name];
+        if (!otherPanel) continue;
         shapes.push({
             type: 'rect',
             xref: 'x', yref: 'paper',
             x0: other.start_sec, x1: other.end_sec,
-            y0: otherDomain[0], y1: otherDomain[1],
-            fillcolor: 'rgba(220, 50, 50, 0.10)',
+            y0: otherPanel.domain[0], y1: otherPanel.domain[1],
+            fillcolor: tc.eventOtherFill,
             line: { width: 0 },
             layer: 'below',
         });
     }
 
-    // (4) THE event — bold rect on the detection panel + thin band across all.
-    const eDomain = PANEL_DOMAINS[ev.signal_name] || [0, 1];
+    // (4) Current event — amber band across full height + bold on signal panel.
+    const eDomain = detPanel ? detPanel.domain : [0, 1];
     shapes.push({
         type: 'rect',
         xref: 'x', yref: 'paper',
         x0: ev.start_sec, x1: ev.end_sec,
         y0: 0, y1: 1,
-        fillcolor: 'rgba(220, 50, 50, 0.12)',
-        line: { color: 'rgba(220, 50, 50, 0.4)', width: 1 },
+        fillcolor: tc.eventCurrentFill,
+        line: { width: 0 },
         layer: 'below',
     });
     shapes.push({
@@ -258,57 +352,91 @@ function buildShapes(ev) {
         xref: 'x', yref: 'paper',
         x0: ev.start_sec, x1: ev.end_sec,
         y0: eDomain[0], y1: eDomain[1],
-        fillcolor: 'rgba(220, 50, 50, 0.20)',
-        line: { color: 'rgba(220, 50, 50, 0.7)', width: 1.5 },
+        fillcolor: tc.eventCurrentBand,
+        line: { color: tc.eventCurrentBorder, width: 2 },
         layer: 'below',
     });
+    // Vertical edge lines at event boundaries.
+    for (const xEdge of [ev.start_sec, ev.end_sec]) {
+        shapes.push({
+            type: 'line',
+            xref: 'x', yref: 'paper',
+            x0: xEdge, x1: xEdge,
+            y0: 0, y1: 1,
+            line: { color: tc.eventCurrentEdge, width: 1.5, dash: 'dot' },
+            layer: 'below',
+        });
+    }
 
-    // (5) Playhead — thin vertical line spanning full plot. Updated separately.
+    // (5) Playhead — thin vertical line spanning full plot.
     shapes.push({
         type: 'line',
         xref: 'x', yref: 'paper',
         x0: state.playheadSec, x1: state.playheadSec,
         y0: 0, y1: 1,
-        line: { color: 'rgba(0, 0, 0, 0.6)', width: 1.5 },
+        line: { color: tc.eventPlayhead, width: 1.5 },
         layer: 'above',
     });
     return shapes;
 }
 
-const PLAYHEAD_SHAPE_KEY = 'playhead';
+function getViewRange(ev) {
+    const dur = state.session.audio_duration_sec || 60;
+    if (!ev) return [0, dur];
+    const windowSec = state.contextZoom;
+    if (windowSec === 0) return [0, dur];
+    const center = (ev.start_sec + ev.end_sec) / 2;
+    const half = windowSec / 2;
+    return [Math.max(0, center - half), Math.min(dur, center + half)];
+}
 
 function buildLayout(ev) {
-    const t0 = ev ? ev.review_audio_start_sec : 0;
-    const t1 = ev ? ev.review_audio_end_sec : (state.session.audio_duration_sec || 60);
+    const [t0, t1] = getViewRange(ev);
+    const tc = getThemeColors();
+    const localRanges = computeLocalSignalRanges(t0, t1);
 
-    const baseAxis = (title, domain) => ({
-        domain,
-        title: { text: title, standoff: 4, font: { size: 11 } },
-        zerolinecolor: '#ddd',
-        gridcolor: '#eee',
-        tickfont: { size: 10 },
-    });
+    const baseAxis = (title, domain, range) => {
+        const ax = {
+            domain,
+            title: { text: title, standoff: 4, font: { size: 11, color: tc.plotTitle } },
+            zerolinecolor: tc.plotZero,
+            gridcolor: tc.plotGrid,
+            tickfont: { size: 10, color: tc.plotTick },
+            fixedrange: true,
+        };
+        if (range) { ax.range = range; ax.autorange = false; }
+        return ax;
+    };
 
-    return {
+    const layout = {
         margin: { t: 14, b: 32, l: 56, r: 14 },
         showlegend: false,
-        plot_bgcolor: '#ffffff',
-        paper_bgcolor: '#ffffff',
+        plot_bgcolor: tc.plotBg,
+        paper_bgcolor: tc.plotBg,
         hovermode: 'x',
-        dragmode: 'pan',
+        dragmode: false,
+        hoverlabel: { bgcolor: tc.plotHoverBg, font: { color: tc.plotHoverFg, size: 12 } },
         xaxis: {
             domain: [0, 1],
             range: [t0, t1],
-            title: { text: 'time (s)', font: { size: 11 } },
-            tickfont: { size: 10 },
-            gridcolor: '#eee',
+            autorange: false,
+            fixedrange: true,
+            title: { text: 'time (s)', font: { size: 11, color: tc.plotTitle } },
+            tickfont: { size: 10, color: tc.plotTick },
+            gridcolor: tc.plotGrid,
         },
-        yaxis:  baseAxis('audio',     PANEL_DOMAINS.waveform),
-        yaxis2: baseAxis('dominance', PANEL_DOMAINS.dominance),
-        yaxis3: baseAxis('valence',   PANEL_DOMAINS.valence),
-        yaxis4: baseAxis('arousal',   PANEL_DOMAINS.arousal),
+        yaxis: baseAxis('audio', state.panels._waveform.domain, undefined),
         shapes: buildShapes(ev),
     };
+
+    for (const name of state.signalNames) {
+        const panel = state.panels[name];
+        if (!panel) continue;
+        const axisKey = panel.axis === 'y' ? 'yaxis' : `yaxis${panel.axis.slice(1)}`;
+        layout[axisKey] = baseAxis(name, panel.domain, localRanges[name]);
+    }
+
+    return layout;
 }
 
 // ---------------------------------------------------------------------------
@@ -406,15 +534,25 @@ function renderPlot(ev) {
         ...buildSignalTraces(),
     ].filter(Boolean);
 
-    Plotly.react('plot', traces, buildLayout(ev), { displaylogo: false, responsive: true });
+    Plotly.react('plot', traces, buildLayout(ev), {
+        displaylogo: false,
+        responsive: true,
+        scrollZoom: false,
+        modeBarButtonsToRemove: [
+            'select2d', 'lasso2d', 'autoScale2d',
+            'zoomIn2d', 'zoomOut2d', 'zoom2d', 'pan2d', 'resetScale2d',
+        ],
+    });
 }
 
 function renderAll() {
     const ev = currentEvent();
+    state.windowedWaveform = null;
     renderEventMeta(ev);
     renderLabelForm(ev);
     renderMinimap();
     renderPlot(ev);
+    debouncedWaveformFetch();
 
     if (ev) {
         const audio = document.getElementById('audio');
@@ -496,6 +634,15 @@ function populateFilterUI() {
 
     const sortSel = document.getElementById('sort-by');
     sortSel.addEventListener('change', () => { state.sort = sortSel.value; refresh(); });
+
+    const zoomSel = document.getElementById('context-zoom');
+    if (zoomSel) {
+        zoomSel.addEventListener('change', () => {
+            state.contextZoom = parseInt(zoomSel.value, 10);
+            renderPlot(currentEvent());
+            debouncedWaveformFetch();
+        });
+    }
 }
 
 function refresh() {
@@ -685,11 +832,65 @@ function bindKeyboard() {
 }
 
 // ---------------------------------------------------------------------------
+// Theme
+// ---------------------------------------------------------------------------
+
+function initTheme() {
+    const saved = localStorage.getItem('ae-review-theme') || 'dark';
+    document.documentElement.dataset.theme = saved;
+}
+
+function toggleTheme() {
+    const next = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
+    document.documentElement.dataset.theme = next;
+    localStorage.setItem('ae-review-theme', next);
+    renderPlot(currentEvent());
+}
+
+// ---------------------------------------------------------------------------
+// Multi-resolution waveform
+// ---------------------------------------------------------------------------
+
+let waveformAbort = null;
+
+async function fetchWindowedWaveform(t0, t1) {
+    if (waveformAbort) waveformAbort.abort();
+    waveformAbort = new AbortController();
+    try {
+        const url = `/api/waveform?t0=${t0.toFixed(2)}&t1=${t1.toFixed(2)}&n_peaks=2000`;
+        const r = await fetch(url, { signal: waveformAbort.signal });
+        if (!r.ok) return;
+        const wf = await r.json();
+        state.windowedWaveform = wf;
+        renderPlot(currentEvent());
+    } catch (e) {
+        if (e.name !== 'AbortError') console.error('waveform fetch:', e);
+    }
+}
+
+const debouncedWaveformFetch = debounce(() => {
+    const ev = currentEvent();
+    if (!ev) return;
+    const [t0, t1] = getViewRange(ev);
+    const dur = state.session.audio_duration_sec || 1;
+    if ((t1 - t0) / dur > 0.5) {
+        state.windowedWaveform = null;
+        renderPlot(currentEvent());
+        return;
+    }
+    fetchWindowedWaveform(t0, t1);
+}, 200);
+
+// ---------------------------------------------------------------------------
 // Init
 // ---------------------------------------------------------------------------
 
 async function init() {
-    // Wait for Plotly (loaded with `defer`) before rendering.
+    initTheme();
+
+    const themeBtn = document.getElementById('theme-toggle');
+    if (themeBtn) themeBtn.addEventListener('click', toggleTheme);
+
     if (typeof Plotly === 'undefined') {
         await new Promise((resolve) => {
             const check = setInterval(() => {
@@ -711,6 +912,9 @@ async function init() {
         state.waveform = waveform;
         state.eventsById = Object.fromEntries(session.events.map(e => [e.event_id, e]));
 
+        state.signalNames = resolveSignalNames(state.signalsMeta, state.signals);
+        state.panels = buildPanelConfig(state.signalNames);
+
         for (const lbl of Object.values(session.labels || {})) {
             for (const t of (lbl.tags || [])) state.knownTags.add(t);
         }
@@ -725,6 +929,11 @@ async function init() {
 
         refresh();
         bindPlotClick();
+
+        window.addEventListener('resize', debounce(() => {
+            Plotly.Plots.resize('plot');
+        }, 150));
+
         setSaveStatus('muted', '');
     } catch (e) {
         console.error(e);
