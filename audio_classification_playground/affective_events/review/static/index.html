@@ -27,16 +27,16 @@
             <label>type
                 <select id="filter-type"><option value="">all</option></select>
             </label>
-            <label>min conf
-                <input id="filter-conf" type="range" min="0" max="1" step="0.05" value="0">
-                <span id="filter-conf-display">0.00</span>
+            <label>min peak z
+                <input id="filter-peak-z" type="range" min="0" max="5" step="0.25" value="0">
+                <span id="filter-peak-z-display">0.00</span>
             </label>
             <label><input id="filter-unlabeled" type="checkbox"> unlabeled only</label>
             <label>sort
                 <select id="sort-by">
                     <option value="time">time</option>
-                    <option value="strength">strength</option>
-                    <option value="confidence">confidence</option>
+                    <option value="peak_z">peak z</option>
+                    <option value="duration">duration</option>
                 </select>
             </label>
             <label>context

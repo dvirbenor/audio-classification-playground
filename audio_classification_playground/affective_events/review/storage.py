@@ -22,9 +22,9 @@ from typing import Iterable, Sequence
 
 import numpy as np
 
-from ..config import Config
-from ..preprocessing import build_blocks
-from ..types import Event, Signal, Vad
+from ..v2.config import Config
+from ..v2.preprocessing import build_blocks
+from ..v2.types import Event, Signal, Vad
 from .models import Label, LabelingSession
 
 
@@ -144,21 +144,19 @@ def save_session(
         for s in signals
     }
 
-    # --- blocks (use the same merging the pipeline uses, so the UI matches)
+    # --- blocks (use the same v2 merging the pipeline uses, so the UI matches)
     block_objs = build_blocks(vad, config)
     blocks = [
         {
             "block_id": b.block_id,
             "start_sec": b.start_sec,
             "end_sec": b.end_sec,
-            "gap_before_sec": b.gap_before_sec if b.gap_before_sec != float("inf") else None,
-            "gap_after_sec": b.gap_after_sec if b.gap_after_sec != float("inf") else None,
         }
         for b in block_objs
     ]
 
     # --- events → list of dicts
-    event_dicts = [asdict(e) for e in events]
+    event_dicts = [e.as_dict() if hasattr(e, "as_dict") else asdict(e) for e in events]
 
     # --- inheritance (if requested)
     labels: dict[str, dict] = {}
@@ -188,6 +186,7 @@ def save_session(
         labels=labels,
         created_at=_utc_now_iso(),
         last_updated_at=_utc_now_iso(),
+        event_schema="affective_events.v2",
         notes=notes,
     )
 

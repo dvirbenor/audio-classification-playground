@@ -64,7 +64,7 @@ class LabelingSession:
     inline so the JSON is portable and inspectable.
     """
 
-    SCHEMA_VERSION: ClassVar[int] = 1
+    SCHEMA_VERSION: ClassVar[int] = 2
 
     session_id: str
     recording_id: str
@@ -79,14 +79,15 @@ class LabelingSession:
     signals_data_path: str       # filename, relative to session JSON's dir
 
     vad_intervals: list[list[float]]   # [[start, end], ...]
-    blocks: list[dict]                  # [{block_id, start_sec, end_sec, gap_before_sec, gap_after_sec}]
+    blocks: list[dict]                  # [{block_id, start_sec, end_sec}]
 
-    events: list[dict]            # serialized Event dicts
+    events: list[dict]            # serialized v2 Event dicts
     labels: dict[str, dict]       # event_id -> Label dict
 
     created_at: str
     last_updated_at: str
     schema_version: int = SCHEMA_VERSION
+    event_schema: str = "affective_events.v2"
     notes: str = ""
 
     def to_dict(self) -> dict:
@@ -107,6 +108,7 @@ class LabelingSession:
             "labels": self.labels,
             "created_at": self.created_at,
             "last_updated_at": self.last_updated_at,
+            "event_schema": self.event_schema,
             "notes": self.notes,
         }
 
@@ -129,5 +131,6 @@ class LabelingSession:
             labels=dict(d.get("labels", {})),
             created_at=d.get("created_at", ""),
             last_updated_at=d.get("last_updated_at", ""),
+            event_schema=d.get("event_schema", "affective_events.v2"),
             notes=d.get("notes", "") or "",
         )

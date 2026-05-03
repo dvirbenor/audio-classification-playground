@@ -51,6 +51,8 @@ def make_app(session_path: str | Path) -> FastAPI:
         # Strip the bulky signal arrays — they live behind /api/signals.
         return JSONResponse({
             "session_id": sess["session_id"],
+            "schema_version": sess.get("schema_version"),
+            "event_schema": sess.get("event_schema", "affective_events.v2"),
             "recording_id": sess["recording_id"],
             "audio_sr": sess["audio_sr"],
             "audio_duration_sec": sess["audio_duration_sec"],

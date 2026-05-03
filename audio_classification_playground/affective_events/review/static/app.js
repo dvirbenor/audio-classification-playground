@@ -21,7 +21,7 @@ const state = {
     eventsById: {},       // id -> event
     filtered: [],         // ordered list of event ids after filter+sort
     currentIndex: 0,      // index into filtered
-    filter: { signal: '', type: '', minConf: 0, unlabeledOnly: false },
+    filter: { signal: '', type: '', minPeakZ: 0, unlabeledOnly: false },
     sort: 'time',
     contextZoom: 30,      // view window in seconds (10, 30, 60, 120, 300), 0 = full
     playheadSec: 0,
@@ -32,6 +32,7 @@ const state = {
 };
 
 const VERDICTS = ['tp', 'fp', 'unclear', 'partial'];
+const REVIEW_AUDIO_PAD_SEC = 8;
 
 // ---------------------------------------------------------------------------
 // Dynamic panel config — derived from loaded signals at runtime
@@ -150,6 +151,20 @@ const fmtTime = (sec) => {
 
 const fmtNum = (v, d = 2) => (v == null ? '–' : Number(v).toFixed(d));
 
+function signedPeakZ(ev) {
+    if (!ev || ev.event_type === 'joint') return ev ? ev.peak_z : null;
+    return ev.direction === '-' ? -ev.peak_z : ev.peak_z;
+}
+
+function eventContextStart(ev) {
+    return Math.max(0, (ev ? ev.start_sec : 0) - REVIEW_AUDIO_PAD_SEC);
+}
+
+function blockIds(ev) {
+    const ids = ev && ev.extra ? ev.extra.block_ids : null;
+    return Array.isArray(ids) ? ids.join(',') : '';
+}
+
 function debounce(fn, ms) {
     let t = null;
     return function (...args) {
@@ -181,7 +196,7 @@ function applyFilterSort() {
     let list = events.filter(e => {
         if (f.signal && e.signal_name !== f.signal) return false;
         if (f.type && e.event_type !== f.type) return false;
-        if ((e.confidence || 0) < f.minConf) return false;
+        if ((e.peak_z || 0) < f.minPeakZ) return false;
         const lbl = labels[e.event_id];
         if (f.unlabeledOnly && lbl && lbl.verdict) return false;
         return true;
@@ -189,8 +204,8 @@ function applyFilterSort() {
 
     const cmp = {
         time:       (a, b) => a.start_sec - b.start_sec,
-        strength:   (a, b) => (b.strength || 0) - (a.strength || 0),
-        confidence: (a, b) => (b.confidence || 0) - (a.confidence || 0),
+        peak_z:     (a, b) => (b.peak_z || 0) - (a.peak_z || 0),
+        duration:   (a, b) => (b.duration_sec || 0) - (a.duration_sec || 0),
     }[state.sort] || ((a, b) => a.start_sec - b.start_sec);
     list.sort(cmp);
 
@@ -463,24 +478,21 @@ function renderEventMeta(ev) {
 
     pos.textContent = `${state.currentIndex + 1} / ${state.filtered.length}`;
 
-    const baselineLabel = ev.baseline_source === 'local'
-        ? `local baseline (ctx ${fmtNum(ev.baseline_context_speech_sec, 1)}s)`
-        : `global baseline (sparse ctx ${fmtNum(ev.baseline_context_speech_sec, 1)}s)`;
-
     meta.innerHTML = [
         `<span class="pill signal">${ev.signal_name}</span>`,
         `<span class="pill">${ev.event_type}</span>`,
         `<span class="pill">${ev.direction}</span>`,
         `t=${fmtNum(ev.start_sec, 2)}–${fmtNum(ev.end_sec, 2)}s (${fmtNum(ev.duration_sec, 1)}s)`,
-        `Δ=${fmtNum(ev.delta, 3)} (z=${fmtNum(ev.delta_z, 2)})`,
-        `strength=${fmtNum(ev.strength, 2)}`,
-        `conf=${fmtNum(ev.confidence, 2)}`,
-        `cov=${fmtNum(ev.mean_speech_coverage, 2)}`,
-        `block=${ev.block_ids.join(',')}`,
-        baselineLabel,
-        ev.near_block_start ? '<span class="pill" style="border-color:#d97706;color:#d97706">near-start</span>' : '',
-        ev.near_block_end   ? '<span class="pill" style="border-color:#d97706;color:#d97706">near-end</span>'   : '',
+        `peak_z=${fmtNum(ev.peak_z, 2)}`,
+        `signed_z=${fmtNum(signedPeakZ(ev), 2)}`,
+        `peak_t=${fmtNum(ev.peak_time_sec, 2)}s`,
+        `Δ=${fmtNum(ev.delta, 3)}`,
+        `baseline=${fmtNum(ev.baseline_at_peak, 3)}`,
+        `scale=${fmtNum(ev.scale_at_peak, 3)}`,
+        `frames=${ev.frame_start}–${ev.frame_end}`,
+        blockIds(ev) ? `block=${blockIds(ev)}` : '',
         ev.parent_id ? `parent=<code>${ev.parent_id}</code>` : '',
+        ev.children && ev.children.length ? `children=${ev.children.length}` : '',
         lbl && lbl.inherited_from ? `<span class="pill" style="border-color:#7c3aed;color:#7c3aed">inherited (${fmtNum(lbl.inherited_match_score, 2)})</span>` : '',
     ].filter(Boolean).join(' &middot; ');
 }
@@ -556,7 +568,7 @@ function renderAll() {
 
     if (ev) {
         const audio = document.getElementById('audio');
-        const target = ev.review_audio_start_sec;
+        const target = eventContextStart(ev);
         // Avoid re-triggering buffering on tiny diffs
         if (Math.abs(audio.currentTime - target) > 0.5) {
             audio.currentTime = target;
@@ -621,11 +633,11 @@ function populateFilterUI() {
     sigSel.addEventListener('change', () => { state.filter.signal = sigSel.value; refresh(); });
     typSel.addEventListener('change', () => { state.filter.type   = typSel.value; refresh(); });
 
-    const conf = document.getElementById('filter-conf');
-    const confDisplay = document.getElementById('filter-conf-display');
-    conf.addEventListener('input', () => {
-        state.filter.minConf = parseFloat(conf.value);
-        confDisplay.textContent = state.filter.minConf.toFixed(2);
+    const peakZ = document.getElementById('filter-peak-z');
+    const peakZDisplay = document.getElementById('filter-peak-z-display');
+    peakZ.addEventListener('input', () => {
+        state.filter.minPeakZ = parseFloat(peakZ.value);
+        peakZDisplay.textContent = state.filter.minPeakZ.toFixed(2);
         refresh();
     });
 
@@ -758,7 +770,7 @@ function bindAudio() {
     });
     document.getElementById('play-context').addEventListener('click', () => {
         const ev = currentEvent(); if (!ev) return;
-        audio.currentTime = ev.review_audio_start_sec; audio.play();
+        audio.currentTime = eventContextStart(ev); audio.play();
     });
     document.getElementById('back-2s').addEventListener('click', () => { audio.currentTime = Math.max(0, audio.currentTime - 2); });
     document.getElementById('fwd-2s').addEventListener('click',  () => { audio.currentTime = audio.currentTime + 2; });

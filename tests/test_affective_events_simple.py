@@ -33,11 +33,10 @@ class SimpleAffectiveEventsTest(unittest.TestCase):
         self.assertEqual(leaves[0].block_ids, (2,))
         self.assertGreater(leaves[0].delta_z, Config.balanced().baseline_departure_z)
 
-    def test_legacy_backend_remains_available(self):
-        self.assertEqual(
-            Config.legacy_model_selection().detector_backend,
-            "legacy_model_selection",
-        )
+    def test_v2_backend_is_available_alongside_v1(self):
+        from audio_classification_playground.affective_events.v2 import Config as V2Config
+
+        self.assertEqual(V2Config.balanced().z_seed, 1.75)
 
 
 if __name__ == "__main__":
