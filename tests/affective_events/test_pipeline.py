@@ -5,14 +5,15 @@ from pathlib import Path
 
 import numpy as np
 
-from audio_classification_playground.affective_events.v2 import (
+from audio_classification_playground.affective_events import (
     Config,
     Signal,
     Vad,
     extract_events,
+    tracks_from_signals,
 )
-from audio_classification_playground.affective_events.v2.config import value_for_signal
-from audio_classification_playground.affective_events.v2.preprocessing import assign_frame_blocks, build_blocks
+from audio_classification_playground.affective_events.config import value_for_signal
+from audio_classification_playground.affective_events.preprocessing import assign_frame_blocks, build_blocks
 
 
 class PipelineTest(unittest.TestCase):
@@ -45,16 +46,33 @@ class PipelineTest(unittest.TestCase):
         )
         leaves = [
             e for e in events
-            if e.signal_name == "arousal" and e.event_type == "deviation"
+            if e.source_track_ids == ("affect.arousal",) and e.event_type == "deviation"
         ]
 
         self.assertTrue(
-            any(e.frame_start == 30 and e.frame_end == 230 for e in leaves),
+            any(e.extra["frame_start"] == 30 and e.extra["frame_end"] == 230 for e in leaves),
             [e.as_dict() for e in leaves],
         )
-        long_event = next(e for e in leaves if e.frame_start == 30 and e.frame_end == 230)
+        long_event = next(e for e in leaves if e.extra["frame_start"] == 30 and e.extra["frame_end"] == 230)
+        self.assertRegex(long_event.event_id, r"^affect\.default\.deviation\.\d{6}$")
+        self.assertEqual(long_event.task, "affect")
+        self.assertEqual(long_event.label, "arousal_deviation")
+        self.assertEqual(long_event.source_track_ids, ("affect.arousal",))
+        self.assertEqual(long_event.score_name, "peak_z")
+        self.assertIn("baseline_at_peak", long_event.evidence)
         self.assertEqual(long_event.direction, "+")
         self.assertIn(long_event.extra["peak_frame"], range(100, 106))
+
+    def test_tracks_from_signals_maps_affect_to_regular_grid_tracks(self):
+        track = tracks_from_signals([
+            Signal("valence", np.array([0.1, 0.2]), hop_sec=0.25, window_sec=3.5)
+        ])[0]
+
+        self.assertEqual(track.track_id, "affect.valence")
+        self.assertEqual(track.producer_id, "affect.default")
+        self.assertEqual(track.task, "affect")
+        self.assertEqual(track.value_type, "continuous")
+        self.assertEqual(track.renderer, "line")
 
     def test_synthetic_pipeline_invariants(self):
         hop = 0.25
@@ -109,7 +127,7 @@ class PipelineTest(unittest.TestCase):
             Config.balanced(),
         )
         counts = {
-            name: sum(1 for e in events if e.event_type == "deviation" and e.signal_name == name)
+            name: sum(1 for e in events if e.event_type == "deviation" and e.source_track_ids == (f"affect.{name}",))
             for name in ("arousal", "valence", "dominance")
         }
         for count in counts.values():
@@ -123,22 +141,24 @@ def _assert_invariants(testcase, leaves, interior, config, signal_name, hop):
     merge_gap_frames = int(round(value_for_signal(config.merge_gap_sec, signal_name) / hop))
 
     for event in leaves:
-        testcase.assertTrue(interior[event.frame_start])
-        testcase.assertTrue(interior[event.frame_end - 1])
-        testcase.assertTrue(interior[event.frame_start:event.frame_end].all())
+        frame_start = event.extra["frame_start"]
+        frame_end = event.extra["frame_end"]
+        testcase.assertTrue(interior[frame_start])
+        testcase.assertTrue(interior[frame_end - 1])
+        testcase.assertTrue(interior[frame_start:frame_end].all())
         testcase.assertGreaterEqual(event.duration_sec, min_duration_sec)
-        testcase.assertGreaterEqual(event.peak_z, value_for_signal(config.z_seed, signal_name))
+        testcase.assertGreaterEqual(event.score, value_for_signal(config.z_seed, signal_name))
         testcase.assertGreaterEqual(event.extra["seed_width_frames"] * hop, value_for_signal(config.seed_min_width_sec, signal_name))
         testcase.assertGreaterEqual(event.extra["shoulder_start_z"], z_return)
         testcase.assertGreaterEqual(event.extra["shoulder_end_z"], z_return)
-        if event.extra["next_left_z"] is not None and event.frame_start > 0 and interior[event.frame_start - 1]:
+        if event.extra["next_left_z"] is not None and frame_start > 0 and interior[frame_start - 1]:
             testcase.assertLess(event.extra["next_left_z"], z_return)
-        if event.extra["next_right_z"] is not None and event.frame_end < len(interior) and interior[event.frame_end]:
+        if event.extra["next_right_z"] is not None and frame_end < len(interior) and interior[frame_end]:
             testcase.assertLess(event.extra["next_right_z"], z_return)
 
     for prev, cur in zip(leaves, leaves[1:]):
-        if prev.signal_name == cur.signal_name and prev.direction == cur.direction:
-            testcase.assertGreater(cur.frame_start - prev.frame_end, merge_gap_frames)
+        if prev.source_track_ids == cur.source_track_ids and prev.direction == cur.direction:
+            testcase.assertGreater(cur.extra["frame_start"] - prev.extra["frame_end"], merge_gap_frames)
 
 
 if __name__ == "__main__":

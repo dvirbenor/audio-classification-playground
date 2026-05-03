@@ -48,18 +48,18 @@ def make_app(session_path: str | Path) -> FastAPI:
     @app.get("/api/session")
     async def get_session() -> JSONResponse:
         sess = state["session"]
-        # Strip the bulky signal arrays — they live behind /api/signals.
+        # Strip bulky track arrays — they live behind /api/tracks.
         return JSONResponse({
             "session_id": sess["session_id"],
             "schema_version": sess.get("schema_version"),
-            "event_schema": sess.get("event_schema", "affective_events.v2"),
+            "event_schema": sess.get("event_schema", "acoustic_events.v1"),
             "recording_id": sess["recording_id"],
             "audio_sr": sess["audio_sr"],
             "audio_duration_sec": sess["audio_duration_sec"],
-            "config_hash": sess["config_hash"],
-            "signals_meta": sess["signals_meta"],
+            "session_fingerprint": sess.get("session_fingerprint", ""),
+            "producer_runs": sess.get("producer_runs", []),
+            "tracks_meta": sess.get("tracks_meta", {}),
             "vad_intervals": sess["vad_intervals"],
-            "blocks": sess["blocks"],
             "events": sess["events"],
             "labels": sess.get("labels", {}),
             "verdicts": list(VERDICTS),
@@ -69,15 +69,23 @@ def make_app(session_path: str | Path) -> FastAPI:
         })
 
     # ---- Signals (full arrays, served once on page load) -----------------
-    @app.get("/api/signals")
-    async def get_signals() -> JSONResponse:
+    @app.get("/api/tracks")
+    async def get_tracks() -> JSONResponse:
         sess = state["session"]
-        npz_path = state["path"].parent / sess["signals_data_path"]
+        npz_path = state["path"].parent / sess["tracks_data_path"]
         if not npz_path.is_file():
-            raise HTTPException(404, f"signals data not found at {npz_path}")
+            raise HTTPException(404, f"tracks data not found at {npz_path}")
         arrays = np.load(npz_path)
-        payload = {name: arrays[name].astype(np.float32).tolist() for name in arrays.files}
-        return JSONResponse({"signals": payload, "meta": sess["signals_meta"]})
+        meta = sess.get("tracks_meta", {})
+        payload = {}
+        for track_id, track_meta in meta.items():
+            if track_meta.get("kind") == "marker":
+                payload[track_id] = track_meta.get("items", [])
+            elif track_id in arrays.files:
+                payload[track_id] = arrays[track_id].astype(np.float32).tolist()
+            else:
+                payload[track_id] = []
+        return JSONResponse({"tracks": payload, "meta": meta})
 
     # ---- Audio (range-served) -------------------------------------------
     @app.get("/api/audio")

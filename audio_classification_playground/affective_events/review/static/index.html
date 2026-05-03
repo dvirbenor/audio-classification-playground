@@ -21,21 +21,30 @@
             <button id="theme-toggle" title="Toggle dark/light theme">◐</button>
         </div>
         <div id="filterbar">
-            <label>signal
-                <select id="filter-signal"><option value="">all</option></select>
+            <label>task
+                <select id="filter-task"><option value="">all</option></select>
+            </label>
+            <label>producer
+                <select id="filter-producer"><option value="">all</option></select>
+            </label>
+            <label>label
+                <select id="filter-label"><option value="">all</option></select>
             </label>
             <label>type
                 <select id="filter-type"><option value="">all</option></select>
             </label>
-            <label>min peak z
-                <input id="filter-peak-z" type="range" min="0" max="5" step="0.25" value="0">
-                <span id="filter-peak-z-display">0.00</span>
+            <label>track
+                <select id="filter-track"><option value="">all</option></select>
+            </label>
+            <label>min score
+                <input id="filter-score" type="range" min="0" max="5" step="0.05" value="0">
+                <span id="filter-score-display">0.00</span>
             </label>
             <label><input id="filter-unlabeled" type="checkbox"> unlabeled only</label>
             <label>sort
                 <select id="sort-by">
                     <option value="time">time</option>
-                    <option value="peak_z">peak z</option>
+                    <option value="score">score</option>
                     <option value="duration">duration</option>
                 </select>
             </label>

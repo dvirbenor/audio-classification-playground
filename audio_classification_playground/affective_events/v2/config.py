@@ -1,4 +1,4 @@
-"""Configuration for the v2 affective-events detector."""
+"""Configuration for the canonical affective-events detector."""
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace

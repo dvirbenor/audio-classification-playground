@@ -1,11 +1,12 @@
-"""Typed containers for the v2 affective-events pipeline."""
+"""Typed containers for the canonical affective-events pipeline."""
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass
 from typing import Iterable, Sequence
 
 import numpy as np
 
+from ..schema import Event, ProducerRun, RegularGridTrack
 
 @dataclass(frozen=True)
 class Signal:
@@ -122,31 +123,11 @@ class Block:
         return 0.5 * (self.start_sec + self.end_sec)
 
 
-@dataclass(frozen=True)
-class Event:
-    """A v2 deviation leaf or cross-signal joint parent."""
-
-    event_id: str
-    signal_name: str
-    event_type: str
-
-    start_sec: float
-    end_sec: float
-    duration_sec: float
-    frame_start: int
-    frame_end: int
-
-    direction: str
-
-    peak_z: float
-    peak_time_sec: float
-    baseline_at_peak: float
-    scale_at_peak: float
-    delta: float
-
-    parent_id: str | None = None
-    children: tuple[str, ...] = ()
-    extra: dict = field(default_factory=dict)
-
-    def as_dict(self) -> dict:
-        return asdict(self)
+__all__ = [
+    "Signal",
+    "Vad",
+    "Block",
+    "Event",
+    "ProducerRun",
+    "RegularGridTrack",
+]

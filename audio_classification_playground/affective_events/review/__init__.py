@@ -1,18 +1,19 @@
-"""Review interface for inspecting and labeling detected affective events.
+"""Review interface for inspecting and labeling acoustic events.
 
 Quick start::
 
     from audio_classification_playground.affective_events import (
-        extract_events, Config, Signal, Vad,
+        extract_events, tracks_from_signals, Config, Signal, Vad,
     )
     from audio_classification_playground.affective_events.review import (
         save_session, launch_review,
     )
 
     events = extract_events(signals, vad, Config.balanced())
+    tracks = tracks_from_signals(signals)
     session_path = save_session(
         events=events,
-        signals=signals,
+        tracks=tracks,
         vad=vad,
         config=Config.balanced(),
         audio_path="/path/to/audio.mp3",
@@ -34,6 +35,7 @@ from .storage import (
     load_session,
     load_session_json,
     save_session,
+    session_fingerprint,
     update_label,
 )
 
@@ -86,6 +88,7 @@ __all__ = [
     "clear_label",
     "inherit_labels",
     "config_hash",
+    "session_fingerprint",
     "make_app",
     "launch_review",
 ]

@@ -2,12 +2,12 @@
 
 Files on disk for a single session::
 
-    <session_dir>/<recording_id>/<config_hash>__<timestamp>.json
-    <session_dir>/<recording_id>/<config_hash>__<timestamp>.npz
+    <session_dir>/<recording_id>/<timestamp>__<short_uuid>.json
+    <session_dir>/<recording_id>/<timestamp>__<short_uuid>.npz
 
 The JSON is the canonical session record (human-readable, diffable, tiny).
-The ``.npz`` holds raw signal arrays — too large for JSON, too small to
-deserve their own subdirectory.
+The ``.npz`` holds regular-grid track arrays — too large for JSON, too small
+to deserve their own subdirectory. Sparse marker tracks live in JSON metadata.
 """
 from __future__ import annotations
 
@@ -15,21 +15,24 @@ import hashlib
 import json
 import os
 import tempfile
+import uuid
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Sequence
 
 import numpy as np
 
+from ..schema import Event, PredictionTrack, ProducerRun, RegularGridTrack, track_meta
 from ..v2.config import Config
+from ..v2.pipeline import DEFAULT_PRODUCER_ID, producer_run as affect_producer_run
 from ..v2.preprocessing import build_blocks
-from ..v2.types import Event, Signal, Vad
+from ..v2.types import Vad
 from .models import Label, LabelingSession
 
 
 _SESSION_SUFFIX = ".json"
-_SIGNALS_SUFFIX = ".npz"
+_TRACKS_SUFFIX = ".npz"
 
 
 # ---------------------------------------------------------------------------
@@ -47,6 +50,32 @@ def _sanitize_for_filename(s: str) -> str:
 
 def config_hash(config: Config | dict) -> str:
     payload = asdict(config) if is_dataclass(config) and not isinstance(config, type) else dict(config)
+    blob = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+    return hashlib.sha256(blob).hexdigest()[:16]
+
+
+def session_fingerprint(
+    producer_runs: Sequence[ProducerRun | dict],
+    events: Sequence[Event | dict],
+    tracks: Sequence[PredictionTrack],
+) -> str:
+    producers = [
+        p.as_dict() if hasattr(p, "as_dict") else dict(p)
+        for p in producer_runs
+    ]
+    payload = {
+        "producers": [
+            {
+                "producer_id": p.get("producer_id"),
+                "task": p.get("task"),
+                "config_hash": p.get("config_hash"),
+            }
+            for p in sorted(producers, key=lambda x: x.get("producer_id", ""))
+        ],
+        "event_count": len(events),
+        "track_count": len(tracks),
+        "track_ids": sorted(t.track_id for t in tracks),
+    }
     blob = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
     return hashlib.sha256(blob).hexdigest()[:16]
 
@@ -100,11 +129,12 @@ def _json_default(obj):
 def save_session(
     *,
     events: Sequence[Event],
-    signals: Sequence[Signal],
+    tracks: Sequence[PredictionTrack],
     vad: Vad,
-    config: Config,
     audio_path: str | Path,
     session_dir: str | Path,
+    producer_runs: Sequence[ProducerRun | dict] | None = None,
+    config: Config | dict | None = None,
     recording_id: str | None = None,
     inherit_from: str | Path | None = None,
     inherit_overlap_threshold: float = 0.5,
@@ -113,7 +143,7 @@ def save_session(
     """Persist a session JSON (+ companion ``.npz``). Returns the JSON path.
 
     If ``inherit_from`` points to a previous session, labels are pre-populated
-    via time-overlap matching on the same signal name.
+    via semantic key + time-overlap matching.
     """
     audio_path = Path(audio_path).resolve()
     session_dir = Path(session_dir)
@@ -122,41 +152,35 @@ def save_session(
     recording_id = _sanitize_for_filename(recording_id)
 
     sr, duration = _audio_metadata(audio_path)
-    chash = config_hash(config)
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    session_id = f"{chash}__{ts}"
+    session_id = f"{ts}__{uuid.uuid4().hex[:8]}"
 
     out_dir = session_dir / recording_id
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # --- signals → .npz
-    signals_filename = f"{session_id}{_SIGNALS_SUFFIX}"
-    np.savez_compressed(
-        out_dir / signals_filename,
-        **{s.name: s.values.astype(np.float32, copy=False) for s in signals},
-    )
-    signals_meta = {
-        s.name: {
-            "hop_sec": float(s.hop_sec),
-            "window_sec": float(s.window_sec),
-            "n_frames": int(s.n_frames),
-        }
-        for s in signals
+    # --- tracks → .npz + JSON metadata
+    tracks_filename = f"{session_id}{_TRACKS_SUFFIX}"
+    arrays = {
+        t.track_id: t.values.astype(np.float32, copy=False)
+        for t in tracks
+        if isinstance(t, RegularGridTrack)
     }
-
-    # --- blocks (use the same v2 merging the pipeline uses, so the UI matches)
-    block_objs = build_blocks(vad, config)
-    blocks = [
-        {
-            "block_id": b.block_id,
-            "start_sec": b.start_sec,
-            "end_sec": b.end_sec,
-        }
-        for b in block_objs
-    ]
+    if arrays:
+        np.savez_compressed(out_dir / tracks_filename, **arrays)
+    else:
+        np.savez_compressed(out_dir / tracks_filename)
+    tracks_meta = {t.track_id: track_meta(t) for t in tracks}
 
     # --- events → list of dicts
     event_dicts = [e.as_dict() if hasattr(e, "as_dict") else asdict(e) for e in events]
+
+    producer_run_dicts = _producer_run_dicts(
+        producer_runs=producer_runs,
+        tracks=tracks,
+        vad=vad,
+        config=config,
+    )
+    fingerprint = session_fingerprint(producer_run_dicts, event_dicts, tracks)
 
     # --- inheritance (if requested)
     labels: dict[str, dict] = {}
@@ -176,23 +200,61 @@ def save_session(
         audio_path=str(audio_path),
         audio_sr=sr,
         audio_duration_sec=duration,
-        config=asdict(config),
-        config_hash=chash,
-        signals_meta=signals_meta,
-        signals_data_path=signals_filename,
+        producer_runs=producer_run_dicts,
+        session_fingerprint=fingerprint,
+        tracks_meta=tracks_meta,
+        tracks_data_path=tracks_filename,
         vad_intervals=[[float(s), float(e)] for s, e in vad.intervals],
-        blocks=blocks,
         events=event_dicts,
         labels=labels,
         created_at=_utc_now_iso(),
         last_updated_at=_utc_now_iso(),
-        event_schema="affective_events.v2",
+        event_schema="acoustic_events.v1",
         notes=notes,
     )
 
     json_path = out_dir / f"{session_id}{_SESSION_SUFFIX}"
     _atomic_write_json(json_path, session.to_dict())
     return json_path
+
+
+def _producer_run_dicts(
+    *,
+    producer_runs: Sequence[ProducerRun | dict] | None,
+    tracks: Sequence[PredictionTrack],
+    vad: Vad,
+    config: Config | dict | None,
+) -> list[dict]:
+    if producer_runs is not None:
+        return [
+            p.as_dict() if hasattr(p, "as_dict") else dict(p)
+            for p in producer_runs
+        ]
+
+    producer_ids = sorted({t.producer_id for t in tracks})
+    if not producer_ids and config is None:
+        return []
+
+    out: list[dict] = []
+    for producer_id in producer_ids or [DEFAULT_PRODUCER_ID]:
+        if producer_id == DEFAULT_PRODUCER_ID and config is not None:
+            cfg = config if isinstance(config, Config) else Config(**dict(config))
+            blocks = build_blocks(vad, cfg)
+            out.append(affect_producer_run(cfg, blocks=blocks).as_dict())
+        else:
+            out.append(ProducerRun(
+                producer_id=producer_id,
+                task=_task_for_producer(producer_id, tracks),
+                source_model="",
+            ).as_dict())
+    return out
+
+
+def _task_for_producer(producer_id: str, tracks: Sequence[PredictionTrack]) -> str:
+    for track in tracks:
+        if track.producer_id == producer_id:
+            return track.task
+    return ""
 
 
 # ---------------------------------------------------------------------------

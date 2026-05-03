@@ -2,8 +2,8 @@ import unittest
 
 import numpy as np
 
-from audio_classification_playground.affective_events.v2.config import Config
-from audio_classification_playground.affective_events.v2.detector import detect_prominence
+from audio_classification_playground.affective_events.config import Config
+from audio_classification_playground.affective_events.detectors import detect_prominence
 
 
 class DetectorTest(unittest.TestCase):

@@ -7,7 +7,9 @@ from audio_classification_playground.affective_events import (
     Signal,
     Vad,
     extract_events,
+    tracks_from_signals,
 )
+from audio_classification_playground.affective_events.config import value_for_signal
 
 
 class SimpleAffectiveEventsTest(unittest.TestCase):
@@ -28,15 +30,19 @@ class SimpleAffectiveEventsTest(unittest.TestCase):
             Config.balanced(),
         )
 
-        leaves = [e for e in events if e.event_type == "block_deviation"]
+        leaves = [e for e in events if e.event_type == "deviation"]
         self.assertEqual(len(leaves), 1)
-        self.assertEqual(leaves[0].block_ids, (2,))
-        self.assertGreater(leaves[0].delta_z, Config.balanced().baseline_departure_z)
+        self.assertEqual(leaves[0].evidence["block_ids"], (2,))
+        self.assertGreater(leaves[0].score, value_for_signal(Config.balanced().z_seed, "arousal"))
 
-    def test_v2_backend_is_available_alongside_v1(self):
-        from audio_classification_playground.affective_events.v2 import Config as V2Config
+    def test_tracks_from_signals_uses_canonical_track_schema(self):
+        track = tracks_from_signals([
+            Signal("arousal", np.zeros(4), hop_sec=0.25, window_sec=1.0)
+        ])[0]
 
-        self.assertEqual(V2Config.balanced().z_seed, 1.75)
+        self.assertEqual(track.track_id, "affect.arousal")
+        self.assertEqual(track.task, "affect")
+        self.assertEqual(track.renderer, "line")
 
 
 if __name__ == "__main__":
