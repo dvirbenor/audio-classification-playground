@@ -1,4 +1,4 @@
-/* Affective Events Review — single-page client.
+/* Acoustic Events Review - single-page client.
  *
  * Architecture: a tiny state object + pure render functions. The DOM is the
  * source of truth for transient form input; `state` is the source of truth

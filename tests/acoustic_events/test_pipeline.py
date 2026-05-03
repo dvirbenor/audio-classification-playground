@@ -5,15 +5,15 @@ from pathlib import Path
 
 import numpy as np
 
-from audio_classification_playground.affective_events import (
+from audio_classification_playground.acoustic_events import (
     Config,
     Signal,
     Vad,
     extract_events,
     tracks_from_signals,
 )
-from audio_classification_playground.affective_events.config import value_for_signal
-from audio_classification_playground.affective_events.preprocessing import assign_frame_blocks, build_blocks
+from audio_classification_playground.acoustic_events.producers.affect.config import value_for_signal
+from audio_classification_playground.acoustic_events.producers.affect.preprocessing import assign_frame_blocks, build_blocks
 
 
 class PipelineTest(unittest.TestCase):

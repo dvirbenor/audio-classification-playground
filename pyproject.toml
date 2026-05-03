@@ -41,7 +41,7 @@ dependencies = [
 packages = ["audio_classification_playground"]
 include = [
     "audio_classification_playground/**/*.csv",
-    "audio_classification_playground/affective_events/review/static/*",
+    "audio_classification_playground/acoustic_events/review/static/*",
 ]
 
 [build-system]

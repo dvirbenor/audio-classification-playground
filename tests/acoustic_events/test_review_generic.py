@@ -7,7 +7,7 @@ import numpy as np
 import soundfile as sf
 from fastapi.testclient import TestClient
 
-from audio_classification_playground.affective_events import (
+from audio_classification_playground.acoustic_events import (
     Config,
     Event,
     MarkerItem,
@@ -16,9 +16,9 @@ from audio_classification_playground.affective_events import (
     RegularGridTrack,
     Vad,
 )
-from audio_classification_playground.affective_events.review.inherit import inherit_labels
-from audio_classification_playground.affective_events.review.server import make_app
-from audio_classification_playground.affective_events.review.storage import save_session
+from audio_classification_playground.acoustic_events.review.inherit import inherit_labels
+from audio_classification_playground.acoustic_events.review.server import make_app
+from audio_classification_playground.acoustic_events.review.storage import save_session
 
 
 def event(

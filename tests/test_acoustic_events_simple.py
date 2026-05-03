@@ -2,17 +2,17 @@ import unittest
 
 import numpy as np
 
-from audio_classification_playground.affective_events import (
+from audio_classification_playground.acoustic_events import (
     Config,
     Signal,
     Vad,
     extract_events,
     tracks_from_signals,
 )
-from audio_classification_playground.affective_events.config import value_for_signal
+from audio_classification_playground.acoustic_events.producers.affect.config import value_for_signal
 
 
-class SimpleAffectiveEventsTest(unittest.TestCase):
+class SimpleAcousticEventsTest(unittest.TestCase):
     def test_obvious_shifted_speech_block_emits_single_block_deviation(self):
         hop = 0.25
         window = 3.5

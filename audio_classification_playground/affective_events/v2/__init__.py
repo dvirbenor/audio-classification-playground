@@ -1,30 +1,7 @@
-"""Canonical affective-events detector internals.
+"""Compatibility wrapper for the canonical affect producer.
 
-Public callers should import from ``audio_classification_playground.affective_events``.
-The ``v2`` package name is retained only as an implementation location during
-the migration from the legacy detector.
+New code should import from
+``audio_classification_playground.acoustic_events.producers.affect``.
 """
-from .config import Config
-from .pipeline import (
-    extract_events,
-    extract_events_with_tracks,
-    producer_run,
-    to_dataframe,
-    tracks_from_signals,
-)
-from .types import Block, Event, ProducerRun, RegularGridTrack, Signal, Vad
+from audio_classification_playground.acoustic_events.producers.affect import *  # noqa: F401,F403
 
-__all__ = [
-    "Block",
-    "Config",
-    "Event",
-    "ProducerRun",
-    "RegularGridTrack",
-    "Signal",
-    "Vad",
-    "extract_events",
-    "extract_events_with_tracks",
-    "producer_run",
-    "tracks_from_signals",
-    "to_dataframe",
-]

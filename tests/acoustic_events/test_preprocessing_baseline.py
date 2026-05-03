@@ -2,16 +2,16 @@ import unittest
 
 import numpy as np
 
-from audio_classification_playground.affective_events.baseline import (
+from audio_classification_playground.acoustic_events.producers.affect.baseline import (
     block_aware_baseline_scale,
 )
-from audio_classification_playground.affective_events.config import Config
-from audio_classification_playground.affective_events.preprocessing import (
+from audio_classification_playground.acoustic_events.producers.affect.config import Config
+from audio_classification_playground.acoustic_events.producers.affect.preprocessing import (
     assign_frame_blocks,
     build_blocks,
     global_stats,
 )
-from audio_classification_playground.affective_events.types import Vad
+from audio_classification_playground.acoustic_events.producers.affect.types import Vad
 
 
 class PreprocessingBaselineTest(unittest.TestCase):

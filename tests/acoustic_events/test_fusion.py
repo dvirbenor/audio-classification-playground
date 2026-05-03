@@ -1,12 +1,12 @@
 import unittest
 from itertools import count
 
-from audio_classification_playground.affective_events.config import Config
-from audio_classification_playground.affective_events.fusion import (
+from audio_classification_playground.acoustic_events.producers.affect.config import Config
+from audio_classification_playground.acoustic_events.producers.affect.fusion import (
     attach_parent_ids,
     merge_cross_signal,
 )
-from audio_classification_playground.affective_events.types import Event
+from audio_classification_playground.acoustic_events.producers.affect.types import Event
 
 
 def leaf(event_id, signal, start, end, direction="+", peak_z=2.0):

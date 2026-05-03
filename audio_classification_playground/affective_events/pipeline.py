@@ -1,5 +1,5 @@
-"""Canonical affective-events extraction pipeline."""
-from .v2.pipeline import (
+"""Compatibility wrapper for canonical affect extraction pipeline."""
+from audio_classification_playground.acoustic_events.producers.affect.pipeline import (
     DEFAULT_PRODUCER_ID,
     extract_events,
     extract_events_with_tracks,

@@ -1,17 +1,15 @@
-"""Compatibility facade for the canonical acoustic-events package.
-
-New code should import from ``audio_classification_playground.acoustic_events``.
-This module remains so existing notebooks that import ``affective_events`` keep
-working during the namespace migration.
-"""
-from audio_classification_playground.acoustic_events import (
-    Block,
-    Config,
+"""Generic acoustic event schema, producers, and review tools."""
+from .schema import (
     Event,
     MarkerItem,
     MarkerTrack,
     ProducerRun,
     RegularGridTrack,
+    SCORE_NAMES,
+)
+from .producers.affect import (
+    Block,
+    Config,
     Signal,
     Vad,
     extract_events,
@@ -29,6 +27,7 @@ __all__ = [
     "MarkerTrack",
     "ProducerRun",
     "RegularGridTrack",
+    "SCORE_NAMES",
     "Signal",
     "Vad",
     "extract_events",
