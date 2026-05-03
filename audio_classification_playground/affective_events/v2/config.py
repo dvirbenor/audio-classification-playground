@@ -1,11 +1,13 @@
 """Configuration for the v2 affective-events detector."""
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Mapping
 
 
 ScalarOrPerSignal = float | Mapping[str, float]
+
+DEFAULT_Z_SEED: ScalarOrPerSignal = {"valence": 1.5, "_default": 1.8}
 
 
 @dataclass(frozen=True)
@@ -20,10 +22,10 @@ class Config:
     scale_floor_frac: float = 0.5
 
     # --- Prominence detection ------------------------------------------------
-    z_seed: ScalarOrPerSignal = 1.75
+    z_seed: ScalarOrPerSignal = field(default_factory=lambda: DEFAULT_Z_SEED)
     seed_min_width_sec: ScalarOrPerSignal = 1.0
     z_return: ScalarOrPerSignal = 0.5
-    min_duration_sec: ScalarOrPerSignal = 2.5
+    min_duration_sec: ScalarOrPerSignal = 2.0
     merge_gap_sec: ScalarOrPerSignal = 0.5
 
     # --- Cross-signal joint merge -------------------------------------------
