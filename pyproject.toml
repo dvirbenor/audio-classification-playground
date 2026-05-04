@@ -41,6 +41,7 @@ dependencies = [
 packages = ["audio_classification_playground"]
 include = [
     "audio_classification_playground/**/*.csv",
+    "audio_classification_playground/acoustic_events/inference/*.md",
     "audio_classification_playground/acoustic_events/review/static/*",
 ]
 

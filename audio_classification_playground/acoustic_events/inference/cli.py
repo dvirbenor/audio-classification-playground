@@ -6,6 +6,7 @@ from pathlib import Path
 
 from .artifacts import list_cached_artifacts
 from .audio import load_audio
+from .log import configure_stdout_logging
 from .runners import (
     run_affect_inference,
     run_all_inference,
@@ -18,11 +19,12 @@ from .runners import (
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    progress = print if getattr(args, "verbose", False) else None
+    logger = configure_stdout_logging(verbose=getattr(args, "verbose", False))
+    progress = logger.info
 
     if args.command == "run":
         result = _run_single(args, progress)
-        _print_artifact(args.task, result.artifact.path, result.reused)
+        _log_artifact(logger, args.task, result.artifact.path, result.reused)
         return 0
     if args.command == "run-all":
         result = run_all_inference(
@@ -36,7 +38,7 @@ def main(argv: list[str] | None = None) -> int:
             progress=progress,
         )
         for task, artifact in result.artifacts.items():
-            _print_artifact(task, artifact.path, result.reused[task])
+            _log_artifact(logger, task, artifact.path, result.reused[task])
         return 0
     if args.command == "list-cached":
         audio_sha256 = None
@@ -50,7 +52,7 @@ def main(argv: list[str] | None = None) -> int:
             inference_config_hash_value=args.inference_config_hash,
         )
         for artifact in artifacts:
-            print(f"{artifact.task}\t{artifact.path}")
+            logger.info("%s\t%s", artifact.task, artifact.path)
         return 0
     parser.error("unknown command")
     return 2
@@ -119,9 +121,9 @@ def _run_single(args, progress):
     raise ValueError(f"Unknown task {args.task!r}")
 
 
-def _print_artifact(task: str, path: Path, reused: bool) -> None:
+def _log_artifact(logger, task: str, path: Path, reused: bool) -> None:
     status = "reused" if reused else "created"
-    print(f"{task}: {status} {path}")
+    logger.info("%s: %s %s", task, status, path)
 
 
 if __name__ == "__main__":

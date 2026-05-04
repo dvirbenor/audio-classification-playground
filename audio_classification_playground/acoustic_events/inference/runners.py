@@ -22,6 +22,7 @@ from .artifacts import (
     write_prediction_artifact,
 )
 from .audio import AudioData, frame_audio, load_audio
+from .log import get_logger
 
 
 DEFAULT_AFFECT_MODELS = {
@@ -42,6 +43,7 @@ DEFAULT_HOP_SEC = 0.25
 
 Backbone = str
 ProgressFn = Callable[[str], None]
+LOGGER = get_logger()
 
 
 @dataclass(frozen=True)
@@ -374,7 +376,24 @@ def run_all_inference(
     vad_detector: Callable[[np.ndarray, int], Sequence[tuple[float, float]]] | None = None,
     cleanup_cuda: Callable[[], None] | None = None,
 ) -> InferenceRunResult:
-    """Run VAD, affect, disfluency, and emotion sequentially."""
+    """Run VAD, affect, disfluency, and emotion sequentially.
+
+    Example:
+
+        result = run_all_inference(
+            "input.mp3",
+            out_dir="artifacts",
+            affect_backbone="wavlm",
+            disfluency_backbone="whisper",
+            reuse_cache=True,
+        )
+
+        affect_path = result.artifacts["affect"].path
+
+    The return value is task-keyed by ``vad``, ``affect``, ``disfluency``,
+    and ``emotion``. This function writes inference artifacts only; it does
+    not run producers or save review sessions.
+    """
     predictors = dict(predictors or {})
     audio = load_audio(audio_path, sample_rate=sample_rate, recording_id=recording_id)
     _progress(progress, f"audio sha256: {audio.audio_sha256}")
@@ -815,3 +834,5 @@ def _batches(
 def _progress(progress: ProgressFn | None, message: str) -> None:
     if progress is not None:
         progress(message)
+    else:
+        LOGGER.info(message)

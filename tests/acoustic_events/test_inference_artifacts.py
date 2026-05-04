@@ -82,6 +82,7 @@ class InferenceArtifactTest(unittest.TestCase):
                 out_dir=out_dir,
                 backbone="wavlm",
                 predictor=predictor,
+                progress=_quiet,
             )
             second = run_affect_inference(
                 audio_path,
@@ -89,6 +90,7 @@ class InferenceArtifactTest(unittest.TestCase):
                 backbone="wavlm",
                 predictor=predictor,
                 reuse_cache=True,
+                progress=_quiet,
             )
 
             self.assertFalse(first.reused)
@@ -118,6 +120,7 @@ class InferenceArtifactTest(unittest.TestCase):
                 predictors=predictors,
                 vad_detector=_fake_vad,
                 cleanup_cuda=lambda: cleanup_calls.append("cleanup"),
+                progress=_quiet,
             )
             second = run_all_inference(
                 audio_path,
@@ -128,6 +131,7 @@ class InferenceArtifactTest(unittest.TestCase):
                 vad_detector=_fake_vad,
                 cleanup_cuda=lambda: cleanup_calls.append("cleanup"),
                 reuse_cache=True,
+                progress=_quiet,
             )
 
             self.assertEqual(set(first.artifacts), {"vad", "affect", "disfluency", "emotion"})
@@ -160,6 +164,7 @@ class InferenceArtifactTest(unittest.TestCase):
                         "emotion": emotion,
                     },
                     vad_detector=_fake_vad,
+                    progress=_quiet,
                 )
             self.assertEqual(called, ["disfluency"])
 
@@ -196,6 +201,7 @@ class InferenceArtifactTest(unittest.TestCase):
                     "emotion": _fake_emotion,
                 },
                 vad_detector=_fake_vad,
+                progress=_quiet,
             )
 
             vad = artifact_to_vad(result.artifacts["vad"])
@@ -243,6 +249,10 @@ def _write_audio(path: Path) -> Path:
     samples = np.zeros(sr, dtype=np.float32)
     sf.write(path, samples, sr)
     return path
+
+
+def _quiet(message):
+    pass
 
 
 def _fake_vad(samples, sample_rate):
