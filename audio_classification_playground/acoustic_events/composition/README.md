@@ -93,8 +93,10 @@ from audio_classification_playground.acoustic_events.composition import (
 )
 ```
 
-The emotion composer intentionally does not apply VAD by default. The package
-records this as `producer_runs[].outputs.composition.vad_applied`.
+The full review-package composer passes VAD into the categorical emotion
+producer. Calling `compose_emotion_from_artifacts()` directly without a
+`vad_artifact` still produces tracks and a valid producer run, but no default
+emotion events.
 
 ## Determinism
 

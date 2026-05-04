@@ -103,30 +103,36 @@ def compose_disfluency_from_artifacts(
 def compose_emotion_from_artifacts(
     *,
     emotion_artifact: PredictionArtifact | str | Path,
+    vad_artifact: PredictionArtifact | str | Path | None = None,
     config: EmotionConfig | Mapping | None = None,
 ) -> tuple[ProducerRun, list[PredictionTrack], list[Event]]:
-    """Run the emotion producer from an inference artifact.
-
-    VAD is intentionally not applied by default in this composition phase.
-    """
+    """Run the emotion producer from inference artifacts."""
     artifact = _coerce_artifact(emotion_artifact)
     _require_task(artifact, "emotion")
+    vad_source = _coerce_artifact(vad_artifact) if vad_artifact is not None else None
+    if vad_source is not None:
+        _require_task(vad_source, "vad")
+        _validate_same_audio([artifact, vad_source])
     cfg = _resolve_config(EmotionConfig.balanced(), config)
     probabilities, labels, hop_sec, window_sec, duration = artifact_to_emotion_probabilities(artifact)
+    vad_intervals = artifact_to_vad(vad_source).intervals if vad_source is not None else None
     run, tracks, events = run_from_probabilities(
         probabilities,
         labels,
         hop_sec=hop_sec,
         window_sec=window_sec,
         audio_duration_sec=duration,
-        vad_intervals=None,
+        vad_intervals=vad_intervals,
         config=cfg,
         source_model=_source_model(artifact),
     )
+    provenance = {"emotion": _artifact_provenance(artifact)}
+    if vad_source is not None:
+        provenance["vad"] = _artifact_provenance(vad_source)
     run = _with_outputs(
         run,
-        inference_artifacts={"emotion": _artifact_provenance(artifact)},
-        composition={"vad_applied": False},
+        inference_artifacts=provenance,
+        composition={"vad_applied": vad_source is not None},
     )
     return run, list(tracks), list(events)
 
@@ -184,6 +190,7 @@ def compose_review_package(
     LOGGER.info("composing emotion")
     emotion_run, emotion_tracks, emotion_events = compose_emotion_from_artifacts(
         emotion_artifact=artifacts["emotion"],
+        vad_artifact=artifacts["vad"],
         config=configs.get("emotion"),
     )
     LOGGER.info("emotion: %d events, %d tracks", len(emotion_events), len(emotion_tracks))

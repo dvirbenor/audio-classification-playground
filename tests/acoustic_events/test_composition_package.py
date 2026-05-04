@@ -94,13 +94,14 @@ class CompositionPackageTest(unittest.TestCase):
             self.assertTrue(pkg.events)
 
             by_task = {run["task"]: run for run in pkg.package["producer_runs"]}
-            self.assertFalse(by_task["emotion"]["outputs"]["composition"]["vad_applied"])
+            self.assertTrue(by_task["emotion"]["outputs"]["composition"]["vad_applied"])
             for task in ("affect", "disfluency", "emotion"):
                 prov = by_task[task]["outputs"]["inference_artifacts"][task]
                 source = artifacts[task].manifest
                 self.assertEqual(prov["audio_sha256"], source["audio"]["sha256"])
                 self.assertEqual(prov["inference_config_hash"], source["inference_config_hash"])
                 self.assertEqual(prov["model"], source["model"])
+            self.assertIn("vad", by_task["emotion"]["outputs"]["inference_artifacts"])
 
     def test_config_override_changes_package_id(self):
         with tempfile.TemporaryDirectory() as tmp:

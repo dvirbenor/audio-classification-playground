@@ -1,6 +1,6 @@
 """Configuration for Vox-Profile disfluency event extraction.
 
-The default suppression of pure ``Sound Repetition`` regions is based on a
+The default suppression of ``Sound Repetition``-dominant regions is based on a
 listening audit of conversational/podcast-like audio, where those high-score
 regions were mostly laughter, background, or otherwise non-target audio. For
 clinical or stuttering-focused work where sound repetitions are themselves a
@@ -23,6 +23,7 @@ DISFLUENCY_TYPE_LABELS = (
 LABEL_TO_EVENT_LABEL = {
     "Block": "block",
     "Prolongation": "prolongation",
+    "Sound Repetition": "sound_repetition",
     "Word Repetition": "word_repetition",
     "Interjection": "interjection",
     "disfluent": "disfluent",

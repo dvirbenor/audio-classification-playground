@@ -4,11 +4,12 @@ This producer consumes already-computed window-pooled logits. It does not run
 model inference. The binary fluency head defines candidate regions, while the
 multi-label disfluency type head names and explains those regions.
 
-Pure ``Sound Repetition`` is suppressed by default because an audit on
-conversational/podcast-like audio found those regions were mostly laughter,
-background, or otherwise non-target audio. This is a use-case default, not a
-property of the model: set ``DisfluencyConfig.suppressed_types=()`` when sound
-repetition itself is a target class.
+``Sound Repetition``-dominant regions are suppressed by default because an
+audit on conversational/podcast-like audio found those regions were mostly
+laughter, background, or otherwise non-target audio. This is a use-case
+default, not a property of the model: set
+``DisfluencyConfig.suppressed_types=()`` when sound repetition itself is a
+target class.
 """
 from __future__ import annotations
 
@@ -187,13 +188,17 @@ def make_producer_run(
         "candidate_region_count": 0,
         "emitted_event_count": 0,
         "suppressed_pure_sound_repetition_count": 0,
+        "suppressed_dominant_type_region_count": 0,
         "unspecified_region_count": 0,
         "emitted_unspecified_event_count": 0,
         "label_counts": {},
         "audit_note": (
-            "Pure Sound Repetition is suppressed by default for "
+            "Sound Repetition-dominant regions are suppressed by default for "
             "conversational/podcast-like audio; set suppressed_types=() for "
-            "clinical or stuttering-focused use cases."
+            "clinical or stuttering-focused use cases. "
+            "suppressed_pure_sound_repetition_count is a subset of "
+            "unspecified_region_count; suppressed_dominant_type_region_count "
+            "is counted separately."
         ),
     }
     if summary is not None:
@@ -257,10 +262,13 @@ def _extract_events_with_summary(
             counters["suppressed_pure_sound_repetition_count"] += 1
         if not useful:
             counters["unspecified_region_count"] += 1
-            if not config.emit_unspecified:
+            if suppressed_active or not config.emit_unspecified:
                 continue
             label = "disfluent"
             counters["emitted_unspecified_event_count"] += 1
+        elif suppressed_active and _suppressed_type_wins_at_peak(suppressed_active, useful):
+            counters["suppressed_dominant_type_region_count"] += 1
+            continue
         else:
             label = _select_label(useful)
 
@@ -287,6 +295,7 @@ def _extract_events_with_summary(
         "candidate_region_count": len(regions),
         "emitted_event_count": len(events),
         "suppressed_pure_sound_repetition_count": counters["suppressed_pure_sound_repetition_count"],
+        "suppressed_dominant_type_region_count": counters["suppressed_dominant_type_region_count"],
         "unspecified_region_count": counters["unspecified_region_count"],
         "emitted_unspecified_event_count": counters["emitted_unspecified_event_count"],
         "label_counts": dict(sorted(label_counts.items())),
@@ -438,6 +447,15 @@ def _select_label(active_types: Sequence[dict]) -> str:
             best_key = key
             best_idx = label_order
     return DISFLUENCY_TYPE_LABELS[best_idx]
+
+
+def _suppressed_type_wins_at_peak(
+    suppressed_active: Sequence[dict],
+    useful_active: Sequence[dict],
+) -> bool:
+    best_suppressed = max(float(item["at_peak"]) for item in suppressed_active)
+    best_useful = max(float(item["at_peak"]) for item in useful_active)
+    return best_suppressed >= best_useful
 
 
 def _type_evidence_item(

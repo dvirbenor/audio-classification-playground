@@ -179,7 +179,7 @@ class DisfluencyProducerTest(unittest.TestCase):
         self.assertEqual(events[0].extra["support_end_frame"], 3)
         self.assertEqual(separated, [])
 
-    def test_multilabel_suppression_keeps_useful_cofiring_type(self):
+    def test_useful_type_wins_over_sound_repetition_at_peak(self):
         cfg = DisfluencyConfig(
             seed_threshold=0.70,
             shoulder_threshold=0.50,
@@ -191,7 +191,7 @@ class DisfluencyProducerTest(unittest.TestCase):
             binary_logits([0.8, 0.9]),
             type_logits([
                 {"Sound Repetition": 0.95, "Word Repetition": 0.90},
-                {"Sound Repetition": 0.95, "Word Repetition": 0.85},
+                {"Sound Repetition": 0.75, "Word Repetition": 0.85},
             ]),
             hop_sec=0.25,
             window_sec=3.0,
@@ -203,7 +203,68 @@ class DisfluencyProducerTest(unittest.TestCase):
         self.assertEqual(events[0].evidence["active_types"][0]["name"], "Word Repetition")
         self.assertEqual(events[0].evidence["suppressed_active_types"][0]["name"], "Sound Repetition")
 
-    def test_pure_sound_repetition_suppressed_by_default_and_unspecified_optional(self):
+    def test_sound_repetition_dominant_or_tied_at_peak_vetoes_region(self):
+        cfg = DisfluencyConfig(
+            seed_threshold=0.70,
+            shoulder_threshold=0.50,
+            min_support_sec=0.50,
+            merge_gap_sec=0.0,
+            type_threshold=0.70,
+        )
+        dominant_run, _, dominant_events = produce_disfluency_events(
+            fluency_logits=binary_logits([0.8, 0.9]),
+            disfluency_type_logits=type_logits([
+                {"Sound Repetition": 0.8, "Word Repetition": 0.9},
+                {"Sound Repetition": 0.9, "Word Repetition": 0.8},
+            ]),
+            hop_sec=0.25,
+            window_sec=3.0,
+            config=cfg,
+        )
+        tied_run, _, tied_events = produce_disfluency_events(
+            fluency_logits=binary_logits([0.8, 0.9]),
+            disfluency_type_logits=type_logits([
+                {"Sound Repetition": 0.8, "Word Repetition": 0.9},
+                {"Sound Repetition": 0.85, "Word Repetition": 0.85},
+            ]),
+            hop_sec=0.25,
+            window_sec=3.0,
+            config=cfg,
+        )
+
+        self.assertEqual(dominant_events, [])
+        self.assertEqual(tied_events, [])
+        self.assertEqual(dominant_run.outputs["suppressed_dominant_type_region_count"], 1)
+        self.assertEqual(tied_run.outputs["suppressed_dominant_type_region_count"], 1)
+        self.assertEqual(dominant_run.outputs["unspecified_region_count"], 0)
+
+    def test_sound_repetition_max_outside_peak_does_not_veto(self):
+        events = extract_events(
+            binary_logits([0.8, 0.9]),
+            type_logits([
+                {"Sound Repetition": 0.95, "Word Repetition": 0.72},
+                {"Sound Repetition": 0.20, "Word Repetition": 0.85},
+            ]),
+            hop_sec=0.25,
+            window_sec=3.0,
+            config=DisfluencyConfig(
+                seed_threshold=0.70,
+                shoulder_threshold=0.50,
+                min_support_sec=0.50,
+                merge_gap_sec=0.0,
+                type_threshold=0.70,
+            ),
+        )
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].label, "word_repetition")
+        self.assertGreater(events[0].evidence["type_max"]["Sound Repetition"], 0.9)
+        self.assertGreater(
+            events[0].evidence["type_at_peak"]["Word Repetition"],
+            events[0].evidence["type_at_peak"]["Sound Repetition"],
+        )
+
+    def test_pure_sound_repetition_suppressed_by_default_and_not_unspecified(self):
         fluency = binary_logits([0.8, 0.9])
         types = type_logits([
             {"Sound Repetition": 0.95},
@@ -226,13 +287,43 @@ class DisfluencyProducerTest(unittest.TestCase):
         self.assertEqual(default_events, [])
         self.assertEqual(default_run.outputs["suppressed_pure_sound_repetition_count"], 1)
         self.assertEqual(default_run.outputs["unspecified_region_count"], 1)
-        self.assertEqual(len(unspecified_events), 1)
-        self.assertEqual(unspecified_events[0].label, "disfluent")
-        self.assertEqual(
-            unspecified_events[0].evidence["suppressed_active_types"][0]["name"],
-            "Sound Repetition",
+        self.assertEqual(unspecified_events, [])
+        self.assertEqual(unspecified_run.outputs["suppressed_pure_sound_repetition_count"], 1)
+        self.assertEqual(unspecified_run.outputs["unspecified_region_count"], 1)
+        self.assertEqual(unspecified_run.outputs["emitted_unspecified_event_count"], 0)
+
+    def test_unspecified_can_emit_when_no_type_is_active(self):
+        run, _, events = produce_disfluency_events(
+            fluency_logits=binary_logits([0.8, 0.9]),
+            disfluency_type_logits=type_logits([{}, {}]),
+            hop_sec=0.25,
+            window_sec=3.0,
+            config=DisfluencyConfig(emit_unspecified=True),
         )
-        self.assertEqual(unspecified_run.outputs["emitted_unspecified_event_count"], 1)
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].label, "disfluent")
+        self.assertEqual(events[0].evidence["active_types"], [])
+        self.assertEqual(events[0].evidence["suppressed_active_types"], [])
+        self.assertEqual(run.outputs["unspecified_region_count"], 1)
+        self.assertEqual(run.outputs["emitted_unspecified_event_count"], 1)
+
+    def test_empty_suppressed_types_allows_sound_repetition_events(self):
+        _, _, events = produce_disfluency_events(
+            fluency_logits=binary_logits([0.8, 0.9]),
+            disfluency_type_logits=type_logits([
+                {"Sound Repetition": 0.9},
+                {"Sound Repetition": 0.95},
+            ]),
+            hop_sec=0.25,
+            window_sec=3.0,
+            config=DisfluencyConfig(suppressed_types=()),
+        )
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].label, "sound_repetition")
+        self.assertEqual(events[0].evidence["active_types"][0]["name"], "Sound Repetition")
+        self.assertEqual(events[0].evidence["suppressed_active_types"], [])
 
     def test_deterministic_ties_use_model_label_order(self):
         events = extract_events(

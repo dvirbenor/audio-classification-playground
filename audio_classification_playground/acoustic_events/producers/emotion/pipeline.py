@@ -47,6 +47,7 @@ def run_from_probabilities(
     audio_duration_sec: float | None = None,
     vad_intervals: Sequence[tuple[float, float]] | None = None,
     config: Config | None = None,
+    require_vad_for_events: bool = True,
     producer_id: str = DEFAULT_PRODUCER_ID,
     source_model: str = DEFAULT_SOURCE_MODEL,
 ) -> tuple[ProducerRun, list[RegularGridTrack], list[Event]]:
@@ -54,7 +55,8 @@ def run_from_probabilities(
 
     The probabilities are expected to be already-normalized model scores. Event
     detection uses raw probabilities; only the boolean support mask is closed to
-    bridge short framewise holes inside speech segments.
+    bridge short framewise holes inside speech segments. By default, VAD is
+    required for event creation; missing VAD yields a tracks-only run.
     """
     cfg = config or Config.balanced()
     canonical_probs, canonical_labels = canonicalize_probabilities(
@@ -63,8 +65,12 @@ def run_from_probabilities(
     _validate_timing(canonical_probs.shape[0], hop_sec, window_sec, audio_duration_sec)
 
     centers = _frame_centers(canonical_probs.shape[0], hop_sec, window_sec)
-    speech_mask = _speech_mask(centers, vad_intervals)
-    valid_mask = speech_mask if vad_intervals is not None else np.ones_like(speech_mask)
+    speech_mask = _speech_mask(centers, hop_sec=hop_sec, vad_intervals=vad_intervals)
+    valid_mask, thresholds_computed_on, no_event_reason = _valid_frame_policy(
+        speech_mask,
+        vad_intervals=vad_intervals,
+        require_vad_for_events=require_vad_for_events,
+    )
     tracks = tracks_from_probabilities(
         canonical_probs,
         hop_sec=hop_sec,
@@ -81,6 +87,7 @@ def run_from_probabilities(
         audio_duration_sec=audio_duration_sec,
         vad_intervals=vad_intervals,
         config=cfg,
+        require_vad_for_events=require_vad_for_events,
         producer_id=producer_id,
         thresholds=thresholds,
     )
@@ -90,9 +97,13 @@ def run_from_probabilities(
         labels=canonical_labels,
         raw_labels=labels,
         valid_mask=valid_mask,
+        speech_mask=speech_mask,
         thresholds=thresholds,
         events=events,
         vad_intervals=vad_intervals,
+        require_vad_for_events=require_vad_for_events,
+        thresholds_computed_on=thresholds_computed_on,
+        no_event_reason=no_event_reason,
         producer_id=producer_id,
         source_model=source_model,
     )
@@ -194,14 +205,19 @@ def extract_events(
     audio_duration_sec: float | None = None,
     vad_intervals: Sequence[tuple[float, float]] | None = None,
     config: Config | None = None,
+    require_vad_for_events: bool = True,
     producer_id: str = DEFAULT_PRODUCER_ID,
     thresholds: dict[str, float] | None = None,
 ) -> list[Event]:
     cfg = config or Config.balanced()
     probs, _ = canonicalize_probabilities(probabilities, CANONICAL_CHANNELS, config=cfg)
     centers = _frame_centers(probs.shape[0], hop_sec, window_sec)
-    speech_mask = _speech_mask(centers, vad_intervals)
-    valid_mask = speech_mask if vad_intervals is not None else np.ones_like(speech_mask)
+    speech_mask = _speech_mask(centers, hop_sec=hop_sec, vad_intervals=vad_intervals)
+    valid_mask, _, _ = _valid_frame_policy(
+        speech_mask,
+        vad_intervals=vad_intervals,
+        require_vad_for_events=require_vad_for_events,
+    )
     if not valid_mask.any():
         return []
 
@@ -212,7 +228,7 @@ def extract_events(
     best_bg_local = background_probs.argmax(axis=1)
     best_bg_idx = np.asarray(background_idx)[best_bg_local]
     best_bg_prob = background_probs[np.arange(probs.shape[0]), best_bg_local]
-    segments = _speech_segments(speech_mask if vad_intervals is not None else np.ones_like(speech_mask))
+    segments = _speech_segments(valid_mask)
 
     candidates: list[dict] = []
     for label in cfg.event_labels:
@@ -225,7 +241,7 @@ def extract_events(
             & (class_prob >= resolved[label])
             & ((class_prob - best_bg_prob) >= cfg.background_margin)
         )
-        support = raw_support & speech_mask
+        support = raw_support & valid_mask
         closed_support = _close_support_by_segments(
             support,
             segments,
@@ -268,12 +284,22 @@ def producer_run(
     thresholds: dict[str, float],
     events: Sequence[Event],
     vad_intervals: Sequence[tuple[float, float]] | None,
+    speech_mask: np.ndarray | None = None,
+    require_vad_for_events: bool = True,
+    thresholds_computed_on: str | None = None,
+    no_event_reason: str | None = None,
     producer_id: str = DEFAULT_PRODUCER_ID,
     source_model: str = DEFAULT_SOURCE_MODEL,
 ) -> ProducerRun:
-    cfg = config or Config.balanced()
-    cfg_dict = asdict(cfg) if is_dataclass(cfg) else dict(cfg)
+    cfg = _coerce_config(config)
+    cfg_dict = _effective_config_dict(cfg, require_vad_for_events=require_vad_for_events)
     probs = np.asarray(probabilities, dtype=np.float64)
+    speech = np.asarray(speech_mask if speech_mask is not None else valid_mask, dtype=bool)
+    threshold_source = thresholds_computed_on or _thresholds_computed_on(
+        vad_intervals=vad_intervals,
+        require_vad_for_events=require_vad_for_events,
+        valid_mask=valid_mask,
+    )
     outputs = {
         "class_occupancy": _class_occupancy(probs, valid_mask, thresholds),
         "resolved_thresholds": {k: float(v) for k, v in thresholds.items()},
@@ -284,11 +310,19 @@ def producer_run(
         },
         "vad": {
             "provided": vad_intervals is not None,
+            "required_for_events": bool(require_vad_for_events),
             "valid_frame_count": int(valid_mask.sum()),
             "total_frame_count": int(valid_mask.size),
-            "thresholds_computed_on": "speech_frames" if vad_intervals is not None else "all_frames",
-            "non_speech_is_hard_barrier": True,
+            "thresholds_computed_on": threshold_source,
+            "no_event_reason": no_event_reason,
         },
+        "suppressed_non_vad_emotion_frames": _suppressed_non_vad_emotion_frames(
+            probs,
+            speech,
+            thresholds,
+            cfg,
+            vad_provided=vad_intervals is not None,
+        ),
     }
     return ProducerRun(
         producer_id=producer_id,
@@ -329,14 +363,48 @@ def _frame_centers(n_frames: int, hop_sec: float, window_sec: float) -> np.ndarr
 
 def _speech_mask(
     centers: np.ndarray,
+    *,
+    hop_sec: float,
     vad_intervals: Sequence[tuple[float, float]] | None,
 ) -> np.ndarray:
     if vad_intervals is None:
         return np.ones(centers.shape[0], dtype=bool)
     mask = np.zeros(centers.shape[0], dtype=bool)
+    frame_start = centers - 0.5 * float(hop_sec)
+    frame_end = centers + 0.5 * float(hop_sec)
     for start, end in _normalize_intervals(vad_intervals):
-        mask |= (centers >= start) & (centers <= end)
+        mask |= (start < frame_end) & (end > frame_start)
     return mask
+
+
+def _valid_frame_policy(
+    speech_mask: np.ndarray,
+    *,
+    vad_intervals: Sequence[tuple[float, float]] | None,
+    require_vad_for_events: bool,
+) -> tuple[np.ndarray, str, str | None]:
+    if vad_intervals is None:
+        if require_vad_for_events:
+            return (
+                np.zeros_like(speech_mask, dtype=bool),
+                "none_missing_vad",
+                "vad_required_but_missing",
+            )
+        return np.ones_like(speech_mask, dtype=bool), "all_frames_debug", None
+    if not speech_mask.any():
+        return speech_mask, "none_no_speech", "vad_found_no_speech"
+    return speech_mask, "speech_frames", None
+
+
+def _thresholds_computed_on(
+    *,
+    vad_intervals: Sequence[tuple[float, float]] | None,
+    require_vad_for_events: bool,
+    valid_mask: np.ndarray,
+) -> str:
+    if vad_intervals is None:
+        return "none_missing_vad" if require_vad_for_events else "all_frames_debug"
+    return "speech_frames" if valid_mask.any() else "none_no_speech"
 
 
 def _normalize_intervals(
@@ -397,6 +465,50 @@ def _class_occupancy(
             ),
         }
     return occupancy
+
+
+def _suppressed_non_vad_emotion_frames(
+    probs: np.ndarray,
+    speech_mask: np.ndarray,
+    thresholds: dict[str, float],
+    config: Config,
+    *,
+    vad_provided: bool,
+) -> dict[str, dict]:
+    if not vad_provided or not thresholds:
+        return {}
+    non_speech = ~np.asarray(speech_mask, dtype=bool)
+    if not non_speech.any():
+        return {}
+
+    top1_idx = probs.argmax(axis=1)
+    background_idx = [CANONICAL_CHANNELS.index(label) for label in config.background_labels]
+    background_probs = probs[:, background_idx]
+    best_bg_prob = background_probs.max(axis=1)
+
+    out: dict[str, dict] = {}
+    for label in config.event_labels:
+        if label not in thresholds:
+            continue
+        class_i = CANONICAL_CHANNELS.index(label)
+        class_prob = probs[:, class_i]
+        suppressed = (
+            non_speech
+            & (top1_idx == class_i)
+            & (class_prob >= thresholds[label])
+            & ((class_prob - best_bg_prob) >= config.background_margin)
+        )
+        if suppressed.any():
+            out[label] = {
+                "frame_count": int(suppressed.sum()),
+                "max_probability": float(class_prob[suppressed].max()),
+            }
+        else:
+            out[label] = {
+                "frame_count": 0,
+                "max_probability": 0.0,
+            }
+    return out
 
 
 def _event_summary(events: Sequence[Event]) -> dict:
@@ -559,6 +671,22 @@ def _top_classes(row: np.ndarray, n: int = 5) -> dict[str, float]:
 def _config_hash(config: dict) -> str:
     blob = json.dumps(config, sort_keys=True, default=str).encode("utf-8")
     return hashlib.sha256(blob).hexdigest()[:16]
+
+
+def _coerce_config(config: Config | dict | None) -> Config:
+    if config is None:
+        return Config.balanced()
+    if isinstance(config, Config):
+        return config
+    data = dict(config)
+    data.pop("require_vad_for_events", None)
+    return Config(**data)
+
+
+def _effective_config_dict(config: Config | dict, *, require_vad_for_events: bool) -> dict:
+    cfg = asdict(config) if is_dataclass(config) else dict(config)
+    cfg["require_vad_for_events"] = bool(require_vad_for_events)
+    return cfg
 
 
 __all__ = [
