@@ -776,8 +776,7 @@ def _detect_silero_vad(
         onnx=False,
     )
     get_speech_timestamps = utils[0]
-    run_device = device or _default_device()
-    model = model.to(run_device)
+    model = model.to("cpu")
     timestamps = get_speech_timestamps(
         torch.from_numpy(np.asarray(samples, dtype=np.float32)),
         model,
