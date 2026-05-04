@@ -140,7 +140,10 @@ def save_session(
     inherit_overlap_threshold: float = 0.5,
     notes: str = "",
 ) -> Path:
-    """Persist a session JSON (+ companion ``.npz``). Returns the JSON path.
+    """Persist a legacy session JSON (+ companion ``.npz``). Returns the JSON path.
+
+    Deprecated: new workflows should compose ``review_package.v1`` directories
+    via :mod:`audio_classification_playground.acoustic_events.composition`.
 
     If ``inherit_from`` points to a previous session, labels are pre-populated
     via semantic key + time-overlap matching.

@@ -114,13 +114,8 @@ class GenericReviewStorageTest(unittest.TestCase):
             self.assertEqual(data["tracks_meta"]["disfluency.type"]["channels"], ["filled_pause", "repetition"])
             self.assertEqual(data["tracks_meta"]["vocalization.markers"]["items"][0]["label"], "laugh")
 
-            client = TestClient(make_app(path))
-            session = client.get("/api/session").json()
-            tracks_payload = client.get("/api/tracks").json()
-            self.assertEqual(session["event_schema"], "acoustic_events.v1")
-            self.assertIn("producer_runs", session)
-            self.assertIn("emotion.anger", tracks_payload["tracks"])
-            self.assertIn("vocalization.markers", tracks_payload["tracks"])
+            with self.assertRaises(FileNotFoundError):
+                make_app(path)
 
     def test_tracks_only_session_is_valid(self):
         with tempfile.TemporaryDirectory() as td:

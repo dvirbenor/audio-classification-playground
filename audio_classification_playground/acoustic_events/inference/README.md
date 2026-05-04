@@ -156,6 +156,30 @@ probs, labels, hop, window, duration = artifact_to_emotion_probabilities(
 The adapters are validation/building-block helpers. They do not save review
 sessions.
 
+## Compose A Review Package
+
+Once you have the four artifacts from `run-all`, compose producer events and
+review tracks with:
+
+```bash
+uv run python -m audio_classification_playground.acoustic_events.composition compose \
+  --affect-artifact artifacts/<recording_id>/<audio_sha256>/affect/<hash>/ \
+  --disfluency-artifact artifacts/<recording_id>/<audio_sha256>/disfluency/<hash>/ \
+  --emotion-artifact artifacts/<recording_id>/<audio_sha256>/emotion/<hash>/ \
+  --vad-artifact artifacts/<recording_id>/<audio_sha256>/vad/<hash>/ \
+  --out review_packages/
+```
+
+Then launch the reviewer:
+
+```bash
+uv run python -m audio_classification_playground.acoustic_events.review \
+  --package review_packages/<recording_id>/<package_id>/
+```
+
+The package format is documented in
+`audio_classification_playground/acoustic_events/composition/README.md`.
+
 ## Logging
 
 The CLI and default Python runner progress use the

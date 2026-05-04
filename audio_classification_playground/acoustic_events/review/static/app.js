@@ -556,7 +556,7 @@ function buildLayout(ev) {
 function renderTopbar() {
     const sess = state.session;
     document.getElementById('recording-id').textContent = sess.recording_id;
-    document.getElementById('config-hash').textContent  = `fp=${sess.session_fingerprint || '—'}`;
+    document.getElementById('config-hash').textContent  = `pkg=${sess.package_id || sess.session_fingerprint || '—'}`;
 }
 
 function renderEventMeta(ev) {

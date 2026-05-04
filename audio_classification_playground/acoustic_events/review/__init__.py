@@ -1,26 +1,4 @@
-"""Review interface for inspecting and labeling acoustic events.
-
-Quick start::
-
-    from audio_classification_playground.acoustic_events import (
-        extract_events, tracks_from_signals, Config, Signal, Vad,
-    )
-    from audio_classification_playground.acoustic_events.review import (
-        save_session, launch_review,
-    )
-
-    events = extract_events(signals, vad, Config.balanced())
-    tracks = tracks_from_signals(signals)
-    session_path = save_session(
-        events=events,
-        tracks=tracks,
-        vad=vad,
-        config=Config.balanced(),
-        audio_path="/path/to/audio.mp3",
-        session_dir="./labeling",
-    )
-    launch_review(session_path)        # blocks; opens server on 127.0.0.1:8765
-"""
+"""Review interface for inspecting and labeling review packages."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -41,13 +19,13 @@ from .storage import (
 
 
 def launch_review(
-    session_path: str | Path,
+    package_path: str | Path,
     *,
     host: str = "127.0.0.1",
     port: int = 8765,
     block: bool = True,
 ) -> "object | None":
-    """Start the review server.
+    """Start the review server for a ``review_package.v1`` directory.
 
     Defaults to blocking (``uvicorn.run``). Set ``block=False`` to spawn the
     server on a daemon thread and return control to the caller — useful from
@@ -58,9 +36,9 @@ def launch_review(
 
     from .cli import _print_banner
 
-    session_path = Path(session_path).resolve()
-    app = make_app(session_path)
-    _print_banner(host, port, session_path)
+    package_path = Path(package_path).resolve()
+    app = make_app(package_path)
+    _print_banner(host, port, package_path)
 
     config = uvicorn.Config(app, host=host, port=port, log_level="info")
     server = uvicorn.Server(config)

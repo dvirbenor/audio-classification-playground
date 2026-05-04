@@ -1,9 +1,4 @@
-"""FastAPI application backing the review UI.
-
-The app holds one in-memory session at a time (loaded from disk at startup)
-and persists every label change immediately. State is intentionally minimal;
-all business logic lives in :mod:`storage`, :mod:`inherit`, and :mod:`waveform`.
-"""
+"""FastAPI application backing the package-oriented review UI."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -14,28 +9,32 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+from ..composition.package import (
+    clear_package_label,
+    load_review_package,
+    update_package_label,
+)
 from .audio_serving import serve_with_range
 from .models import VERDICTS, Label
-from .storage import clear_label, load_session_json, update_label
 from .waveform import cached_peaks, compute_peaks_window
 
 
 _STATIC_DIR = Path(__file__).parent / "static"
 
 
-def make_app(session_path: str | Path) -> FastAPI:
-    session_path = Path(session_path).resolve()
-    if not session_path.is_file():
-        raise FileNotFoundError(f"Session not found: {session_path}")
+def make_app(package_path: str | Path) -> FastAPI:
+    package_path = Path(package_path).resolve()
+    if not package_path.is_dir():
+        raise FileNotFoundError(f"Review package directory not found: {package_path}")
 
     app = FastAPI(title="Acoustic Events Review", version="0.1.0")
 
     # In-memory state, refreshed on demand from disk so external edits propagate.
-    state: dict[str, Any] = {"path": session_path, "session": load_session_json(session_path)}
+    state: dict[str, Any] = {"path": package_path, "package": load_review_package(package_path)}
 
-    def _reload() -> dict:
-        state["session"] = load_session_json(state["path"])
-        return state["session"]
+    def _reload():
+        state["package"] = load_review_package(state["path"])
+        return state["package"]
 
     # ---- Static UI -------------------------------------------------------
     app.mount("/assets", StaticFiles(directory=str(_STATIC_DIR)), name="assets")
@@ -47,51 +46,62 @@ def make_app(session_path: str | Path) -> FastAPI:
     # ---- Session metadata + events --------------------------------------
     @app.get("/api/session")
     async def get_session() -> JSONResponse:
-        sess = state["session"]
+        pkg = state["package"]
+        package = pkg.package
+        audio = package["audio"]
         # Strip bulky track arrays — they live behind /api/tracks.
         return JSONResponse({
-            "session_id": sess["session_id"],
-            "schema_version": sess.get("schema_version"),
-            "event_schema": sess.get("event_schema", "acoustic_events.v1"),
-            "recording_id": sess["recording_id"],
-            "audio_sr": sess["audio_sr"],
-            "audio_duration_sec": sess["audio_duration_sec"],
-            "session_fingerprint": sess.get("session_fingerprint", ""),
-            "producer_runs": sess.get("producer_runs", []),
-            "tracks_meta": sess.get("tracks_meta", {}),
-            "vad_intervals": sess["vad_intervals"],
-            "events": sess["events"],
-            "labels": sess.get("labels", {}),
+            "session_id": package["package_id"],
+            "schema": package.get("schema", "review_package.v1"),
+            "schema_version": None,
+            "event_schema": "acoustic_events.v1",
+            "package_id": package["package_id"],
+            "package_fingerprint": package["package_fingerprint"],
+            "recording_id": package["recording_id"],
+            "audio_sr": audio["sample_rate"],
+            "audio_duration_sec": audio["duration_sec"],
+            "session_fingerprint": package["package_id"],
+            "producer_runs": package.get("producer_runs", []),
+            "tracks_meta": package.get("tracks_meta", {}),
+            "vad_intervals": package.get("vad_intervals", []),
+            "events": package.get("events", []),
+            "labels": pkg.labels,
             "verdicts": list(VERDICTS),
-            "created_at": sess.get("created_at", ""),
-            "last_updated_at": sess.get("last_updated_at", ""),
-            "notes": sess.get("notes", ""),
+            "created_at": "",
+            "last_updated_at": "",
+            "notes": "",
         })
 
     # ---- Signals (full arrays, served once on page load) -----------------
     @app.get("/api/tracks")
     async def get_tracks() -> JSONResponse:
-        sess = state["session"]
-        npz_path = state["path"].parent / sess["tracks_data_path"]
-        if not npz_path.is_file():
-            raise HTTPException(404, f"tracks data not found at {npz_path}")
-        arrays = np.load(npz_path)
-        meta = sess.get("tracks_meta", {})
+        pkg = state["package"]
+        meta = pkg.package.get("tracks_meta", {})
         payload = {}
         for track_id, track_meta in meta.items():
             if track_meta.get("kind") == "marker":
                 payload[track_id] = track_meta.get("items", [])
-            elif track_id in arrays.files:
-                payload[track_id] = arrays[track_id].astype(np.float32).tolist()
             else:
-                payload[track_id] = []
+                data_path = track_meta.get("data_path")
+                if not data_path:
+                    payload[track_id] = []
+                    continue
+                npz_path = pkg.path / data_path
+                if not npz_path.is_file():
+                    raise HTTPException(404, f"tracks data not found at {npz_path}")
+                with np.load(npz_path) as arrays:
+                    payload[track_id] = (
+                        arrays[track_id].astype(np.float32).tolist()
+                        if track_id in arrays.files
+                        else []
+                    )
         return JSONResponse({"tracks": payload, "meta": meta})
 
     # ---- Audio (range-served) -------------------------------------------
     @app.get("/api/audio")
     async def get_audio(request: Request):
-        sess = state["session"]
-        return serve_with_range(sess["audio_path"], request)
+        pkg = state["package"]
+        return serve_with_range(pkg.package["audio"]["path"], request)
 
     # ---- Waveform peaks (cached on disk, or windowed high-res) -----------
     @app.get("/api/waveform")
@@ -100,13 +110,14 @@ def make_app(session_path: str | Path) -> FastAPI:
         t1: float | None = None,
         n_peaks: int | None = None,
     ) -> JSONResponse:
-        sess = state["session"]
+        pkg = state["package"]
+        audio_path = pkg.package["audio"]["path"]
         if t0 is not None and t1 is not None:
             capped = min(n_peaks or 2000, 4000)
-            peaks = compute_peaks_window(sess["audio_path"], t0, t1, n_peaks=capped)
+            peaks = compute_peaks_window(audio_path, t0, t1, n_peaks=capped)
         else:
-            cache_path = state["path"].with_suffix(".peaks.json")
-            peaks = cached_peaks(sess["audio_path"], cache_path)
+            cache_path = state["path"] / "waveform.peaks.json"
+            peaks = cached_peaks(audio_path, cache_path)
         return JSONResponse(peaks)
 
     # ---- Labels ---------------------------------------------------------
@@ -122,7 +133,7 @@ def make_app(session_path: str | Path) -> FastAPI:
             labeler=body.get("labeler", "") or "",
         )
         try:
-            payload = update_label(state["path"], event_id, label)
+            payload = update_package_label(state["path"], event_id, label.to_dict())
         except KeyError as e:
             raise HTTPException(404, str(e)) from e
         _reload()
@@ -130,13 +141,13 @@ def make_app(session_path: str | Path) -> FastAPI:
 
     @app.delete("/api/label/{event_id}")
     async def delete_label(event_id: str) -> JSONResponse:
-        clear_label(state["path"], event_id)
+        clear_package_label(state["path"], event_id)
         _reload()
         return JSONResponse({"ok": True})
 
     # ---- Health ---------------------------------------------------------
     @app.get("/api/health")
     async def health() -> dict:
-        return {"ok": True, "session": state["session"].get("session_id")}
+        return {"ok": True, "package": state["package"].package.get("package_id")}
 
     return app
