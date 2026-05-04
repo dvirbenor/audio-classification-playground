@@ -264,50 +264,107 @@ function currentEvent() {
 function buildTrackTraces() {
     const traces = [];
     for (const trackId of state.visibleTrackIds) {
-        const meta = state.tracksMeta[trackId];
-        if (!meta) continue;
-        const panel = state.panels[trackId];
-        if (!panel) continue;
-        if (meta.kind === 'marker' || meta.renderer === 'marker') {
-            traces.push(buildMarkerTrace(trackId, meta, panel));
-            continue;
-        }
-        const ts = Array.from(frameTimes(meta));
-        const values = state.tracks[trackId] || [];
-        if (meta.renderer === 'multi_probability') {
-            const channels = meta.channels || [];
-            const nChannels = channels.length || (Array.isArray(values[0]) ? values[0].length : 1);
-            for (let c = 0; c < nChannels; c++) {
-                const label = channels[c] || `ch${c}`;
-                traces.push({
-                    type: 'scattergl',
-                    mode: 'lines',
-                    name: `${meta.name}:${label}`,
-                    x: ts,
-                    y: values.map(row => Array.isArray(row) ? row[c] : row),
-                    xaxis: 'x',
-                    yaxis: panel.axis,
-                    line: { color: PALETTE[c % PALETTE.length], width: 1.2 },
-                    hovertemplate: `${escapeHtml(meta.name)} ${escapeHtml(label)}: %{y:.3f}<br>t=%{x:.2f}s<extra></extra>`,
-                    showlegend: false,
-                });
-            }
-            continue;
-        }
+        traces.push(...buildTrackTrace(trackId));
+    }
+    return traces;
+}
+
+function buildTrackTrace(trackId) {
+    const meta = state.tracksMeta[trackId];
+    if (!meta) return [];
+    const panel = state.panels[trackId];
+    if (!panel) return [];
+    if (meta.kind === 'marker' || meta.renderer === 'marker') {
+        return [buildMarkerTrace(trackId, meta, panel)];
+    }
+
+    const ts = Array.from(frameTimes(meta));
+    const values = state.tracks[trackId] || [];
+    if (meta.renderer === 'multi_probability') {
+        return isValidHeatmapTrack(meta, values)
+            ? [buildMultiProbabilityHeatmapTrace(trackId, meta, panel, ts, values)]
+            : buildMultiProbabilityLineTraces(trackId, meta, panel, ts, values);
+    }
+    return [buildLineTrace(trackId, meta, panel, ts, values)];
+}
+
+function buildLineTrace(trackId, meta, panel, ts, values) {
+    return {
+        type: 'scattergl',
+        mode: 'lines',
+        name: meta.name || trackId,
+        x: ts,
+        y: values,
+        xaxis: 'x',
+        yaxis: panel.axis,
+        line: { color: panel.color, width: 1.4 },
+        hovertemplate: `${escapeHtml(meta.name || trackId)}: %{y:.3f}<br>t=%{x:.2f}s<extra></extra>`,
+        showlegend: false,
+    };
+}
+
+function buildMultiProbabilityLineTraces(trackId, meta, panel, ts, values) {
+    const channels = meta.channels || [];
+    const nChannels = channels.length || (Array.isArray(values[0]) ? values[0].length : 1);
+    const traces = [];
+    for (let c = 0; c < nChannels; c++) {
+        const label = channels[c] || `ch${c}`;
         traces.push({
             type: 'scattergl',
             mode: 'lines',
-            name: meta.name || trackId,
+            name: `${meta.name || trackId}:${label}`,
             x: ts,
-            y: values,
+            y: values.map(row => Array.isArray(row) ? row[c] : row),
             xaxis: 'x',
             yaxis: panel.axis,
-            line: { color: panel.color, width: 1.4 },
-            hovertemplate: `${escapeHtml(meta.name || trackId)}: %{y:.3f}<br>t=%{x:.2f}s<extra></extra>`,
+            line: { color: PALETTE[c % PALETTE.length], width: 1.2 },
+            hovertemplate: `${escapeHtml(meta.name || trackId)} ${escapeHtml(label)}: %{y:.3f}<br>t=%{x:.2f}s<extra></extra>`,
             showlegend: false,
         });
     }
     return traces;
+}
+
+function buildMultiProbabilityHeatmapTrace(trackId, meta, panel, ts, values) {
+    const channels = meta.channels;
+    const z = channels.map((_, c) => values.map(row => row[c]));
+    return {
+        type: 'heatmap',
+        name: meta.name || trackId,
+        x: ts,
+        y: channels,
+        z,
+        xaxis: 'x',
+        yaxis: panel.axis,
+        zmin: 0,
+        zmax: 1,
+        zsmooth: false,
+        colorscale: heatmapColorscale(),
+        showscale: false,
+        hovertemplate: `${escapeHtml(meta.name || trackId)}<br>%{y}: %{z:.3f}<br>t=%{x:.2f}s<extra></extra>`,
+        showlegend: false,
+    };
+}
+
+function isValidHeatmapTrack(meta, values) {
+    const channels = meta && Array.isArray(meta.channels) ? meta.channels : [];
+    return meta && meta.renderer === 'multi_probability'
+        && channels.length > 0
+        && Array.isArray(values)
+        && values.length > 0
+        && values.every(row => Array.isArray(row) && row.length === channels.length);
+}
+
+function heatmapColorscale() {
+    return document.documentElement.dataset.theme === 'light' ? 'Blues' : 'Cividis';
+}
+
+function hasVisibleHeatmapTrack() {
+    return state.visibleTrackIds.some(trackId => {
+        const meta = state.tracksMeta[trackId];
+        const values = state.tracks[trackId] || [];
+        return isValidHeatmapTrack(meta, values);
+    });
 }
 
 function buildMarkerTrace(trackId, meta, panel) {
@@ -449,8 +506,17 @@ function buildShapes(ev) {
         x0: ev.start_sec, x1: ev.end_sec,
         y0: eDomain[0], y1: eDomain[1],
         fillcolor: tc.eventCurrentBand,
-        line: { color: tc.eventCurrentBorder, width: 2 },
+        line: { width: 0 },
         layer: 'below',
+    });
+    shapes.push({
+        type: 'rect',
+        xref: 'x', yref: 'paper',
+        x0: ev.start_sec, x1: ev.end_sec,
+        y0: eDomain[0], y1: eDomain[1],
+        fillcolor: 'rgba(0,0,0,0)',
+        line: { color: tc.eventCurrentBorder, width: 2 },
+        layer: 'above',
     });
     // Vertical edge lines at event boundaries.
     for (const xEdge of [ev.start_sec, ev.end_sec]) {
@@ -460,7 +526,7 @@ function buildShapes(ev) {
             x0: xEdge, x1: xEdge,
             y0: 0, y1: 1,
             line: { color: tc.eventCurrentEdge, width: 1.5, dash: 'dot' },
-            layer: 'below',
+            layer: 'above',
         });
     }
 
@@ -503,26 +569,34 @@ function buildLayout(ev) {
     const [t0, t1] = getViewRange(ev);
     const tc = getThemeColors();
     const localRanges = computeLocalSignalRanges(t0, t1);
+    const hasHeatmap = hasVisibleHeatmapTrack();
 
-    const baseAxis = (title, domain, range) => {
+    const baseAxis = (title, domain, range, options = {}) => {
         const ax = {
             domain,
-            title: { text: title, standoff: 4, font: { size: 11, color: tc.plotTitle } },
             zerolinecolor: tc.plotZero,
             gridcolor: tc.plotGrid,
             tickfont: { size: 10, color: tc.plotTick },
             fixedrange: true,
         };
+        if (title) {
+            ax.title = { text: title, standoff: 4, font: { size: 11, color: tc.plotTitle } };
+        }
         if (range) { ax.range = range; ax.autorange = false; }
+        if (options.category) {
+            ax.type = 'category';
+            ax.gridcolor = 'rgba(0,0,0,0)';
+            ax.zeroline = false;
+        }
         return ax;
     };
 
     const layout = {
-        margin: { t: 14, b: 32, l: 56, r: 14 },
+        margin: { t: 14, b: 32, l: hasHeatmap ? 120 : 56, r: 14 },
         showlegend: false,
         plot_bgcolor: tc.plotBg,
         paper_bgcolor: tc.plotBg,
-        hovermode: 'x',
+        hovermode: hasHeatmap ? 'closest' : 'x',
         dragmode: false,
         hoverlabel: { bgcolor: tc.plotHoverBg, font: { color: tc.plotHoverFg, size: 12 } },
         xaxis: {
@@ -543,7 +617,14 @@ function buildLayout(ev) {
         if (!panel) continue;
         const axisKey = panel.axis === 'y' ? 'yaxis' : `yaxis${panel.axis.slice(1)}`;
         const meta = state.tracksMeta[trackId] || {};
-        layout[axisKey] = baseAxis(meta.name || trackId, panel.domain, localRanges[trackId]);
+        const values = state.tracks[trackId] || [];
+        const isHeatmap = isValidHeatmapTrack(meta, values);
+        layout[axisKey] = baseAxis(
+            isHeatmap ? '' : (meta.name || trackId),
+            panel.domain,
+            isHeatmap ? undefined : localRanges[trackId],
+            { category: isHeatmap },
+        );
     }
 
     return layout;
