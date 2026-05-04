@@ -16,8 +16,13 @@ from audio_classification_playground.acoustic_events.inference import (
     load_prediction_artifact,
     run_affect_inference,
     run_all_inference,
+    run_vad,
 )
 from audio_classification_playground.acoustic_events.inference.runners import (
+    DEFAULT_VAD_FRAME_SPEECH_RATIO_THRESHOLD,
+    DEFAULT_VAD_MIN_SILENCE_SEC,
+    DEFAULT_VAD_MIN_SPEECH_SEC,
+    DEFAULT_VAD_SPEECH_THRESHOLD,
     emotion2vec_scores_to_probabilities,
 )
 from audio_classification_playground.acoustic_events.producers.affect import (
@@ -138,6 +143,26 @@ class InferenceArtifactTest(unittest.TestCase):
             self.assertEqual(first.reused, {task: False for task in first.artifacts})
             self.assertEqual(second.reused, {task: True for task in second.artifacts})
             self.assertEqual(len(cleanup_calls), 4)
+
+    def test_vad_manifest_defaults_match_vox_profile_notebook(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audio_path = _write_audio(Path(tmp) / "clip.wav")
+            result = run_vad(
+                audio_path,
+                out_dir=Path(tmp) / "artifacts",
+                detector=_fake_vad,
+                progress=_quiet,
+            )
+
+            config = result.artifact.manifest["inference_config"]
+            self.assertEqual(config["threshold"], DEFAULT_VAD_SPEECH_THRESHOLD)
+            self.assertEqual(config["speech_threshold"], DEFAULT_VAD_SPEECH_THRESHOLD)
+            self.assertEqual(config["min_speech_sec"], DEFAULT_VAD_MIN_SPEECH_SEC)
+            self.assertEqual(config["min_silence_sec"], DEFAULT_VAD_MIN_SILENCE_SEC)
+            self.assertEqual(
+                config["frame_speech_ratio_threshold"],
+                DEFAULT_VAD_FRAME_SPEECH_RATIO_THRESHOLD,
+            )
 
     def test_run_all_fails_fast(self):
         with tempfile.TemporaryDirectory() as tmp:

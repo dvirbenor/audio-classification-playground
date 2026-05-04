@@ -8,6 +8,9 @@ from .artifacts import list_cached_artifacts
 from .audio import load_audio
 from .log import configure_stdout_logging
 from .runners import (
+    DEFAULT_VAD_MIN_SILENCE_SEC,
+    DEFAULT_VAD_MIN_SPEECH_SEC,
+    DEFAULT_VAD_SPEECH_THRESHOLD,
     run_affect_inference,
     run_all_inference,
     run_disfluency_inference,
@@ -35,6 +38,9 @@ def main(argv: list[str] | None = None) -> int:
             recording_id=args.recording_id,
             reuse_cache=args.reuse_cache,
             device=args.device,
+            vad_threshold=args.vad_threshold,
+            vad_min_speech_sec=args.vad_min_speech_sec,
+            vad_min_silence_sec=args.vad_min_silence_sec,
             progress=progress,
         )
         for task, artifact in result.artifacts.items():
@@ -73,12 +79,14 @@ def build_parser() -> argparse.ArgumentParser:
     run_sub.choices["disfluency"].add_argument("--backbone", choices=("wavlm", "whisper"), required=True)
     _add_common_run_args(run_sub.add_parser("emotion", help="Run emotion2vec inference."))
     _add_common_run_args(run_sub.add_parser("vad", help="Run shared VAD."))
+    _add_vad_options(run_sub.choices["vad"])
 
     run_all = sub.add_parser("run-all", help="Run VAD and all model inference tasks.")
     _add_common_options(run_all)
     run_all.add_argument("--audio", required=True)
     run_all.add_argument("--affect-backbone", choices=("wavlm", "whisper"), required=True)
     run_all.add_argument("--disfluency-backbone", choices=("wavlm", "whisper"), required=True)
+    _add_vad_options(run_all)
 
     cached = sub.add_parser("list-cached", help="List complete cached artifacts.")
     cached.add_argument("--out", required=True)
@@ -102,6 +110,27 @@ def _add_common_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--verbose", action="store_true")
 
 
+def _add_vad_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--vad-threshold",
+        type=float,
+        default=DEFAULT_VAD_SPEECH_THRESHOLD,
+        help="Silero speech probability threshold.",
+    )
+    parser.add_argument(
+        "--vad-min-speech-sec",
+        type=float,
+        default=DEFAULT_VAD_MIN_SPEECH_SEC,
+        help="Discard Silero speech regions shorter than this many seconds.",
+    )
+    parser.add_argument(
+        "--vad-min-silence-sec",
+        type=float,
+        default=DEFAULT_VAD_MIN_SILENCE_SEC,
+        help="Bridge Silero silence gaps shorter than this many seconds.",
+    )
+
+
 def _run_single(args, progress):
     common = {
         "out_dir": args.out,
@@ -117,7 +146,13 @@ def _run_single(args, progress):
     if args.task == "emotion":
         return run_emotion_inference(args.audio, **common)
     if args.task == "vad":
-        return run_vad(args.audio, **common)
+        return run_vad(
+            args.audio,
+            threshold=args.vad_threshold,
+            min_speech_sec=args.vad_min_speech_sec,
+            min_silence_sec=args.vad_min_silence_sec,
+            **common,
+        )
     raise ValueError(f"Unknown task {args.task!r}")
 
 

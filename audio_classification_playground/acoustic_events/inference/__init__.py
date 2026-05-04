@@ -41,6 +41,10 @@ from .artifacts import (
     load_prediction_artifact,
 )
 from .runners import (
+    DEFAULT_VAD_FRAME_SPEECH_RATIO_THRESHOLD,
+    DEFAULT_VAD_MIN_SILENCE_SEC,
+    DEFAULT_VAD_MIN_SPEECH_SEC,
+    DEFAULT_VAD_SPEECH_THRESHOLD,
     run_affect_inference,
     run_all_inference,
     run_disfluency_inference,
@@ -51,6 +55,10 @@ from .runners import (
 __all__ = [
     "InferenceRunResult",
     "PredictionArtifact",
+    "DEFAULT_VAD_FRAME_SPEECH_RATIO_THRESHOLD",
+    "DEFAULT_VAD_MIN_SILENCE_SEC",
+    "DEFAULT_VAD_MIN_SPEECH_SEC",
+    "DEFAULT_VAD_SPEECH_THRESHOLD",
     "artifact_to_affect_signals",
     "artifact_to_disfluency_logits",
     "artifact_to_emotion_probabilities",

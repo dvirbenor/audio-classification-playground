@@ -61,6 +61,11 @@ uv run python -m audio_classification_playground.acoustic_events.inference run v
   --out artifacts/
 ```
 
+By default this uses the same Silero settings as
+`notebooks/vox-profile-emotion-dim.ipynb`: speech threshold `0.4`,
+minimum speech `0.1s`, and minimum silence `1.2s`. Override them with
+`--vad-threshold`, `--vad-min-speech-sec`, and `--vad-min-silence-sec`.
+
 Add `--reuse-cache` to reuse a complete matching artifact instead of rerunning
 the model. Add `--recording-id my_recording` to control the organizational
 directory name.

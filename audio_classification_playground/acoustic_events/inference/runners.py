@@ -40,6 +40,10 @@ AFFECT_WINDOW_SEC = 3.5
 DISFLUENCY_WINDOW_SEC = 3.0
 EMOTION_WINDOW_SEC = 3.0
 DEFAULT_HOP_SEC = 0.25
+DEFAULT_VAD_SPEECH_THRESHOLD = 0.4
+DEFAULT_VAD_MIN_SPEECH_SEC = 0.1
+DEFAULT_VAD_MIN_SILENCE_SEC = 1.2
+DEFAULT_VAD_FRAME_SPEECH_RATIO_THRESHOLD = 0.1
 
 Backbone = str
 ProgressFn = Callable[[str], None]
@@ -292,15 +296,22 @@ def run_vad(
     reuse_cache: bool = False,
     model_id: str = DEFAULT_VAD_MODEL,
     sample_rate: int = SAMPLE_RATE,
-    threshold: float = 0.5,
-    min_speech_sec: float = 0.25,
-    min_silence_sec: float = 0.10,
+    threshold: float = DEFAULT_VAD_SPEECH_THRESHOLD,
+    min_speech_sec: float = DEFAULT_VAD_MIN_SPEECH_SEC,
+    min_silence_sec: float = DEFAULT_VAD_MIN_SILENCE_SEC,
     device: str | None = None,
     detector: Callable[[np.ndarray, int], Sequence[tuple[float, float]]] | None = None,
     progress: ProgressFn | None = None,
     cleanup_cuda: Callable[[], None] | None = None,
 ) -> TaskRun:
-    """Run shared VAD and persist intervals in seconds."""
+    """Run shared Silero VAD and persist native-resolution intervals in seconds.
+
+    The default threshold and duration settings mirror
+    ``notebooks/vox-profile-emotion-dim.ipynb``. The notebook's
+    frame-level speech-ratio threshold is recorded in the manifest because
+    it is applied downstream when aligning these intervals to affect windows,
+    not during Silero timestamp generation.
+    """
     audio = _coerce_audio(audio_path, sample_rate=sample_rate, recording_id=recording_id)
     config = _inference_config(
         task="vad",
@@ -313,8 +324,10 @@ def run_vad(
         transform_policy="silero_vad_intervals_sec_v1",
         extra={
             "threshold": float(threshold),
+            "speech_threshold": float(threshold),
             "min_speech_sec": float(min_speech_sec),
             "min_silence_sec": float(min_silence_sec),
+            "frame_speech_ratio_threshold": float(DEFAULT_VAD_FRAME_SPEECH_RATIO_THRESHOLD),
         },
     )
     cached = _maybe_cached(out_dir, audio, "vad", config, reuse_cache)
@@ -371,6 +384,9 @@ def run_all_inference(
     reuse_cache: bool = False,
     sample_rate: int = SAMPLE_RATE,
     device: str | None = None,
+    vad_threshold: float = DEFAULT_VAD_SPEECH_THRESHOLD,
+    vad_min_speech_sec: float = DEFAULT_VAD_MIN_SPEECH_SEC,
+    vad_min_silence_sec: float = DEFAULT_VAD_MIN_SILENCE_SEC,
     progress: ProgressFn | None = None,
     predictors: Mapping[str, Callable] | None = None,
     vad_detector: Callable[[np.ndarray, int], Sequence[tuple[float, float]]] | None = None,
@@ -408,6 +424,9 @@ def run_all_inference(
                 out_dir=out_dir,
                 reuse_cache=reuse_cache,
                 device=device,
+                threshold=vad_threshold,
+                min_speech_sec=vad_min_speech_sec,
+                min_silence_sec=vad_min_silence_sec,
                 detector=vad_detector,
                 progress=progress,
                 cleanup_cuda=cleanup_cuda,
@@ -773,6 +792,7 @@ def _detect_silero_vad(
         repo_or_dir="snakers4/silero-vad",
         model="silero_vad",
         force_reload=False,
+        trust_repo=True,
         onnx=False,
     )
     get_speech_timestamps = utils[0]
@@ -785,6 +805,7 @@ def _detect_silero_vad(
         threshold=float(threshold),
         min_speech_duration_ms=int(float(min_speech_sec) * 1000),
         min_silence_duration_ms=int(float(min_silence_sec) * 1000),
+        return_seconds=False,
     )
     return [
         (float(item["start"]) / float(sample_rate), float(item["end"]) / float(sample_rate))
