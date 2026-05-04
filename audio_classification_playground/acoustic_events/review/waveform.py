@@ -2,7 +2,7 @@
 
 The browser cannot render a 75-minute float32 sample stream. We decimate
 to a few thousand ``(min, max)`` pairs once per audio file and cache the
-result on disk next to the session.
+result on disk outside the immutable review package.
 
 For windowed (high-res) requests, ``soundfile`` is used for efficient
 random-access seeking without decoding the entire file.

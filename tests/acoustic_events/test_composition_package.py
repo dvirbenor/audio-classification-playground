@@ -69,6 +69,24 @@ class CompositionPackageTest(unittest.TestCase):
             self.assertEqual(first_mtime, package_json.stat().st_mtime_ns)
 
             pkg = load_review_package(first)
+            track_rel = next(
+                meta["data_path"]
+                for meta in pkg.tracks_meta.values()
+                if "data_path" in meta
+            )
+            track_path = first / track_rel
+            track_path.unlink()
+            third = compose_review_package(
+                affect_artifact=artifacts["affect"].path,
+                disfluency_artifact=artifacts["disfluency"].path,
+                emotion_artifact=artifacts["emotion"].path,
+                vad_artifact=artifacts["vad"].path,
+                out_dir=out_dir,
+            )
+            self.assertEqual(first, third)
+            self.assertTrue(track_path.is_file())
+            self.assertEqual(first_bytes, package_json.read_bytes())
+
             self.assertEqual(pkg.package["schema"], "review_package.v1")
             self.assertEqual(pkg.package_id, pkg.package_fingerprint[:24])
             self.assertEqual(pkg.labels, {})
@@ -170,6 +188,16 @@ class CompositionPackageTest(unittest.TestCase):
             tracks = client.get("/api/tracks").json()
             self.assertEqual(session["package_id"], package_path.name)
             self.assertIn("disfluency.fluency", tracks["tracks"])
+            waveform = client.get("/api/waveform")
+            self.assertEqual(waveform.status_code, 200)
+            self.assertFalse((package_path / "waveform.peaks.json").exists())
+            self.assertTrue(
+                (
+                    package_path.parent
+                    / ".review_cache"
+                    / f"{package_path.name}.waveform.peaks.json"
+                ).is_file()
+            )
 
             event_id = session["events"][0]["event_id"]
             response = client.post(f"/api/label/{event_id}", json={"verdict": "tp", "tags": ["ok"]})

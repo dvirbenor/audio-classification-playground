@@ -116,7 +116,7 @@ def make_app(package_path: str | Path) -> FastAPI:
             capped = min(n_peaks or 2000, 4000)
             peaks = compute_peaks_window(audio_path, t0, t1, n_peaks=capped)
         else:
-            cache_path = state["path"] / "waveform.peaks.json"
+            cache_path = state["path"].parent / ".review_cache" / f"{state['path'].name}.waveform.peaks.json"
             peaks = cached_peaks(audio_path, cache_path)
         return JSONResponse(peaks)
 

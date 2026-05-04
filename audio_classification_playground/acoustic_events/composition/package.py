@@ -102,6 +102,11 @@ def write_review_package(
     if package_json.is_file():
         existing = _read_json(package_json)
         if existing.get("package_fingerprint") == payload.get("package_fingerprint"):
+            missing_tracks = _missing_track_files(package_dir, tracks)
+            if missing_tracks:
+                tracks_dir = package_dir / TRACKS_DIR
+                tracks_dir.mkdir(parents=True, exist_ok=True)
+                _write_track_arrays(tracks_dir, tracks)
             if not labels_json.is_file():
                 _atomic_write_text(labels_json, pretty_json_text({}))
             return package_dir
@@ -172,6 +177,14 @@ def arrays_by_producer(tracks: Sequence[PredictionTrack]) -> dict[str, dict[str,
                 copy=False,
             )
     return grouped
+
+
+def _missing_track_files(package_dir: Path, tracks: Sequence[PredictionTrack]) -> list[Path]:
+    return [
+        package_dir / TRACKS_DIR / _track_filename(producer_id)
+        for producer_id in arrays_by_producer(tracks)
+        if not (package_dir / TRACKS_DIR / _track_filename(producer_id)).is_file()
+    ]
 
 
 def _write_track_arrays(tracks_dir: Path, tracks: Sequence[PredictionTrack]) -> None:
