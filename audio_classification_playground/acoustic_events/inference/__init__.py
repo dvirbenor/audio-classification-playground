@@ -40,11 +40,21 @@ from .artifacts import (
     list_cached_artifacts,
     load_prediction_artifact,
 )
+from .audio import AudioData
+from .models import (
+    AffectPredictor,
+    DisfluencyPredictor,
+    EmotionPredictor,
+    ModelSuite,
+    VadDetector,
+)
 from .runners import (
     DEFAULT_VAD_FRAME_SPEECH_RATIO_THRESHOLD,
     DEFAULT_VAD_MIN_SILENCE_SEC,
     DEFAULT_VAD_MIN_SPEECH_SEC,
     DEFAULT_VAD_SPEECH_THRESHOLD,
+    ShutdownRequested,
+    compute_inference_config,
     run_affect_inference,
     run_all_inference,
     run_disfluency_inference,
@@ -53,8 +63,15 @@ from .runners import (
 )
 
 __all__ = [
+    "AffectPredictor",
+    "AudioData",
+    "DisfluencyPredictor",
+    "EmotionPredictor",
     "InferenceRunResult",
+    "ModelSuite",
     "PredictionArtifact",
+    "ShutdownRequested",
+    "VadDetector",
     "DEFAULT_VAD_FRAME_SPEECH_RATIO_THRESHOLD",
     "DEFAULT_VAD_MIN_SILENCE_SEC",
     "DEFAULT_VAD_MIN_SPEECH_SEC",
@@ -63,6 +80,7 @@ __all__ = [
     "artifact_to_disfluency_logits",
     "artifact_to_emotion_probabilities",
     "artifact_to_vad",
+    "compute_inference_config",
     "decoded_audio_sha256",
     "inference_config_hash",
     "list_cached_artifacts",

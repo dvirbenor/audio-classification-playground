@@ -1,0 +1,257 @@
+"""Persistent model wrappers for reuse across multiple inference calls.
+
+Each class loads a model once in ``__init__`` and implements ``__call__``
+matching the predictor/detector callable interface expected by the
+inference runners.  This allows an orchestrator to keep models resident
+in GPU memory across thousands of files.
+
+Example::
+
+    from audio_classification_playground.acoustic_events.inference.models import ModelSuite
+
+    models = ModelSuite(
+        affect_backbone="wavlm",
+        disfluency_backbone="whisper",
+        batch_size=512,
+        device="cuda",
+    )
+    # models.affect, models.disfluency, models.emotion, models.vad
+    # are persistent callables that match the runner predictor interfaces.
+"""
+from __future__ import annotations
+
+from collections.abc import Callable
+from typing import Sequence
+
+import numpy as np
+
+from .artifacts import SAMPLE_RATE
+from .log import get_logger
+from .runners import (
+    DEFAULT_AFFECT_MODELS,
+    DEFAULT_DISFLUENCY_MODELS,
+    DEFAULT_EMOTION_MODEL,
+    DEFAULT_VAD_MIN_SILENCE_SEC,
+    DEFAULT_VAD_MIN_SPEECH_SEC,
+    DEFAULT_VAD_SPEECH_THRESHOLD,
+    _load_affect_wrapper,
+    _load_disfluency_wrapper,
+)
+
+LOGGER = get_logger()
+ProgressFn = Callable[[str], None]
+
+
+def _batches(windows: np.ndarray, batch_size: int, task: str):
+    n = len(windows)
+    for start in range(0, n, batch_size):
+        yield windows[start : min(start + batch_size, n)]
+
+
+class AffectPredictor:
+    """Persistent Vox-Profile dimensional affect model.
+
+    Matches ``Callable[[np.ndarray], dict[str, np.ndarray]]``.
+    """
+
+    def __init__(
+        self,
+        backbone: str,
+        model_id: str | None = None,
+        device: str | None = None,
+        batch_size: int = 512,
+    ) -> None:
+        import torch
+
+        self.backbone = backbone
+        self.batch_size = batch_size
+        resolved_id = model_id or DEFAULT_AFFECT_MODELS[backbone]
+        self.model_id = resolved_id
+        self._device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        wrapper = _load_affect_wrapper(backbone)
+        self._model = wrapper.from_pretrained(resolved_id).to(self._device).eval()
+        LOGGER.info("AffectPredictor loaded: %s on %s", resolved_id, self._device)
+
+    def __call__(self, windows: np.ndarray) -> dict[str, np.ndarray]:
+        import torch
+
+        arousal, valence, dominance = [], [], []
+        with torch.inference_mode():
+            for batch_np in _batches(windows, self.batch_size, "affect"):
+                batch = torch.from_numpy(np.ascontiguousarray(batch_np)).to(self._device)
+                a, v, d = self._model(batch)
+                arousal.append(a.detach().cpu().reshape(-1).numpy())
+                valence.append(v.detach().cpu().reshape(-1).numpy())
+                dominance.append(d.detach().cpu().reshape(-1).numpy())
+        return {
+            "arousal": np.concatenate(arousal),
+            "valence": np.concatenate(valence),
+            "dominance": np.concatenate(dominance),
+        }
+
+
+class DisfluencyPredictor:
+    """Persistent Vox-Profile disfluency model.
+
+    Matches ``Callable[[np.ndarray], dict[str, np.ndarray]]``.
+    """
+
+    def __init__(
+        self,
+        backbone: str,
+        model_id: str | None = None,
+        device: str | None = None,
+        batch_size: int = 512,
+    ) -> None:
+        import torch
+
+        self.backbone = backbone
+        self.batch_size = batch_size
+        resolved_id = model_id or DEFAULT_DISFLUENCY_MODELS[backbone]
+        self.model_id = resolved_id
+        self._device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        wrapper = _load_disfluency_wrapper(backbone)
+        self._model = wrapper.from_pretrained(resolved_id).to(self._device).eval()
+        LOGGER.info("DisfluencyPredictor loaded: %s on %s", resolved_id, self._device)
+
+    def __call__(self, windows: np.ndarray) -> dict[str, np.ndarray]:
+        import torch
+
+        fluency, dysfluency = [], []
+        with torch.inference_mode():
+            for batch_np in _batches(windows, self.batch_size, "disfluency"):
+                batch = torch.from_numpy(np.ascontiguousarray(batch_np)).to(self._device)
+                f, d = self._model(batch, return_feature=False)
+                fluency.append(f.detach().cpu().numpy())
+                dysfluency.append(d.detach().cpu().numpy())
+        return {
+            "fluency_logits": np.concatenate(fluency, axis=0),
+            "disfluency_type_logits": np.concatenate(dysfluency, axis=0),
+        }
+
+
+class EmotionPredictor:
+    """Persistent emotion2vec model.
+
+    Matches ``Callable[[np.ndarray], tuple[np.ndarray, Sequence[str]]]``.
+    """
+
+    def __init__(
+        self,
+        model_id: str = DEFAULT_EMOTION_MODEL,
+        sample_rate: int = SAMPLE_RATE,
+        batch_size: int = 512,
+    ) -> None:
+        from funasr import AutoModel
+
+        self.model_id = model_id
+        self.sample_rate = sample_rate
+        self.batch_size = batch_size
+        self._model = AutoModel(model=model_id)
+        LOGGER.info("EmotionPredictor loaded: %s", model_id)
+
+    def __call__(self, windows: np.ndarray) -> tuple[np.ndarray, Sequence[str]]:
+        all_scores: list = []
+        labels: list[str] | None = None
+        for batch_np in _batches(windows, self.batch_size, "emotion"):
+            batch = [np.ascontiguousarray(batch_np[i]) for i in range(len(batch_np))]
+            results = self._model.generate(
+                input=batch,
+                fs=self.sample_rate,
+                granularity="utterance",
+                extract_embedding=False,
+            )
+            if labels is None:
+                labels = list(results[0]["labels"])
+            all_scores.extend(result["scores"] for result in results)
+        if labels is None:
+            raise ValueError("emotion2vec produced no results")
+        return np.asarray(all_scores, dtype=np.float32), labels
+
+
+class VadDetector:
+    """Persistent Silero VAD model (CPU).
+
+    Matches ``Callable[[np.ndarray, int], list[tuple[float, float]]]``.
+    """
+
+    def __init__(
+        self,
+        threshold: float = DEFAULT_VAD_SPEECH_THRESHOLD,
+        min_speech_sec: float = DEFAULT_VAD_MIN_SPEECH_SEC,
+        min_silence_sec: float = DEFAULT_VAD_MIN_SILENCE_SEC,
+    ) -> None:
+        import torch
+
+        self.threshold = float(threshold)
+        self.min_speech_sec = float(min_speech_sec)
+        self.min_silence_sec = float(min_silence_sec)
+        model, utils = torch.hub.load(
+            repo_or_dir="snakers4/silero-vad",
+            model="silero_vad",
+            force_reload=False,
+            trust_repo=True,
+            onnx=False,
+        )
+        self._model = model.to("cpu")
+        self._get_speech_timestamps = utils[0]
+        LOGGER.info("VadDetector loaded (CPU)")
+
+    def __call__(
+        self, samples: np.ndarray, sample_rate: int
+    ) -> list[tuple[float, float]]:
+        import torch
+
+        timestamps = self._get_speech_timestamps(
+            torch.from_numpy(np.asarray(samples, dtype=np.float32)),
+            self._model,
+            sampling_rate=sample_rate,
+            threshold=self.threshold,
+            min_speech_duration_ms=int(self.min_speech_sec * 1000),
+            min_silence_duration_ms=int(self.min_silence_sec * 1000),
+            return_seconds=False,
+        )
+        sr = float(sample_rate)
+        return [(float(t["start"]) / sr, float(t["end"]) / sr) for t in timestamps]
+
+
+class ModelSuite:
+    """Convenience holder that loads all four models at construction time.
+
+    Example::
+
+        suite = ModelSuite(
+            affect_backbone="wavlm",
+            disfluency_backbone="whisper",
+            batch_size=512,
+            device="cuda",
+        )
+        # suite.affect   -> AffectPredictor
+        # suite.disfluency -> DisfluencyPredictor
+        # suite.emotion  -> EmotionPredictor
+        # suite.vad      -> VadDetector
+    """
+
+    def __init__(
+        self,
+        *,
+        affect_backbone: str,
+        disfluency_backbone: str,
+        batch_size: int = 512,
+        device: str | None = None,
+        vad_threshold: float = DEFAULT_VAD_SPEECH_THRESHOLD,
+        vad_min_speech_sec: float = DEFAULT_VAD_MIN_SPEECH_SEC,
+        vad_min_silence_sec: float = DEFAULT_VAD_MIN_SILENCE_SEC,
+    ) -> None:
+        self.affect = AffectPredictor(
+            backbone=affect_backbone, device=device, batch_size=batch_size,
+        )
+        self.disfluency = DisfluencyPredictor(
+            backbone=disfluency_backbone, device=device, batch_size=batch_size,
+        )
+        self.emotion = EmotionPredictor(batch_size=batch_size)
+        self.vad = VadDetector(
+            threshold=vad_threshold,
+            min_speech_sec=vad_min_speech_sec,
+            min_silence_sec=vad_min_silence_sec,
+        )

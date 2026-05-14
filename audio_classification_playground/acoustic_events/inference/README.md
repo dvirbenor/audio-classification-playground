@@ -131,6 +131,78 @@ emotion = run_emotion_inference(
 print(emotion.artifact.path)
 ```
 
+### Persistent Model Classes
+
+For batch workloads that process many files, load models once and inject
+them as persistent callables:
+
+```python
+from audio_classification_playground.acoustic_events.inference import (
+    ModelSuite,
+    run_all_inference,
+)
+
+models = ModelSuite(
+    affect_backbone="wavlm",
+    disfluency_backbone="whisper",
+    batch_size=512,
+    device="cuda",
+)
+
+result = run_all_inference(
+    audio_data,  # AudioData or file path
+    out_dir="artifacts",
+    affect_backbone="wavlm",
+    disfluency_backbone="whisper",
+    predictors={
+        "affect": models.affect,
+        "disfluency": models.disfluency,
+        "emotion": models.emotion,
+    },
+    vad_detector=models.vad,
+    cleanup_cuda=lambda: None,  # skip per-file cleanup
+    reuse_cache=True,
+)
+```
+
+### Custom Artifact Paths
+
+Override the default deep layout with `artifact_path_fn`:
+
+```python
+from pathlib import Path
+
+result = run_all_inference(
+    audio_data,
+    out_dir="artifacts",
+    affect_backbone="wavlm",
+    disfluency_backbone="whisper",
+    artifact_path_fn=lambda task: Path(f"output/{session_id}/{archive_id}/{task}"),
+    audio_path_override="s3://bucket/key/to/audio.wav",
+    audio_source_key="key/to/audio.wav",
+    reuse_cache=True,
+)
+```
+
+### Graceful Shutdown
+
+Pass a `shutdown_check` callback to allow clean interruption between tasks:
+
+```python
+import threading
+
+stop = threading.Event()
+
+result = run_all_inference(
+    audio_data,
+    out_dir="artifacts",
+    affect_backbone="wavlm",
+    disfluency_backbone="whisper",
+    shutdown_check=stop.is_set,
+)
+# Raises ShutdownRequested if stop is set between tasks.
+```
+
 ## Later Producer Inputs
 
 Adapters convert artifacts into the existing producer input shapes:

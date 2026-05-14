@@ -237,19 +237,24 @@ def base_manifest(
     timing: Mapping,
     runtime: Mapping,
     labels: Sequence[str] | None = None,
+    audio_path_override: str | None = None,
+    audio_source_key: str | None = None,
 ) -> dict:
+    audio_block: dict = {
+        "path": audio_path_override or str(Path(audio_path).resolve()),
+        "sha256": audio_sha256,
+        "sample_rate": int(sample_rate),
+        "duration_sec": float(duration_sec),
+        "hash_semantics": "decoded_mono_16khz_float32",
+    }
+    if audio_source_key is not None:
+        audio_block["source_key"] = audio_source_key
     payload = {
         "schema": SCHEMA,
         "status": _COMPLETE_STATUS,
         "task": task,
         "recording_id": recording_id,
-        "audio": {
-            "path": str(Path(audio_path).resolve()),
-            "sha256": audio_sha256,
-            "sample_rate": int(sample_rate),
-            "duration_sec": float(duration_sec),
-            "hash_semantics": "decoded_mono_16khz_float32",
-        },
+        "audio": audio_block,
         "inference_config": dict(inference_config),
         "inference_config_hash": inference_config_hash_value,
         "model": dict(model),

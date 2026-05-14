@@ -4,6 +4,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 import gc
+import json
 from pathlib import Path
 from typing import Mapping, Sequence
 
@@ -13,12 +14,15 @@ from ..producers.emotion.config import CANONICAL_CHANNELS, Config as EmotionConf
 from ..producers.emotion.pipeline import normalize_label
 from .artifacts import (
     InferenceRunResult,
+    MANIFEST_FILENAME,
+    PREDICTIONS_FILENAME,
     PredictionArtifact,
     SAMPLE_RATE,
     artifact_dir,
     base_manifest,
     find_cached_artifact,
     inference_config_hash,
+    load_prediction_artifact,
     write_prediction_artifact,
 )
 from .audio import AudioData, frame_audio, load_audio
@@ -50,6 +54,10 @@ ProgressFn = Callable[[str], None]
 LOGGER = get_logger()
 
 
+class ShutdownRequested(Exception):
+    """Raised between tasks when the worker received a graceful shutdown signal."""
+
+
 @dataclass(frozen=True)
 class TaskRun:
     artifact: PredictionArtifact
@@ -72,6 +80,9 @@ def run_affect_inference(
     predictor: Callable[[np.ndarray], Mapping[str, np.ndarray]] | None = None,
     progress: ProgressFn | None = None,
     cleanup_cuda: Callable[[], None] | None = None,
+    artifact_path: Path | None = None,
+    audio_path_override: str | None = None,
+    audio_source_key: str | None = None,
 ) -> TaskRun:
     """Run Vox-Profile dimensional affect inference and persist A/V/D arrays."""
     if backbone not in DEFAULT_AFFECT_MODELS:
@@ -88,7 +99,7 @@ def run_affect_inference(
         batch_size=batch_size,
         transform_policy="vox_profile_affect_sigmoid_heads_v1",
     )
-    cached = _maybe_cached(out_dir, audio, "affect", config, reuse_cache)
+    cached = _maybe_cached(out_dir, audio, "affect", config, reuse_cache, artifact_path)
     if cached is not None:
         _progress(progress, f"affect cache hit: {cached.path}")
         return TaskRun(cached, True)
@@ -128,6 +139,9 @@ def run_affect_inference(
             },
             timing=_timing(sample_rate, window_sec, hop_sec, len(windows)),
             runtime=_runtime(device=device, batch_size=batch_size),
+            artifact_path=artifact_path,
+            audio_path_override=audio_path_override,
+            audio_source_key=audio_source_key,
         )
         _progress(progress, f"affect wrote: {artifact.path}")
         return TaskRun(artifact, False)
@@ -151,6 +165,9 @@ def run_disfluency_inference(
     predictor: Callable[[np.ndarray], Mapping[str, np.ndarray]] | None = None,
     progress: ProgressFn | None = None,
     cleanup_cuda: Callable[[], None] | None = None,
+    artifact_path: Path | None = None,
+    audio_path_override: str | None = None,
+    audio_source_key: str | None = None,
 ) -> TaskRun:
     """Run Vox-Profile disfluency inference and persist raw logits."""
     if backbone not in DEFAULT_DISFLUENCY_MODELS:
@@ -167,7 +184,7 @@ def run_disfluency_inference(
         batch_size=batch_size,
         transform_policy="vox_profile_disfluency_raw_logits_v1",
     )
-    cached = _maybe_cached(out_dir, audio, "disfluency", config, reuse_cache)
+    cached = _maybe_cached(out_dir, audio, "disfluency", config, reuse_cache, artifact_path)
     if cached is not None:
         _progress(progress, f"disfluency cache hit: {cached.path}")
         return TaskRun(cached, True)
@@ -207,6 +224,9 @@ def run_disfluency_inference(
             },
             timing=_timing(sample_rate, window_sec, hop_sec, len(windows)),
             runtime=_runtime(device=device, batch_size=batch_size),
+            artifact_path=artifact_path,
+            audio_path_override=audio_path_override,
+            audio_source_key=audio_source_key,
         )
         _progress(progress, f"disfluency wrote: {artifact.path}")
         return TaskRun(artifact, False)
@@ -229,6 +249,9 @@ def run_emotion_inference(
     predictor: Callable[[np.ndarray], tuple[np.ndarray, Sequence[str]]] | None = None,
     progress: ProgressFn | None = None,
     cleanup_cuda: Callable[[], None] | None = None,
+    artifact_path: Path | None = None,
+    audio_path_override: str | None = None,
+    audio_source_key: str | None = None,
 ) -> TaskRun:
     """Run emotion2vec inference and persist canonical probabilities."""
     audio = _coerce_audio(audio_path, sample_rate=sample_rate, recording_id=recording_id)
@@ -242,7 +265,7 @@ def run_emotion_inference(
         batch_size=batch_size,
         transform_policy="emotion2vec_fold_row_normalize_v1",
     )
-    cached = _maybe_cached(out_dir, audio, "emotion", config, reuse_cache)
+    cached = _maybe_cached(out_dir, audio, "emotion", config, reuse_cache, artifact_path)
     if cached is not None:
         _progress(progress, f"emotion cache hit: {cached.path}")
         return TaskRun(cached, True)
@@ -281,6 +304,9 @@ def run_emotion_inference(
             timing=_timing(sample_rate, window_sec, hop_sec, len(windows)),
             runtime=_runtime(device=device, batch_size=batch_size),
             labels=labels,
+            artifact_path=artifact_path,
+            audio_path_override=audio_path_override,
+            audio_source_key=audio_source_key,
         )
         _progress(progress, f"emotion wrote: {artifact.path}")
         return TaskRun(artifact, False)
@@ -303,6 +329,9 @@ def run_vad(
     detector: Callable[[np.ndarray, int], Sequence[tuple[float, float]]] | None = None,
     progress: ProgressFn | None = None,
     cleanup_cuda: Callable[[], None] | None = None,
+    artifact_path: Path | None = None,
+    audio_path_override: str | None = None,
+    audio_source_key: str | None = None,
 ) -> TaskRun:
     """Run shared Silero VAD and persist native-resolution intervals in seconds.
 
@@ -330,7 +359,7 @@ def run_vad(
             "frame_speech_ratio_threshold": float(DEFAULT_VAD_FRAME_SPEECH_RATIO_THRESHOLD),
         },
     )
-    cached = _maybe_cached(out_dir, audio, "vad", config, reuse_cache)
+    cached = _maybe_cached(out_dir, audio, "vad", config, reuse_cache, artifact_path)
     if cached is not None:
         _progress(progress, f"vad cache hit: {cached.path}")
         return TaskRun(cached, True)
@@ -367,6 +396,9 @@ def run_vad(
                 "window_semantics": "sparse_intervals_sec",
             },
             runtime=_runtime(device=device, batch_size=0),
+            artifact_path=artifact_path,
+            audio_path_override=audio_path_override,
+            audio_source_key=audio_source_key,
         )
         _progress(progress, f"vad wrote: {artifact.path}")
         return TaskRun(artifact, False)
@@ -375,7 +407,7 @@ def run_vad(
 
 
 def run_all_inference(
-    audio_path: str | Path,
+    audio_path: str | Path | AudioData,
     *,
     out_dir: str | Path,
     affect_backbone: Backbone,
@@ -383,6 +415,7 @@ def run_all_inference(
     recording_id: str | None = None,
     reuse_cache: bool = False,
     sample_rate: int = SAMPLE_RATE,
+    batch_size: int = 128,
     device: str | None = None,
     vad_threshold: float = DEFAULT_VAD_SPEECH_THRESHOLD,
     vad_min_speech_sec: float = DEFAULT_VAD_MIN_SPEECH_SEC,
@@ -391,10 +424,33 @@ def run_all_inference(
     predictors: Mapping[str, Callable] | None = None,
     vad_detector: Callable[[np.ndarray, int], Sequence[tuple[float, float]]] | None = None,
     cleanup_cuda: Callable[[], None] | None = None,
+    artifact_path_fn: Callable[[str], Path] | None = None,
+    audio_path_override: str | None = None,
+    audio_source_key: str | None = None,
+    shutdown_check: Callable[[], bool] | None = None,
 ) -> InferenceRunResult:
     """Run VAD, affect, disfluency, and emotion sequentially.
 
-    Example:
+    Parameters
+    ----------
+    audio_path:
+        A file path or a pre-loaded ``AudioData`` to avoid redundant decoding.
+    artifact_path_fn:
+        If provided, ``fn(task_name)`` returns the directory where that task's
+        artifact should be stored, overriding the default deep layout.
+    audio_path_override:
+        Durable audio URI written into manifests (e.g. an ``s3://`` URI)
+        instead of the ephemeral local temp path.
+    audio_source_key:
+        Bare S3 key recorded in the manifest's ``audio.source_key`` field.
+    batch_size:
+        Batch size passed to sub-runners and recorded in manifests.
+    shutdown_check:
+        Called between tasks.  If it returns ``True``, a
+        :class:`ShutdownRequested` exception is raised so the orchestrator
+        can exit cleanly.
+
+    Example::
 
         result = run_all_inference(
             "input.mp3",
@@ -411,8 +467,14 @@ def run_all_inference(
     not run producers or save review sessions.
     """
     predictors = dict(predictors or {})
-    audio = load_audio(audio_path, sample_rate=sample_rate, recording_id=recording_id)
+    if isinstance(audio_path, AudioData):
+        audio = audio_path
+    else:
+        audio = load_audio(audio_path, sample_rate=sample_rate, recording_id=recording_id)
     _progress(progress, f"audio sha256: {audio.audio_sha256}")
+
+    def _ap(task: str) -> Path | None:
+        return artifact_path_fn(task) if artifact_path_fn is not None else None
 
     artifacts: dict[str, PredictionArtifact] = {}
     reused: dict[str, bool] = {}
@@ -430,6 +492,9 @@ def run_all_inference(
                 detector=vad_detector,
                 progress=progress,
                 cleanup_cuda=cleanup_cuda,
+                artifact_path=_ap("vad"),
+                audio_path_override=audio_path_override,
+                audio_source_key=audio_source_key,
             ),
         ),
         (
@@ -439,10 +504,14 @@ def run_all_inference(
                 out_dir=out_dir,
                 backbone=affect_backbone,
                 reuse_cache=reuse_cache,
+                batch_size=batch_size,
                 device=device,
                 predictor=predictors.get("affect"),
                 progress=progress,
                 cleanup_cuda=cleanup_cuda,
+                artifact_path=_ap("affect"),
+                audio_path_override=audio_path_override,
+                audio_source_key=audio_source_key,
             ),
         ),
         (
@@ -452,10 +521,14 @@ def run_all_inference(
                 out_dir=out_dir,
                 backbone=disfluency_backbone,
                 reuse_cache=reuse_cache,
+                batch_size=batch_size,
                 device=device,
                 predictor=predictors.get("disfluency"),
                 progress=progress,
                 cleanup_cuda=cleanup_cuda,
+                artifact_path=_ap("disfluency"),
+                audio_path_override=audio_path_override,
+                audio_source_key=audio_source_key,
             ),
         ),
         (
@@ -464,14 +537,20 @@ def run_all_inference(
                 audio,
                 out_dir=out_dir,
                 reuse_cache=reuse_cache,
+                batch_size=batch_size,
                 device=device,
                 predictor=predictors.get("emotion"),
                 progress=progress,
                 cleanup_cuda=cleanup_cuda,
+                artifact_path=_ap("emotion"),
+                audio_path_override=audio_path_override,
+                audio_source_key=audio_source_key,
             ),
         ),
     ]
     for task, run_step in steps:
+        if shutdown_check is not None and shutdown_check():
+            raise ShutdownRequested(f"shutdown requested before task {task!r}")
         _progress(progress, f"run-all task: {task}")
         result = run_step()
         artifacts[task] = result.artifact
@@ -572,9 +651,14 @@ def _maybe_cached(
     task: str,
     config: Mapping,
     reuse_cache: bool,
+    explicit_artifact_path: Path | None = None,
 ) -> PredictionArtifact | None:
     if not reuse_cache:
         return None
+    if explicit_artifact_path is not None:
+        return _validate_explicit_artifact(
+            explicit_artifact_path, audio, task, config,
+        )
     return find_cached_artifact(
         out_dir,
         recording_id=audio.recording_id,
@@ -582,6 +666,37 @@ def _maybe_cached(
         task=task,
         inference_config_hash_value=inference_config_hash(config),
     )
+
+
+def _validate_explicit_artifact(
+    artifact_path: Path,
+    audio: AudioData,
+    task: str,
+    config: Mapping,
+) -> PredictionArtifact | None:
+    """Validate an artifact at a caller-specified path against current config.
+
+    With a flat layout the config hash is no longer embedded in the directory
+    structure, so we must open the manifest and verify that the task, audio
+    SHA256, and inference_config_hash all match the current run parameters.
+    """
+    manifest_path = artifact_path / MANIFEST_FILENAME
+    predictions_path = artifact_path / PREDICTIONS_FILENAME
+    if not manifest_path.is_file() or not predictions_path.is_file():
+        return None
+    try:
+        artifact = load_prediction_artifact(artifact_path)
+    except (OSError, ValueError, KeyError, json.JSONDecodeError):
+        return None
+    m = artifact.manifest
+    expected_hash = inference_config_hash(config)
+    if m.get("task") != task:
+        return None
+    if m.get("audio", {}).get("sha256") != audio.audio_sha256:
+        return None
+    if m.get("inference_config_hash") != expected_hash:
+        return None
+    return artifact
 
 
 def _write_task_artifact(
@@ -595,15 +710,21 @@ def _write_task_artifact(
     timing: Mapping,
     runtime: Mapping,
     labels: Sequence[str] | None = None,
+    artifact_path: Path | None = None,
+    audio_path_override: str | None = None,
+    audio_source_key: str | None = None,
 ) -> PredictionArtifact:
     config_hash = inference_config_hash(config)
-    path = artifact_dir(
-        out_dir,
-        recording_id=audio.recording_id,
-        audio_sha256=audio.audio_sha256,
-        task=task,
-        inference_config_hash_value=config_hash,
-    )
+    if artifact_path is not None:
+        path = artifact_path
+    else:
+        path = artifact_dir(
+            out_dir,
+            recording_id=audio.recording_id,
+            audio_sha256=audio.audio_sha256,
+            task=task,
+            inference_config_hash_value=config_hash,
+        )
     manifest = base_manifest(
         task=task,
         recording_id=audio.recording_id,
@@ -617,6 +738,8 @@ def _write_task_artifact(
         timing=timing,
         runtime=runtime,
         labels=labels,
+        audio_path_override=audio_path_override,
+        audio_source_key=audio_source_key,
     )
     return write_prediction_artifact(path, manifest=manifest, arrays=arrays)
 
@@ -849,6 +972,37 @@ def _batches(
         end = min(start + batch_size, n)
         _progress(progress, f"{task} batch {start}:{end} / {n}")
         yield windows[start:end]
+
+
+def compute_inference_config(
+    *,
+    task: str,
+    model_id: str,
+    backbone: str | None,
+    sample_rate: int,
+    window_sec: float,
+    hop_sec: float,
+    batch_size: int,
+    transform_policy: str,
+    extra: Mapping | None = None,
+) -> dict:
+    """Public wrapper around the internal config builder.
+
+    The orchestrator uses this to compute expected inference_config_hash
+    values for stale-artifact detection without duplicating the config
+    construction logic.
+    """
+    return _inference_config(
+        task=task,
+        model_id=model_id,
+        backbone=backbone,
+        sample_rate=sample_rate,
+        window_sec=window_sec,
+        hop_sec=hop_sec,
+        batch_size=batch_size,
+        transform_policy=transform_policy,
+        extra=extra,
+    )
 
 
 def _progress(progress: ProgressFn | None, message: str) -> None:
