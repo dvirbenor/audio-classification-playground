@@ -43,6 +43,20 @@ python -m audio_classification_playground.acoustic_events.orchestration errors \
     --output /efs/dvir/data/magic-clips-research/acoustic-understanding/models-inference \
     --kind inference --group
 
+# Timing distribution summary (split by VAD mode by default)
+python -m audio_classification_playground.acoustic_events.orchestration timings \
+    --output /efs/dvir/data/magic-clips-research/acoustic-understanding/models-inference
+
+# Timing CSV export for notebooks
+python -m audio_classification_playground.acoustic_events.orchestration timings \
+    --output /efs/dvir/data/magic-clips-research/acoustic-understanding/models-inference \
+    --csv --no-split-by-vad-mode > timings.csv
+
+# Per-worker breakdown
+python -m audio_classification_playground.acoustic_events.orchestration timings \
+    --output /efs/dvir/data/magic-clips-research/acoustic-understanding/models-inference \
+    --by-worker
+
 # Reclaim stale locks from crashed pods
 python -m audio_classification_playground.acoustic_events.orchestration reclaim-stale \
     --output /efs/dvir/data/magic-clips-research/acoustic-understanding/models-inference \
@@ -102,6 +116,8 @@ python -m audio_classification_playground.acoustic_events.orchestration reclaim-
       <uuid>.json
     inference_errors/
       <uuid>.json
+    timings/
+      <worker_id>.jsonl
 ```
 
 ### Processing Flow
@@ -274,6 +290,77 @@ since retries are the meaningful signal there).
 
 The original flat listing (`--summary` without `--group`) remains available.
 
+### Timing distributions (`timings`)
+
+Each worker appends a JSONL line per completed archive to
+`_meta/timings/<worker_id>.jsonl`.  The `timings` subcommand reads all
+worker files and computes distributional statistics (percentiles, mean,
+std) for each timing field.
+
+```bash
+python -m audio_classification_playground.acoustic_events.orchestration timings \
+    --output /efs/.../models-inference
+```
+
+By default, records are split into three populations by VAD execution
+mode (derived from stored booleans — no enum stored in the record):
+
+| VAD mode | Condition | `vad_sec` meaning |
+|---|---|---|
+| `prefetched` | `precomputed_vad=true` | Artifact write using pre-fetched intervals |
+| `cached` | `precomputed_vad=false, vad_reused=true` | Cache load of existing artifact |
+| `inline` | `precomputed_vad=false, vad_reused=false` | Full inline Silero VAD run |
+
+Disable splitting with `--no-split-by-vad-mode` for a single combined view.
+
+**Flags:**
+
+| Flag | Description |
+|---|---|
+| `--csv` | Output raw records as CSV (includes derived `vad_mode` column) |
+| `--fields F1,F2,...` | Only display specific timing fields |
+| `--min-audio-sec N` | Filter to archives with `audio_duration_sec >= N` |
+| `--max-audio-sec N` | Filter to archives with `audio_duration_sec <= N` |
+| `--by-worker` | Per-worker breakdown followed by aggregate |
+| `--worker SUBSTR` | Filter to a single worker (substring match) |
+| `--no-split-by-vad-mode` | Disable VAD mode splitting |
+
+**Record schema** (one JSON object per JSONL line):
+
+```json
+{
+    "worker_id": "pod-abc12_3f8a",
+    "session_id": "abc",
+    "archive_id": "def",
+    "ts": "2026-05-15T01:30:00Z",
+    "audio_duration_sec": 183.4,
+    "prefetch_wait_sec": 0.12,
+    "download_decode_sec": 1.4,
+    "vad_precompute_sec": 0.8,
+    "precomputed_vad": true,
+    "vad_reused": false,
+    "affect_reused": false,
+    "disfluency_reused": false,
+    "emotion_reused": false,
+    "vad_sec": 0.02,
+    "affect_sec": 1.73,
+    "disfluency_sec": 2.01,
+    "emotion_sec": 0.94,
+    "inference_sec": 4.70,
+    "total_sec": 6.22
+}
+```
+
+`inference_sec` is wall-clock time around the entire `run_all_inference`
+call (includes inter-task overhead).  Per-task `*_sec` fields come from
+`InferenceRunResult.task_elapsed_sec`.  `*_reused` booleans come from
+`InferenceRunResult.reused`.
+
+**Multi-pod design:** each pod writes its own JSONL file (append-only,
+no locks). The CLI globs all files at analysis time. `worker_id` is
+embedded in every record, so analysis is correct even if files are
+concatenated or moved.
+
 ## Glacier Restore
 
 Archives stored in `GLACIER` or `DEEP_ARCHIVE` produce transient
@@ -439,6 +526,7 @@ The `_meta/` directory will contain:
 
 - Up to ~600k lock files (small, ephemeral)
 - Error JSON files (one per error event, typically <1 KB each)
+- Timing JSONL files (one per worker process, ~200 bytes per record)
 
 EFS handles this volume well, but monitor the metadata cost if running
 hundreds of thousands of archives.

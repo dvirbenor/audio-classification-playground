@@ -5,6 +5,7 @@ Subcommands:
     run             Start a worker that processes archives.
     progress        Print a summary of the current pipeline state.
     errors          List audio or inference errors.
+    timings         Summarise per-archive inference timing distributions.
     reclaim-stale   Remove orphan lock files from crashed pods.
 
 Example::
@@ -211,6 +212,75 @@ def _cmd_errors(args: argparse.Namespace) -> None:
         _print_errors_flat(errors_dir, kind, args.summary)
 
 
+# ---------------------------------------------------------------------------
+# timings
+# ---------------------------------------------------------------------------
+
+
+def _cmd_timings(args: argparse.Namespace) -> None:
+    from .timings import (
+        derive_vad_mode,
+        format_timing_csv,
+        format_timing_summary,
+        load_timing_records,
+        summarize_timings,
+        summarize_timings_by_worker,
+    )
+
+    output_base = Path(args.output)
+    records = load_timing_records(output_base)
+
+    if not records:
+        print("No timing records found.")
+        return
+
+    fields = None
+    if args.fields:
+        fields = tuple(f.strip() for f in args.fields.split(","))
+
+    if args.min_audio_sec is not None:
+        records = [r for r in records if r.get("audio_duration_sec", 0) >= args.min_audio_sec]
+    if args.max_audio_sec is not None:
+        records = [r for r in records if r.get("audio_duration_sec", 0) <= args.max_audio_sec]
+    if args.worker:
+        records = [r for r in records if args.worker in r.get("worker_id", "")]
+
+    if not records:
+        print("No timing records match the filters.")
+        return
+
+    if args.csv:
+        print(format_timing_csv(records, fields), end="")
+        return
+
+    split_vad = args.split_by_vad_mode
+
+    def _print_group(recs: list[dict], title: str | None = None) -> None:
+        if split_vad:
+            buckets: dict[str, list[dict]] = {}
+            for r in recs:
+                mode = derive_vad_mode(r)
+                buckets.setdefault(mode, []).append(r)
+            for mode in ("prefetched", "cached", "inline"):
+                bucket = buckets.get(mode)
+                if not bucket:
+                    continue
+                label = f"{title} (vad_mode={mode})" if title else f"vad_mode={mode}"
+                print(format_timing_summary(summarize_timings(bucket, fields), title=label))
+        else:
+            print(format_timing_summary(summarize_timings(recs, fields), title=title))
+
+    if args.by_worker:
+        groups = summarize_timings_by_worker(records, fields)
+        for wid in groups:
+            worker_recs = [r for r in records if r.get("worker_id") == wid]
+            _print_group(worker_recs, title=f"Worker: {wid}")
+        print("---")
+        _print_group(records, title="All workers (aggregate)")
+    else:
+        _print_group(records, title=f"Timing summary ({len(records)} records)")
+
+
 def _cmd_reclaim_stale(args: argparse.Namespace) -> None:
     from .locking import reclaim_stale
     from .progress import is_archive_complete
@@ -266,6 +336,28 @@ def main(argv: list[str] | None = None) -> None:
     p_errors.add_argument("--group", action="store_true",
                           help="Group errors by type with record/archive counts")
 
+    # --- timings ---
+    p_timings = sub.add_parser("timings", help="Summarise per-archive inference timing distributions")
+    p_timings.add_argument("--output", required=True, help="EFS output base directory")
+    p_timings.add_argument("--fields", default=None,
+                           help="Comma-separated subset of timing fields to display")
+    p_timings.add_argument("--csv", action="store_true",
+                           help="Output as CSV instead of formatted table")
+    p_timings.add_argument("--min-audio-sec", type=float, default=None,
+                           help="Only include records with audio_duration_sec >= this value")
+    p_timings.add_argument("--max-audio-sec", type=float, default=None,
+                           help="Only include records with audio_duration_sec <= this value")
+    p_timings.add_argument("--by-worker", action="store_true",
+                           help="Print per-worker breakdown followed by aggregate")
+    p_timings.add_argument("--worker", default=None,
+                           help="Filter to a single worker_id (substring match)")
+    p_timings.add_argument("--split-by-vad-mode", action="store_true", default=True,
+                           dest="split_by_vad_mode",
+                           help="Split stats by VAD mode: prefetched/cached/inline (default)")
+    p_timings.add_argument("--no-split-by-vad-mode", action="store_false",
+                           dest="split_by_vad_mode",
+                           help="Disable VAD mode splitting")
+
     # --- reclaim-stale ---
     p_reclaim = sub.add_parser("reclaim-stale", help="Remove orphan lock files")
     p_reclaim.add_argument("--output", required=True)
@@ -279,6 +371,7 @@ def main(argv: list[str] | None = None) -> None:
         "run": _cmd_run,
         "progress": _cmd_progress,
         "errors": _cmd_errors,
+        "timings": _cmd_timings,
         "reclaim-stale": _cmd_reclaim_stale,
     }
     handlers[args.command](args)

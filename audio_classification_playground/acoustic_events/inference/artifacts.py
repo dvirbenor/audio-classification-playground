@@ -1,7 +1,7 @@
 """Prediction artifact storage for acoustic-event inference runs."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -36,6 +36,7 @@ class InferenceRunResult:
 
     artifacts: dict[str, PredictionArtifact]
     reused: dict[str, bool]
+    task_elapsed_sec: dict[str, float] = field(default_factory=dict)
 
 
 def utc_now_iso() -> str:

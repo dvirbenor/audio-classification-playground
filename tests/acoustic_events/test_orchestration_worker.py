@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from collections import Counter
@@ -7,6 +8,9 @@ from unittest.mock import patch
 
 import numpy as np
 
+from audio_classification_playground.acoustic_events.inference.artifacts import (
+    InferenceRunResult,
+)
 from audio_classification_playground.acoustic_events.inference.audio import AudioData
 from audio_classification_playground.acoustic_events.orchestration import worker
 from audio_classification_playground.acoustic_events.orchestration.manifest import (
@@ -15,6 +19,17 @@ from audio_classification_playground.acoustic_events.orchestration.manifest impo
 from audio_classification_playground.acoustic_events.orchestration.prefetch import (
     PrefetchResult,
 )
+
+_TASKS = ("vad", "affect", "disfluency", "emotion")
+
+
+def _fake_inference_result():
+    """Fresh InferenceRunResult with all keys the worker expects."""
+    return InferenceRunResult(
+        artifacts={},
+        reused={t: False for t in _TASKS},
+        task_elapsed_sec={t: 0.0 for t in _TASKS},
+    )
 
 
 class WorkerAsyncVadTest(unittest.TestCase):
@@ -30,6 +45,7 @@ class WorkerAsyncVadTest(unittest.TestCase):
 
         def fake_run_all(*args, **kwargs):
             run_kwargs.append(kwargs)
+            return _fake_inference_result()
 
         with _worker_patches(
             [entity],
@@ -94,6 +110,7 @@ class WorkerAsyncVadTest(unittest.TestCase):
 
         def fake_run_all(*args, **kwargs):
             run_calls.append(kwargs["vad_detector"](np.zeros(4, dtype=np.float32), 16000))
+            return _fake_inference_result()
 
         with _worker_patches(
             [entity],
@@ -157,6 +174,7 @@ class WorkerAsyncVadTest(unittest.TestCase):
 
         def fake_run_all(*args, **kwargs):
             vad_detectors.append(kwargs["vad_detector"])
+            return _fake_inference_result()
 
         with _worker_patches(
             [entity],
@@ -210,6 +228,7 @@ class WorkerAsyncVadTest(unittest.TestCase):
             calls.append(archive_id)
             if archive_id == "a0":
                 raise RuntimeError("boom")
+            return _fake_inference_result()
 
         with _worker_patches(
             entities,
@@ -237,6 +256,7 @@ class WorkerAsyncVadTest(unittest.TestCase):
 
         def fake_run_all(*args, **kwargs):
             vad_detectors.append(kwargs["vad_detector"])
+            return _fake_inference_result()
 
         with _worker_patches([entity], run_all_fn=fake_run_all):
             worker.run_worker(
@@ -249,6 +269,44 @@ class WorkerAsyncVadTest(unittest.TestCase):
             )
 
         self.assertEqual(vad_detectors, ["sync-vad"])
+
+    def test_timing_jsonl_written_after_inference(self):
+        entity = ArchiveEntity("s1", "a1", "prefix")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with _worker_patches([entity]):
+                worker.run_worker(
+                    parquet_path="manifest.parquet",
+                    output_base=tmpdir,
+                    affect_backbone="wavlm",
+                    disfluency_backbone="whisper",
+                    prefetch_lookahead=1,
+                    vad_prefetch_workers=1,
+                )
+
+            timings_dir = Path(tmpdir) / "_meta" / "timings"
+            jsonl_files = list(timings_dir.glob("*.jsonl"))
+            self.assertEqual(len(jsonl_files), 1)
+
+            with open(jsonl_files[0], encoding="utf-8") as f:
+                lines = [line.strip() for line in f if line.strip()]
+            self.assertEqual(len(lines), 1)
+
+            record = json.loads(lines[0])
+            self.assertEqual(record["session_id"], "s1")
+            self.assertEqual(record["archive_id"], "a1")
+            expected_fields = {
+                "worker_id", "session_id", "archive_id", "ts",
+                "audio_duration_sec", "prefetch_wait_sec",
+                "download_decode_sec", "vad_precompute_sec",
+                "precomputed_vad", "vad_reused", "affect_reused",
+                "disfluency_reused", "emotion_reused",
+                "vad_sec", "affect_sec", "disfluency_sec", "emotion_sec",
+                "inference_sec", "total_sec",
+            }
+            self.assertTrue(expected_fields <= set(record.keys()))
+            for f in ("vad_sec", "affect_sec", "disfluency_sec", "emotion_sec",
+                       "inference_sec", "total_sec"):
+                self.assertIsInstance(record[f], (int, float))
 
 
 class _FakePrefetcher:
@@ -298,7 +356,7 @@ def _worker_patches(
     try_claim_fn = try_claim_fn or (lambda output_base, entity: True)
     release_claim_fn = release_claim_fn or (lambda output_base, entity: None)
     task_complete_fn = task_complete_fn or (lambda *args, **kwargs: False)
-    run_all_fn = run_all_fn or (lambda *args, **kwargs: None)
+    run_all_fn = run_all_fn or (lambda *args, **kwargs: _fake_inference_result())
     handle_error_fn = handle_error_fn or (lambda *args, **kwargs: None)
     with ExitStack() as stack:
         stack.enter_context(

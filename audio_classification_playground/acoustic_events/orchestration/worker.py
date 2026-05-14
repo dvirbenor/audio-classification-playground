@@ -14,12 +14,16 @@ The worker:
 """
 from __future__ import annotations
 
+import json
 import logging
+import os
 import random
 import signal
 import threading
 import time
+import uuid
 from collections import deque
+from datetime import datetime, timezone
 from pathlib import Path
 
 from ..inference.artifacts import SAMPLE_RATE, inference_config_hash
@@ -64,6 +68,20 @@ DEFAULT_MAX_INFERENCE_ATTEMPTS = 3
 PREFETCH_LOOKAHEAD = 4
 PREFETCH_WORKERS = 4
 VAD_PREFETCH_WORKERS = 1
+TIMINGS_DIR = "_meta/timings"
+
+
+def _append_timing_record(jsonl_path: Path, record: dict) -> None:
+    """Append a single JSON line to the worker's timing file.
+
+    Catches ``OSError`` so a disk hiccup never kills the worker.
+    """
+    try:
+        jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(jsonl_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, default=str) + "\n")
+    except OSError:
+        LOGGER.warning("Failed to write timing record to %s", jsonl_path, exc_info=True)
 
 
 def build_expected_configs(
@@ -195,6 +213,8 @@ def run_worker(
     )
 
     output_base = Path(output_base)
+    worker_id = f"{os.environ.get('HOSTNAME', 'unknown')}_{uuid.uuid4().hex[:8]}"
+    timings_path = output_base / TIMINGS_DIR / f"{worker_id}.jsonl"
     shutdown_event = threading.Event()
 
     def _sigterm_handler(signum, frame):
@@ -394,7 +414,7 @@ def run_worker(
                 )
 
                 inference_started = time.perf_counter()
-                run_all_inference(
+                result = run_all_inference(
                     pf_result.audio,
                     out_dir=str(output_base),
                     affect_backbone=affect_backbone,
@@ -437,6 +457,28 @@ def run_worker(
                     total_sec,
                     pf_result.vad_intervals is not None,
                 )
+
+                _append_timing_record(timings_path, {
+                    "worker_id": worker_id,
+                    "session_id": sid,
+                    "archive_id": aid,
+                    "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "audio_duration_sec": pf_result.audio.duration_sec,
+                    "prefetch_wait_sec": prefetch_wait_sec,
+                    "download_decode_sec": pf_result.timings.download_decode_sec,
+                    "vad_precompute_sec": pf_result.timings.vad_sec,
+                    "precomputed_vad": pf_result.vad_intervals is not None,
+                    "vad_reused": result.reused.get("vad", False),
+                    "affect_reused": result.reused.get("affect", False),
+                    "disfluency_reused": result.reused.get("disfluency", False),
+                    "emotion_reused": result.reused.get("emotion", False),
+                    "vad_sec": result.task_elapsed_sec.get("vad", 0.0),
+                    "affect_sec": result.task_elapsed_sec.get("affect", 0.0),
+                    "disfluency_sec": result.task_elapsed_sec.get("disfluency", 0.0),
+                    "emotion_sec": result.task_elapsed_sec.get("emotion", 0.0),
+                    "inference_sec": inference_sec,
+                    "total_sec": total_sec,
+                })
 
                 _release(entity)
                 claim_released = True

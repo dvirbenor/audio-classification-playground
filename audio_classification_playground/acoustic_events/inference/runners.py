@@ -564,6 +564,7 @@ def run_all_inference(
             ),
         ),
     ]
+    task_elapsed_sec: dict[str, float] = {}
     for task, run_step in steps:
         if shutdown_check is not None and shutdown_check():
             raise ShutdownRequested(f"shutdown requested before task {task!r}")
@@ -583,17 +584,21 @@ def run_all_inference(
                 _cuda_task_stats(cuda_before),
             )
             raise
+        elapsed = time.perf_counter() - task_started
+        task_elapsed_sec[task] = elapsed
         LOGGER.info(
             "run-all task complete: task=%s reused=%s batch_size=%d elapsed=%.3fs cuda=%s",
             task,
             result.reused,
             batch_for_task,
-            time.perf_counter() - task_started,
+            elapsed,
             _cuda_task_stats(cuda_before),
         )
         artifacts[task] = result.artifact
         reused[task] = result.reused
-    return InferenceRunResult(artifacts=artifacts, reused=reused)
+    return InferenceRunResult(
+        artifacts=artifacts, reused=reused, task_elapsed_sec=task_elapsed_sec,
+    )
 
 
 def emotion2vec_scores_to_probabilities(

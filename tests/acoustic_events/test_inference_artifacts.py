@@ -158,6 +158,30 @@ class InferenceArtifactTest(unittest.TestCase):
             self.assertEqual(second.reused, {task: True for task in second.artifacts})
             self.assertEqual(len(cleanup_calls), 4)
 
+    def test_run_all_returns_task_elapsed_sec(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audio_path = _write_audio(Path(tmp) / "clip.wav")
+            result = run_all_inference(
+                audio_path,
+                out_dir=Path(tmp) / "artifacts",
+                affect_backbone="wavlm",
+                disfluency_backbone="whisper",
+                predictors={
+                    "affect": _fake_affect,
+                    "disfluency": _fake_disfluency,
+                    "emotion": _fake_emotion,
+                },
+                vad_detector=_fake_vad,
+                progress=_quiet,
+            )
+            self.assertEqual(
+                set(result.task_elapsed_sec),
+                {"vad", "affect", "disfluency", "emotion"},
+            )
+            for task, elapsed in result.task_elapsed_sec.items():
+                self.assertIsInstance(elapsed, float, f"{task} elapsed is not a float")
+                self.assertGreaterEqual(elapsed, 0.0, f"{task} elapsed is negative")
+
     def test_run_all_records_per_task_batch_sizes(self):
         with tempfile.TemporaryDirectory() as tmp:
             audio_path = _write_audio(Path(tmp) / "clip.wav")
