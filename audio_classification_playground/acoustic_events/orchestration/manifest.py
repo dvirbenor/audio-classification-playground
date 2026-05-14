@@ -14,7 +14,6 @@ from pathlib import Path
 LOGGER = logging.getLogger(__name__)
 
 _UNSAFE_ID_PATTERN = re.compile(r"[/\\\x00]")
-_DOUBLE_UNDERSCORE = "__"
 
 
 @dataclass(frozen=True)
@@ -32,10 +31,6 @@ def _validate_id(value: str, field: str) -> None:
     if _UNSAFE_ID_PATTERN.search(value):
         raise ValueError(
             f"{field} contains unsafe path characters: {value!r}"
-        )
-    if _DOUBLE_UNDERSCORE in value:
-        raise ValueError(
-            f"{field} contains double-underscore (reserved separator): {value!r}"
         )
 
 
