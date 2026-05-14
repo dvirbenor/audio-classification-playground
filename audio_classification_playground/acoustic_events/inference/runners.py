@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import gc
 import json
 from pathlib import Path
+import time
 from typing import Mapping, Sequence
 
 import numpy as np
@@ -554,7 +555,14 @@ def run_all_inference(
         if shutdown_check is not None and shutdown_check():
             raise ShutdownRequested(f"shutdown requested before task {task!r}")
         _progress(progress, f"run-all task: {task}")
+        task_started = time.perf_counter()
         result = run_step()
+        LOGGER.info(
+            "run-all task complete: task=%s reused=%s elapsed=%.3fs",
+            task,
+            result.reused,
+            time.perf_counter() - task_started,
+        )
         artifacts[task] = result.artifact
         reused[task] = result.reused
     return InferenceRunResult(artifacts=artifacts, reused=reused)

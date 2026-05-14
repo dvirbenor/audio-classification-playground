@@ -78,6 +78,28 @@ def is_archive_complete_for_config(
     return True
 
 
+def is_task_complete_for_config(
+    output_base: Path,
+    session_id: str,
+    archive_id: str,
+    task: str,
+    expected_config_hash: str,
+) -> bool:
+    """Return True when one task artifact exists and matches config."""
+    if task not in TASKS:
+        raise ValueError(f"Unknown task {task!r}; expected one of {TASKS}")
+    task_dir = output_base / session_id / archive_id / task
+    if not is_task_complete(task_dir):
+        return False
+    manifest_path = task_dir / MANIFEST_FILENAME
+    try:
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            manifest = json.load(f)
+        return manifest.get("inference_config_hash") == expected_config_hash
+    except (OSError, json.JSONDecodeError, KeyError):
+        return False
+
+
 def scan_progress(
     output_base: Path,
     entities: list,

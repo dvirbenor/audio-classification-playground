@@ -47,6 +47,7 @@ def _cmd_run(args: argparse.Namespace) -> None:
         max_inference_attempts=args.max_retries,
         prefetch_workers=args.prefetch_workers,
         prefetch_lookahead=args.prefetch_lookahead,
+        vad_prefetch_workers=args.vad_prefetch_workers,
         seed=args.seed,
     )
 
@@ -149,7 +150,8 @@ def main(argv: list[str] | None = None) -> None:
     p_run.add_argument("--device", default=None)
     p_run.add_argument("--max-retries", type=int, default=3)
     p_run.add_argument("--prefetch-workers", type=int, default=4)
-    p_run.add_argument("--prefetch-lookahead", type=int, default=8)
+    p_run.add_argument("--prefetch-lookahead", type=int, default=4)
+    p_run.add_argument("--vad-prefetch-workers", type=int, default=1)
     p_run.add_argument("--seed", type=int, default=None)
 
     # --- progress ---

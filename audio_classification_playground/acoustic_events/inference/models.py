@@ -15,8 +15,8 @@ Example::
         batch_size=512,
         device="cuda",
     )
-    # models.affect, models.disfluency, models.emotion, models.vad
-    # are persistent callables that match the runner predictor interfaces.
+    # models.affect, models.disfluency, models.emotion are persistent
+    # callables. models.vad is loaded lazily when requested.
 """
 from __future__ import annotations
 
@@ -217,7 +217,7 @@ class VadDetector:
 
 
 class ModelSuite:
-    """Convenience holder that loads all four models at construction time.
+    """Convenience holder for persistent inference models.
 
     Example::
 
@@ -230,7 +230,7 @@ class ModelSuite:
         # suite.affect   -> AffectPredictor
         # suite.disfluency -> DisfluencyPredictor
         # suite.emotion  -> EmotionPredictor
-        # suite.vad      -> VadDetector
+        # suite.vad      -> VadDetector (loaded lazily unless load_vad=True)
     """
 
     def __init__(
@@ -243,6 +243,7 @@ class ModelSuite:
         vad_threshold: float = DEFAULT_VAD_SPEECH_THRESHOLD,
         vad_min_speech_sec: float = DEFAULT_VAD_MIN_SPEECH_SEC,
         vad_min_silence_sec: float = DEFAULT_VAD_MIN_SILENCE_SEC,
+        load_vad: bool = True,
     ) -> None:
         self.affect = AffectPredictor(
             backbone=affect_backbone, device=device, batch_size=batch_size,
@@ -251,8 +252,18 @@ class ModelSuite:
             backbone=disfluency_backbone, device=device, batch_size=batch_size,
         )
         self.emotion = EmotionPredictor(batch_size=batch_size, device=device)
-        self.vad = VadDetector(
+        self._vad_config = dict(
             threshold=vad_threshold,
             min_speech_sec=vad_min_speech_sec,
             min_silence_sec=vad_min_silence_sec,
         )
+        self._vad: VadDetector | None = None
+        if load_vad:
+            self._vad = VadDetector(**self._vad_config)
+
+    @property
+    def vad(self) -> VadDetector:
+        """Lazily load the CPU VAD model when requested."""
+        if self._vad is None:
+            self._vad = VadDetector(**self._vad_config)
+        return self._vad

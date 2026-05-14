@@ -12,7 +12,10 @@ python -m audio_classification_playground.acoustic_events.orchestration run \
     --output  /efs/dvir/data/magic-clips-research/acoustic-understanding/models-inference \
     --affect-backbone wavlm \
     --disfluency-backbone whisper \
-    --batch-size 512
+    --batch-size 512 \
+    --prefetch-lookahead 4 \
+    --prefetch-workers 4 \
+    --vad-prefetch-workers 1
 
 # Check progress (from any machine with EFS access)
 python -m audio_classification_playground.acoustic_events.orchestration progress \
@@ -43,14 +46,15 @@ python -m audio_classification_playground.acoustic_events.orchestration reclaim-
 │                                                        │
 │  ┌─────────────┐   ┌──────────────────────────────┐   │
 │  │  Prefetcher  │   │        Main Loop              │   │
-│  │  (threads)   │──▶│  claim → get audio → infer   │   │
+│  │  (threads)   │──▶│  claim → prefetch → infer    │   │
 │  │  S3 download │   │  → write artifact → release  │   │
 │  │  + decode    │   └──────────────────────────────┘   │
+│  │  + CPU VAD   │                                      │
 │  └─────────────┘                                       │
 │                    ┌──────────────────────────────┐    │
 │                    │  GPU-Resident Models          │    │
 │                    │  affect / disfluency /        │    │
-│                    │  emotion / VAD                │    │
+│                    │  emotion                      │    │
 │                    └──────────────────────────────┘    │
 └────────────────────────────────────────────────────────┘
           │                         │
@@ -95,18 +99,21 @@ python -m audio_classification_playground.acoustic_events.orchestration reclaim-
    `(session_id, archive_id)`.
 2. **Pre-filtering**: Loads permanent audio errors and inference attempt
    counts to skip known-bad archives.
-3. **Model loading**: All four models are loaded into GPU memory once
-   (affect, disfluency, emotion on GPU; VAD on CPU).
+3. **Model loading**: Affect, disfluency, and emotion predictors are loaded
+   once. VAD is handled by background CPU workers by default.
 4. **Shuffled iteration**: Entities are shuffled (for balanced load across
    pods) and iterated.
-5. **Per-archive**: config-aware completion check → atomic lock claim →
-   authoritative retry count check → prefetch get → `run_all_inference` →
-   release lock.
+5. **Claimed prefetch**: config-aware completion check → atomic lock claim →
+   authoritative retry count check → submit download/decode/VAD prefetch.
+6. **Per-archive inference**: prefetch get → `run_all_inference` with
+   precomputed VAD intervals when available → release lock.
 
 ### Coordination
 
 - **Locks**: Atomic `O_CREAT | O_EXCL` files on EFS. Released on both
   success and failure. Stale locks reclaimed via the `reclaim-stale` CLI.
+  In async VAD mode, each pod may hold up to `--prefetch-lookahead` locks
+  while prefetch and inference overlap.
 - **Error logs**: Individual JSON files per error event — no `flock`,
   no contention.
 - **Progress**: Derived from the directory structure: if
@@ -137,6 +144,10 @@ arrives:
 **Important**: Set `terminationGracePeriodSeconds` in your K8s pod spec to
 exceed the maximum expected per-archive inference time (typically 30–120s).
 Stale-lock reclaim remains necessary for hard kills.
+
+Async VAD prefetch means hard-killed pods can leave up to
+`--prefetch-lookahead` stale locks, not just the currently inferred archive.
+Keep `--prefetch-lookahead` conservative unless stale reclaim runs frequently.
 
 ### Config-Aware Completion
 
@@ -185,6 +196,12 @@ spec:
     - whisper
     - --batch-size
     - "512"
+    - --prefetch-lookahead
+    - "4"
+    - --prefetch-workers
+    - "4"
+    - --vad-prefetch-workers
+    - "1"
     resources:
       limits:
         nvidia.com/gpu: 1
@@ -224,6 +241,23 @@ Simply launch N pods with the same arguments. Each pod:
 - Claims archives via atomic lock files
 - Skips already-complete or locked archives
 - Reports progress to the same shared EFS directory
+
+### Async VAD Prefetch
+
+`--vad-prefetch-workers` defaults to `1`, making CPU VAD the default
+prefetch path. Use `--vad-prefetch-workers 0` only as an emergency fallback
+to run VAD synchronously inside `run_all_inference`.
+
+Recommended starting settings:
+
+```bash
+--prefetch-lookahead 4 --prefetch-workers 4 --vad-prefetch-workers 1
+```
+
+Increase `--vad-prefetch-workers` to `2` only if timing logs show the GPU is
+waiting for VAD-ready prefetch results. Larger `--prefetch-lookahead` values
+increase both locks held per pod and decoded-audio memory in flight; long
+archives at 16 kHz float32 can make that memory noticeable.
 
 ### EFS Metadata Budget
 
