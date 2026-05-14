@@ -23,6 +23,7 @@ from .artifacts import (
     base_manifest,
     find_cached_artifact,
     inference_config_hash,
+    inference_configs_match,
     load_prediction_artifact,
     write_prediction_artifact,
 )
@@ -419,6 +420,9 @@ def run_all_inference(
     reuse_cache: bool = False,
     sample_rate: int = SAMPLE_RATE,
     batch_size: int = 128,
+    affect_batch_size: int | None = None,
+    disfluency_batch_size: int | None = None,
+    emotion_batch_size: int | None = None,
     device: str | None = None,
     vad_threshold: float = DEFAULT_VAD_SPEECH_THRESHOLD,
     vad_min_speech_sec: float = DEFAULT_VAD_MIN_SPEECH_SEC,
@@ -447,7 +451,10 @@ def run_all_inference(
     audio_source_key:
         Bare S3 key recorded in the manifest's ``audio.source_key`` field.
     batch_size:
-        Batch size passed to sub-runners and recorded in manifests.
+        Legacy default batch size for all sub-runners.
+    affect_batch_size, disfluency_batch_size, emotion_batch_size:
+        Optional per-task overrides. When provided, these win over
+        ``batch_size`` for the corresponding task.
     shutdown_check:
         Called between tasks.  If it returns ``True``, a
         :class:`ShutdownRequested` exception is raised so the orchestrator
@@ -469,6 +476,12 @@ def run_all_inference(
     and ``emotion``. This function writes inference artifacts only; it does
     not run producers or save review sessions.
     """
+    resolved_batches = resolve_task_batch_sizes(
+        batch_size=batch_size,
+        affect_batch_size=affect_batch_size,
+        disfluency_batch_size=disfluency_batch_size,
+        emotion_batch_size=emotion_batch_size,
+    )
     predictors = dict(predictors or {})
     if isinstance(audio_path, AudioData):
         audio = audio_path
@@ -507,7 +520,7 @@ def run_all_inference(
                 out_dir=out_dir,
                 backbone=affect_backbone,
                 reuse_cache=reuse_cache,
-                batch_size=batch_size,
+                batch_size=resolved_batches["affect"],
                 device=device,
                 predictor=predictors.get("affect"),
                 progress=progress,
@@ -524,7 +537,7 @@ def run_all_inference(
                 out_dir=out_dir,
                 backbone=disfluency_backbone,
                 reuse_cache=reuse_cache,
-                batch_size=batch_size,
+                batch_size=resolved_batches["disfluency"],
                 device=device,
                 predictor=predictors.get("disfluency"),
                 progress=progress,
@@ -540,7 +553,7 @@ def run_all_inference(
                 audio,
                 out_dir=out_dir,
                 reuse_cache=reuse_cache,
-                batch_size=batch_size,
+                batch_size=resolved_batches["emotion"],
                 device=device,
                 predictor=predictors.get("emotion"),
                 progress=progress,
@@ -556,12 +569,27 @@ def run_all_inference(
             raise ShutdownRequested(f"shutdown requested before task {task!r}")
         _progress(progress, f"run-all task: {task}")
         task_started = time.perf_counter()
-        result = run_step()
+        batch_for_task = resolved_batches.get(task, 0)
+        cuda_before = _cuda_memory_snapshot()
+        _reset_cuda_peak_memory_stats()
+        try:
+            result = run_step()
+        except Exception:
+            LOGGER.info(
+                "run-all task failed: task=%s batch_size=%d elapsed=%.3fs cuda=%s",
+                task,
+                batch_for_task,
+                time.perf_counter() - task_started,
+                _cuda_task_stats(cuda_before),
+            )
+            raise
         LOGGER.info(
-            "run-all task complete: task=%s reused=%s elapsed=%.3fs",
+            "run-all task complete: task=%s reused=%s batch_size=%d elapsed=%.3fs cuda=%s",
             task,
             result.reused,
+            batch_for_task,
             time.perf_counter() - task_started,
+            _cuda_task_stats(cuda_before),
         )
         artifacts[task] = result.artifact
         reused[task] = result.reused
@@ -604,6 +632,24 @@ def emotion2vec_scores_to_probabilities(
             f"observed min={observed.min():.6f}, max={observed.max():.6f}"
         )
     return probabilities.astype(np.float32), CANONICAL_CHANNELS
+
+
+def resolve_task_batch_sizes(
+    *,
+    batch_size: int,
+    affect_batch_size: int | None = None,
+    disfluency_batch_size: int | None = None,
+    emotion_batch_size: int | None = None,
+) -> dict[str, int]:
+    batches = {
+        "affect": int(batch_size if affect_batch_size is None else affect_batch_size),
+        "disfluency": int(batch_size if disfluency_batch_size is None else disfluency_batch_size),
+        "emotion": int(batch_size if emotion_batch_size is None else emotion_batch_size),
+    }
+    for task, value in batches.items():
+        if value <= 0:
+            raise ValueError(f"{task} batch size must be positive")
+    return batches
 
 
 def cleanup_torch_memory() -> None:
@@ -704,7 +750,12 @@ def _validate_explicit_artifact(
         return None
     if m.get("audio", {}).get("sha256") != audio.audio_sha256:
         return None
-    if m.get("inference_config_hash") != expected_hash:
+    if m.get("inference_config_hash") == expected_hash:
+        return artifact
+    manifest_config = m.get("inference_config")
+    if not isinstance(manifest_config, Mapping):
+        return None
+    if not inference_configs_match(manifest_config, config, ignore_batch_size=True):
         return None
     return artifact
 
@@ -814,6 +865,53 @@ def _runtime(*, device: str | None, batch_size: int) -> dict:
         "device": device or _default_device(),
         "batch_size": int(batch_size),
     }
+
+
+def _cuda_memory_snapshot() -> dict[str, float] | None:
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return None
+        torch.cuda.synchronize()
+        free, total = torch.cuda.mem_get_info()
+        return {
+            "allocated_gib": float(torch.cuda.memory_allocated()) / 2**30,
+            "reserved_gib": float(torch.cuda.memory_reserved()) / 2**30,
+            "free_gib": float(free) / 2**30,
+            "total_gib": float(total) / 2**30,
+        }
+    except Exception:
+        return None
+
+
+def _reset_cuda_peak_memory_stats() -> None:
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+    except Exception:
+        return
+
+
+def _cuda_task_stats(before: dict[str, float] | None) -> dict[str, object] | None:
+    after = _cuda_memory_snapshot()
+    if before is None and after is None:
+        return None
+    out: dict[str, object] = {
+        "before": before,
+        "after": after,
+    }
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            out["peak_allocated_gib"] = float(torch.cuda.max_memory_allocated()) / 2**30
+            out["peak_reserved_gib"] = float(torch.cuda.max_memory_reserved()) / 2**30
+    except Exception:
+        pass
+    return out
 
 
 def _default_device() -> str:

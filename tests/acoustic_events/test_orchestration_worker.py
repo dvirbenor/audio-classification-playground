@@ -18,6 +18,66 @@ from audio_classification_playground.acoustic_events.orchestration.prefetch impo
 
 
 class WorkerAsyncVadTest(unittest.TestCase):
+    def test_per_task_batch_sizes_are_passed_to_models_and_run_all(self):
+        entity = ArchiveEntity("s1", "a1", "prefix")
+        model_kwargs = []
+        run_kwargs = []
+
+        class FakeModels(_FakeModels):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                model_kwargs.append(kwargs)
+
+        def fake_run_all(*args, **kwargs):
+            run_kwargs.append(kwargs)
+
+        with _worker_patches(
+            [entity],
+            model_suite_cls=FakeModels,
+            run_all_fn=fake_run_all,
+        ):
+            worker.run_worker(
+                parquet_path="manifest.parquet",
+                output_base=tempfile.mkdtemp(),
+                affect_backbone="wavlm",
+                disfluency_backbone="whisper",
+                batch_size=512,
+                affect_batch_size=384,
+                emotion_batch_size=64,
+                prefetch_lookahead=1,
+                vad_prefetch_workers=1,
+            )
+
+        self.assertEqual(model_kwargs[0]["affect_batch_size"], 384)
+        self.assertEqual(model_kwargs[0]["disfluency_batch_size"], 512)
+        self.assertEqual(model_kwargs[0]["emotion_batch_size"], 64)
+        self.assertEqual(run_kwargs[0]["affect_batch_size"], 384)
+        self.assertEqual(run_kwargs[0]["disfluency_batch_size"], 512)
+        self.assertEqual(run_kwargs[0]["emotion_batch_size"], 64)
+
+    def test_orchestration_emotion_batch_defaults_to_64(self):
+        entity = ArchiveEntity("s1", "a1", "prefix")
+        model_kwargs = []
+
+        class FakeModels(_FakeModels):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                model_kwargs.append(kwargs)
+
+        with _worker_patches([entity], model_suite_cls=FakeModels):
+            worker.run_worker(
+                parquet_path="manifest.parquet",
+                output_base=tempfile.mkdtemp(),
+                affect_backbone="wavlm",
+                disfluency_backbone="whisper",
+                prefetch_lookahead=1,
+                vad_prefetch_workers=1,
+            )
+
+        self.assertEqual(model_kwargs[0]["affect_batch_size"], 512)
+        self.assertEqual(model_kwargs[0]["disfluency_batch_size"], 512)
+        self.assertEqual(model_kwargs[0]["emotion_batch_size"], 64)
+
     def test_claim_happens_before_prefetch_and_intervals_are_passed(self):
         entity = ArchiveEntity("s1", "a1", "prefix")
         events = []
@@ -227,6 +287,7 @@ class _FakeModels:
 def _worker_patches(
     entities,
     *,
+    model_suite_cls=_FakeModels,
     prefetcher_cls=_FakePrefetcher,
     try_claim_fn=None,
     release_claim_fn=None,
@@ -243,7 +304,7 @@ def _worker_patches(
         stack.enter_context(
             patch(
                 "audio_classification_playground.acoustic_events.inference.models.ModelSuite",
-                _FakeModels,
+                model_suite_cls,
             )
         )
         stack.enter_context(

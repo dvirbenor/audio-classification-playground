@@ -16,7 +16,11 @@ import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from ..inference.artifacts import MANIFEST_FILENAME, PREDICTIONS_FILENAME
+from ..inference.artifacts import (
+    MANIFEST_FILENAME,
+    PREDICTIONS_FILENAME,
+    inference_configs_match,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -54,6 +58,8 @@ def is_archive_complete_for_config(
     session_id: str,
     archive_id: str,
     expected_config_hashes: dict[str, str],
+    expected_configs: dict[str, dict] | None = None,
+    ignore_batch_size: bool = False,
 ) -> bool:
     """Config-aware completion check.
 
@@ -71,7 +77,22 @@ def is_archive_complete_for_config(
             with open(manifest_path, "r", encoding="utf-8") as f:
                 manifest = json.load(f)
             expected = expected_config_hashes.get(task)
-            if expected is not None and manifest.get("inference_config_hash") != expected:
+            if expected is not None and manifest.get("inference_config_hash") == expected:
+                continue
+            if ignore_batch_size and expected_configs is not None:
+                observed_config = manifest.get("inference_config")
+                expected_config = expected_configs.get(task)
+                if (
+                    isinstance(observed_config, dict)
+                    and expected_config is not None
+                    and inference_configs_match(
+                        observed_config,
+                        expected_config,
+                        ignore_batch_size=True,
+                    )
+                ):
+                    continue
+            if expected is not None:
                 return False
         except (OSError, json.JSONDecodeError, KeyError):
             return False
@@ -84,6 +105,8 @@ def is_task_complete_for_config(
     archive_id: str,
     task: str,
     expected_config_hash: str,
+    expected_config: dict | None = None,
+    ignore_batch_size: bool = False,
 ) -> bool:
     """Return True when one task artifact exists and matches config."""
     if task not in TASKS:
@@ -95,7 +118,19 @@ def is_task_complete_for_config(
     try:
         with open(manifest_path, "r", encoding="utf-8") as f:
             manifest = json.load(f)
-        return manifest.get("inference_config_hash") == expected_config_hash
+        if manifest.get("inference_config_hash") == expected_config_hash:
+            return True
+        observed_config = manifest.get("inference_config")
+        return (
+            ignore_batch_size
+            and isinstance(observed_config, dict)
+            and expected_config is not None
+            and inference_configs_match(
+                observed_config,
+                expected_config,
+                ignore_batch_size=True,
+            )
+        )
     except (OSError, json.JSONDecodeError, KeyError):
         return False
 

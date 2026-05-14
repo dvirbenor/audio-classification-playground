@@ -37,8 +37,10 @@ from .artifacts import (
     PredictionArtifact,
     decoded_audio_sha256,
     inference_config_hash,
+    inference_configs_match,
     list_cached_artifacts,
     load_prediction_artifact,
+    semantic_inference_config,
 )
 from .audio import AudioData
 from .models import (
@@ -55,6 +57,7 @@ from .runners import (
     DEFAULT_VAD_SPEECH_THRESHOLD,
     ShutdownRequested,
     compute_inference_config,
+    resolve_task_batch_sizes,
     run_affect_inference,
     run_all_inference,
     run_disfluency_inference,
@@ -83,8 +86,11 @@ __all__ = [
     "compute_inference_config",
     "decoded_audio_sha256",
     "inference_config_hash",
+    "inference_configs_match",
     "list_cached_artifacts",
     "load_prediction_artifact",
+    "resolve_task_batch_sizes",
+    "semantic_inference_config",
     "run_affect_inference",
     "run_all_inference",
     "run_disfluency_inference",

@@ -37,6 +37,10 @@ def main(argv: list[str] | None = None) -> int:
             disfluency_backbone=args.disfluency_backbone,
             recording_id=args.recording_id,
             reuse_cache=args.reuse_cache,
+            batch_size=128 if args.batch_size is None else args.batch_size,
+            affect_batch_size=args.affect_batch_size,
+            disfluency_batch_size=args.disfluency_batch_size,
+            emotion_batch_size=args.emotion_batch_size,
             device=args.device,
             vad_threshold=args.vad_threshold,
             vad_min_speech_sec=args.vad_min_speech_sec,
@@ -86,6 +90,9 @@ def build_parser() -> argparse.ArgumentParser:
     run_all.add_argument("--audio", required=True)
     run_all.add_argument("--affect-backbone", choices=("wavlm", "whisper"), required=True)
     run_all.add_argument("--disfluency-backbone", choices=("wavlm", "whisper"), required=True)
+    run_all.add_argument("--affect-batch-size", type=int)
+    run_all.add_argument("--disfluency-batch-size", type=int)
+    run_all.add_argument("--emotion-batch-size", type=int)
     _add_vad_options(run_all)
 
     cached = sub.add_parser("list-cached", help="List complete cached artifacts.")
@@ -106,6 +113,7 @@ def _add_common_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--out", required=True, help="Artifact output root.")
     parser.add_argument("--recording-id")
     parser.add_argument("--reuse-cache", action="store_true")
+    parser.add_argument("--batch-size", type=int)
     parser.add_argument("--device")
     parser.add_argument("--verbose", action="store_true")
 
@@ -139,12 +147,19 @@ def _run_single(args, progress):
         "device": args.device,
         "progress": progress,
     }
+    batch_kwargs = {}
+    if args.batch_size is not None:
+        batch_kwargs["batch_size"] = args.batch_size
     if args.task == "affect":
-        return run_affect_inference(args.audio, backbone=args.backbone, **common)
+        return run_affect_inference(
+            args.audio, backbone=args.backbone, **common, **batch_kwargs,
+        )
     if args.task == "disfluency":
-        return run_disfluency_inference(args.audio, backbone=args.backbone, **common)
+        return run_disfluency_inference(
+            args.audio, backbone=args.backbone, **common, **batch_kwargs,
+        )
     if args.task == "emotion":
-        return run_emotion_inference(args.audio, **common)
+        return run_emotion_inference(args.audio, **common, **batch_kwargs)
     if args.task == "vad":
         return run_vad(
             args.audio,

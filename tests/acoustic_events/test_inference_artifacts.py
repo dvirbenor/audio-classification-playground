@@ -12,6 +12,7 @@ from audio_classification_playground.acoustic_events.inference import (
     artifact_to_vad,
     decoded_audio_sha256,
     inference_config_hash,
+    resolve_task_batch_sizes,
     list_cached_artifacts,
     load_prediction_artifact,
     run_affect_inference,
@@ -51,6 +52,19 @@ EMOTION2VEC_LABELS = [
 
 
 class InferenceArtifactTest(unittest.TestCase):
+    def test_task_batch_resolution_prefers_per_task_values(self):
+        self.assertEqual(
+            resolve_task_batch_sizes(
+                batch_size=512,
+                affect_batch_size=None,
+                disfluency_batch_size=384,
+                emotion_batch_size=64,
+            ),
+            {"affect": 512, "disfluency": 384, "emotion": 64},
+        )
+        with self.assertRaisesRegex(ValueError, "emotion batch size"):
+            resolve_task_batch_sizes(batch_size=512, emotion_batch_size=0)
+
     def test_decoded_audio_hash_and_config_hash_are_stable_and_sensitive(self):
         audio = np.asarray([0.0, 0.5, -0.25], dtype=np.float32)
         self.assertEqual(decoded_audio_sha256(audio), decoded_audio_sha256(audio.copy()))
@@ -143,6 +157,128 @@ class InferenceArtifactTest(unittest.TestCase):
             self.assertEqual(first.reused, {task: False for task in first.artifacts})
             self.assertEqual(second.reused, {task: True for task in second.artifacts})
             self.assertEqual(len(cleanup_calls), 4)
+
+    def test_run_all_records_per_task_batch_sizes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audio_path = _write_audio(Path(tmp) / "clip.wav")
+            result = run_all_inference(
+                audio_path,
+                out_dir=Path(tmp) / "artifacts",
+                affect_backbone="wavlm",
+                disfluency_backbone="wavlm",
+                batch_size=512,
+                affect_batch_size=256,
+                emotion_batch_size=64,
+                predictors={
+                    "affect": _fake_affect,
+                    "disfluency": _fake_disfluency,
+                    "emotion": _fake_emotion,
+                },
+                vad_detector=_fake_vad,
+                progress=_quiet,
+            )
+
+            self.assertEqual(
+                result.artifacts["affect"].manifest["inference_config"]["batch_size"],
+                256,
+            )
+            self.assertEqual(
+                result.artifacts["disfluency"].manifest["inference_config"]["batch_size"],
+                512,
+            )
+            self.assertEqual(
+                result.artifacts["emotion"].manifest["inference_config"]["batch_size"],
+                64,
+            )
+
+    def test_flat_artifact_reuse_ignores_batch_size_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audio_path = _write_audio(Path(tmp) / "clip.wav")
+            out_dir = Path(tmp) / "artifacts"
+            flat = out_dir / "session" / "archive"
+            calls = {"affect": 0, "disfluency": 0, "emotion": 0, "vad": 0}
+
+            def artifact_path(task):
+                return flat / task
+
+            def affect(windows):
+                calls["affect"] += 1
+                return _fake_affect(windows)
+
+            def disfluency(windows):
+                calls["disfluency"] += 1
+                return _fake_disfluency(windows)
+
+            def emotion(windows):
+                calls["emotion"] += 1
+                return _fake_emotion(windows)
+
+            def vad(samples, sample_rate):
+                calls["vad"] += 1
+                return _fake_vad(samples, sample_rate)
+
+            first = run_all_inference(
+                audio_path,
+                out_dir=out_dir,
+                affect_backbone="wavlm",
+                disfluency_backbone="wavlm",
+                batch_size=512,
+                emotion_batch_size=64,
+                predictors={"affect": affect, "disfluency": disfluency, "emotion": emotion},
+                vad_detector=vad,
+                artifact_path_fn=artifact_path,
+                progress=_quiet,
+            )
+            second = run_all_inference(
+                audio_path,
+                out_dir=out_dir,
+                affect_backbone="wavlm",
+                disfluency_backbone="wavlm",
+                reuse_cache=True,
+                batch_size=384,
+                emotion_batch_size=128,
+                predictors={"affect": affect, "disfluency": disfluency, "emotion": emotion},
+                vad_detector=vad,
+                artifact_path_fn=artifact_path,
+                progress=_quiet,
+            )
+
+            self.assertEqual(first.reused, {task: False for task in first.artifacts})
+            self.assertEqual(second.reused, {task: True for task in second.artifacts})
+            self.assertEqual(calls, {"affect": 1, "disfluency": 1, "emotion": 1, "vad": 1})
+
+    def test_flat_artifact_reuse_rejects_semantic_mismatch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audio_path = _write_audio(Path(tmp) / "clip.wav")
+            out_dir = Path(tmp) / "artifacts"
+            artifact_path = out_dir / "session" / "archive" / "affect"
+            calls = []
+
+            def predictor(windows):
+                calls.append("predict")
+                return _fake_affect(windows)
+
+            first = run_affect_inference(
+                audio_path,
+                out_dir=out_dir,
+                backbone="wavlm",
+                predictor=predictor,
+                artifact_path=artifact_path,
+                progress=_quiet,
+            )
+            second = run_affect_inference(
+                audio_path,
+                out_dir=out_dir,
+                backbone="whisper",
+                predictor=predictor,
+                reuse_cache=True,
+                artifact_path=artifact_path,
+                progress=_quiet,
+            )
+
+            self.assertFalse(first.reused)
+            self.assertFalse(second.reused)
+            self.assertEqual(calls, ["predict", "predict"])
 
     def test_vad_manifest_defaults_match_vox_profile_notebook(self):
         with tempfile.TemporaryDirectory() as tmp:

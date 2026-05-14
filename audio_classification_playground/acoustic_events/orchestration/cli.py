@@ -43,6 +43,9 @@ def _cmd_run(args: argparse.Namespace) -> None:
         affect_backbone=args.affect_backbone,
         disfluency_backbone=args.disfluency_backbone,
         batch_size=args.batch_size,
+        affect_batch_size=args.affect_batch_size,
+        disfluency_batch_size=args.disfluency_batch_size,
+        emotion_batch_size=args.emotion_batch_size,
         device=args.device,
         max_inference_attempts=args.max_retries,
         prefetch_workers=args.prefetch_workers,
@@ -147,6 +150,9 @@ def main(argv: list[str] | None = None) -> None:
     p_run.add_argument("--affect-backbone", required=True, choices=["wavlm", "whisper"])
     p_run.add_argument("--disfluency-backbone", required=True, choices=["wavlm", "whisper"])
     p_run.add_argument("--batch-size", type=int, default=512)
+    p_run.add_argument("--affect-batch-size", type=int, default=None)
+    p_run.add_argument("--disfluency-batch-size", type=int, default=None)
+    p_run.add_argument("--emotion-batch-size", type=int, default=None)
     p_run.add_argument("--device", default=None)
     p_run.add_argument("--max-retries", type=int, default=3)
     p_run.add_argument("--prefetch-workers", type=int, default=4)
