@@ -26,6 +26,7 @@ from typing import Sequence
 import numpy as np
 
 from .artifacts import SAMPLE_RATE
+from .emotion2vec import predict_emotion2vec_scores
 from .log import get_logger
 from .runners import (
     DEFAULT_AFFECT_MODELS,
@@ -141,32 +142,32 @@ class EmotionPredictor:
         model_id: str = DEFAULT_EMOTION_MODEL,
         sample_rate: int = SAMPLE_RATE,
         batch_size: int = 512,
+        device: str | None = None,
     ) -> None:
         from funasr import AutoModel
 
         self.model_id = model_id
         self.sample_rate = sample_rate
         self.batch_size = batch_size
-        self._model = AutoModel(model=model_id)
+        self._device = device
+        auto_kwargs = {
+            "model": model_id,
+            "batch_size": batch_size,
+            "disable_update": True,
+            "disable_pbar": True,
+        }
+        if device is not None:
+            auto_kwargs["device"] = device
+        self._model = AutoModel(**auto_kwargs)
         LOGGER.info("EmotionPredictor loaded: %s", model_id)
 
     def __call__(self, windows: np.ndarray) -> tuple[np.ndarray, Sequence[str]]:
-        all_scores: list = []
-        labels: list[str] | None = None
-        for batch_np in _batches(windows, self.batch_size, "emotion"):
-            batch = [np.ascontiguousarray(batch_np[i]) for i in range(len(batch_np))]
-            results = self._model.generate(
-                input=batch,
-                fs=self.sample_rate,
-                granularity="utterance",
-                extract_embedding=False,
-            )
-            if labels is None:
-                labels = list(results[0]["labels"])
-            all_scores.extend(result["scores"] for result in results)
-        if labels is None:
-            raise ValueError("emotion2vec produced no results")
-        return np.asarray(all_scores, dtype=np.float32), labels
+        return predict_emotion2vec_scores(
+            self._model,
+            windows,
+            sample_rate=self.sample_rate,
+            batch_size=self.batch_size,
+        )
 
 
 class VadDetector:
@@ -249,7 +250,7 @@ class ModelSuite:
         self.disfluency = DisfluencyPredictor(
             backbone=disfluency_backbone, device=device, batch_size=batch_size,
         )
-        self.emotion = EmotionPredictor(batch_size=batch_size)
+        self.emotion = EmotionPredictor(batch_size=batch_size, device=device)
         self.vad = VadDetector(
             threshold=vad_threshold,
             min_speech_sec=vad_min_speech_sec,
