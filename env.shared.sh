@@ -8,9 +8,9 @@
 #   CACHE_ROOT=/efs/dvir/data/.shared-model-cache
 #   mkdir -p "$CACHE_ROOT"
 #   cp -a /workspace/.persistent/.cache/huggingface "$CACHE_ROOT/huggingface"
-#   cp -a /workspace/.cache/modelscope              "$CACHE_ROOT/modelscope"
+#   cp -a /workspace/.cache/modelscope/hub           "$CACHE_ROOT/modelscope/hub"
 #   cp -a /workspace/.cache/torch                   "$CACHE_ROOT/torch"
 
 export HF_HOME=/efs/dvir/data/.shared-model-cache/huggingface
-export MODELSCOPE_CACHE=/efs/dvir/data/.shared-model-cache/modelscope
+export MODELSCOPE_CACHE=/efs/dvir/data/.shared-model-cache/modelscope/hub
 export TORCH_HOME=/efs/dvir/data/.shared-model-cache/torch
