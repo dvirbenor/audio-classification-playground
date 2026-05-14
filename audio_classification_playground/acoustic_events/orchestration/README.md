@@ -57,6 +57,10 @@ python -m audio_classification_playground.acoustic_events.orchestration timings 
     --output /efs/dvir/data/magic-clips-research/acoustic-understanding/models-inference \
     --by-worker
 
+# Fleet heartbeat — per-worker lock/pace dashboard (no parquet needed)
+python -m audio_classification_playground.acoustic_events.orchestration status \
+    --output /efs/dvir/data/magic-clips-research/acoustic-understanding/models-inference
+
 # Reclaim stale locks from crashed pods
 python -m audio_classification_playground.acoustic_events.orchestration reclaim-stale \
     --output /efs/dvir/data/magic-clips-research/acoustic-understanding/models-inference \
@@ -360,6 +364,60 @@ call (includes inter-task overhead).  Per-task `*_sec` fields come from
 no locks). The CLI globs all files at analysis time. `worker_id` is
 embedded in every record, so analysis is correct even if files are
 concatenated or moved.
+
+### Fleet heartbeat (`status`)
+
+A compact, at-a-glance dashboard showing which pods are alive, how many
+archives each has completed, and the current processing pace.  No parquet
+or manifest required — reads only `_meta/` on EFS.
+
+```bash
+python -m audio_classification_playground.acoustic_events.orchestration status \
+    --output /efs/.../models-inference
+```
+
+Sample output:
+
+```
+Fleet heartbeat                              2026-05-15 02:45:12 UTC
+================================================================
+
+Worker                  Locks  Done  Last activity  Pace (arc/h)
+----------------------  -----  ----  -------------  ------------
+pod-gpu-abc123_3f8a         4   312  12s ago              ~48.2
+pod-gpu-def456_a1b2         4   287  3s ago               ~45.7
+pod-gpu-ghi789_c9d0         3   301  47s ago              ~47.0
+----------------------  -----  ----  -------------  ------------
+Fleet (3 workers)          11   900                      ~140.9
+
+Completed: 14,203  |  Partial: 42  |  Errors: 7 audio, 2 inference
+```
+
+| Column | Source | What it tells you |
+|---|---|---|
+| Locks | `_meta/locks/*.lock` ownership | Is the pod alive? (0 = dead or finished) |
+| Done | `_meta/timings/<worker_id>.jsonl` line count | Is it making progress? |
+| Last activity | Latest lock claim time or timing record timestamp | Is it stuck? (>5 min = suspicious) |
+| Pace | Mean `total_sec` of last N records, extrapolated to archives/hour | How fast is it going? |
+
+**Flags:**
+
+| Flag | Description |
+|---|---|
+| `--tail N` | Number of recent timing records per worker for pace calculation (default: 20) |
+
+For continuous monitoring, wrap with `watch`:
+
+```bash
+watch -n 15 python -m audio_classification_playground.acoustic_events.orchestration status \
+    --output /efs/.../models-inference
+```
+
+Or create a shell alias for quick access:
+
+```bash
+alias hb='python -m audio_classification_playground.acoustic_events.orchestration status --output /efs/.../models-inference'
+```
 
 ## Glacier Restore
 

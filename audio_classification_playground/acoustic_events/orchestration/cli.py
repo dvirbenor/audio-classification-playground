@@ -6,6 +6,7 @@ Subcommands:
     progress        Print a summary of the current pipeline state.
     errors          List audio or inference errors.
     timings         Summarise per-archive inference timing distributions.
+    status          Fleet heartbeat — per-worker lock/pace dashboard.
     reclaim-stale   Remove orphan lock files from crashed pods.
 
 Example::
@@ -281,6 +282,23 @@ def _cmd_timings(args: argparse.Namespace) -> None:
         _print_group(records, title=f"Timing summary ({len(records)} records)")
 
 
+def _cmd_status(args: argparse.Namespace) -> None:
+    from .heartbeat import (
+        build_fleet_heartbeat,
+        format_heartbeat,
+        load_recent_timings,
+        parse_active_locks,
+    )
+    from .progress import quick_disk_summary
+
+    output_base = Path(args.output)
+    locks = parse_active_locks(output_base)
+    timings = load_recent_timings(output_base, tail=args.tail)
+    heartbeat = build_fleet_heartbeat(locks, timings)
+    disk = quick_disk_summary(output_base)
+    print(format_heartbeat(heartbeat, disk_summary=disk))
+
+
 def _cmd_reclaim_stale(args: argparse.Namespace) -> None:
     from .locking import reclaim_stale
     from .progress import is_archive_complete
@@ -358,6 +376,14 @@ def main(argv: list[str] | None = None) -> None:
                            dest="split_by_vad_mode",
                            help="Disable VAD mode splitting")
 
+    # --- status ---
+    p_status = sub.add_parser(
+        "status", help="Fleet heartbeat \u2014 per-worker lock/pace dashboard",
+    )
+    p_status.add_argument("--output", required=True, help="EFS output base directory")
+    p_status.add_argument("--tail", type=int, default=20,
+                          help="Recent timing records per worker for pace calculation")
+
     # --- reclaim-stale ---
     p_reclaim = sub.add_parser("reclaim-stale", help="Remove orphan lock files")
     p_reclaim.add_argument("--output", required=True)
@@ -372,6 +398,7 @@ def main(argv: list[str] | None = None) -> None:
         "progress": _cmd_progress,
         "errors": _cmd_errors,
         "timings": _cmd_timings,
+        "status": _cmd_status,
         "reclaim-stale": _cmd_reclaim_stale,
     }
     handlers[args.command](args)
