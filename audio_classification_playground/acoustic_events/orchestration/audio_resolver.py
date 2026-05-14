@@ -7,9 +7,9 @@ Resolution rules:
   3. Fall back to ``*.mp3`` files.
   4. If multiple candidates exist in a tier, pick the lexicographically
      first key for determinism.
-  5. If no candidate is found, return ``no_matching_file``.
+  5. If no candidate is found, return ``no_matching_file`` (permanent).
   6. If the chosen object is in Glacier / Deep Archive, return
-     ``glacier_storage_class``.
+     ``glacier_storage_class`` (transient -- retried on next encounter).
   7. Transient download failures are retried with exponential backoff.
 """
 from __future__ import annotations
@@ -39,10 +39,11 @@ class AudioResolutionError:
     file_parent_dir: str
     error_type: str  # "no_matching_file" | "glacier_storage_class" | "download_failed"
     detail: str = ""
+    s3_key: str = ""
 
     @property
     def is_permanent(self) -> bool:
-        return self.error_type in ("no_matching_file", "glacier_storage_class")
+        return self.error_type == "no_matching_file"
 
 
 def _get_s3_client():
@@ -98,7 +99,7 @@ def download_audio(
     """Download a single S3 object, retrying transient failures.
 
     Returns the local temp path on success, or an ``AudioResolutionError``
-    on permanent failure.
+    on resolution failure (Glacier storage class, exhausted retries, etc.).
     """
     try:
         head = s3_client.head_object(Bucket=bucket, Key=key)
@@ -111,6 +112,7 @@ def download_audio(
                 file_parent_dir="",
                 error_type="glacier_storage_class",
                 detail=f"s3://{bucket}/{key} is in {storage_class}",
+                s3_key=key,
             )
     except Exception as exc:
         LOGGER.warning("head_object failed for %s: %s", key, exc)
@@ -142,6 +144,7 @@ def download_audio(
         file_parent_dir="",
         error_type="download_failed",
         detail=f"s3://{bucket}/{key}: {last_exc}",
+        s3_key=key,
     )
 
 
@@ -169,6 +172,7 @@ def resolve_and_download(
             file_parent_dir=file_parent_dir,
             error_type=result.error_type,
             detail=result.detail,
+            s3_key=result.s3_key,
         )
 
     chosen_key = result
@@ -180,6 +184,7 @@ def resolve_and_download(
             file_parent_dir=file_parent_dir,
             error_type=dl_result.error_type,
             detail=dl_result.detail,
+            s3_key=dl_result.s3_key,
         )
 
     return dl_result, chosen_key

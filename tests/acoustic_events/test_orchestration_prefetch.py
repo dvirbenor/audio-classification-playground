@@ -158,5 +158,98 @@ def _patched_audio(tmp_dir: str):
     )
 
 
+# ===========================================================================
+# AudioResolutionError classification and s3_key propagation
+# ===========================================================================
+
+
+class AudioResolutionErrorClassificationTest(unittest.TestCase):
+
+    def test_no_matching_file_is_permanent(self):
+        err = AudioResolutionError("s1", "a1", "pfx", "no_matching_file")
+        self.assertTrue(err.is_permanent)
+
+    def test_glacier_storage_class_is_transient(self):
+        err = AudioResolutionError("s1", "a1", "pfx", "glacier_storage_class")
+        self.assertFalse(err.is_permanent)
+
+    def test_download_failed_is_transient(self):
+        err = AudioResolutionError("s1", "a1", "pfx", "download_failed")
+        self.assertFalse(err.is_permanent)
+
+    def test_s3_key_defaults_to_empty(self):
+        err = AudioResolutionError("s1", "a1", "pfx", "no_matching_file")
+        self.assertEqual(err.s3_key, "")
+
+    def test_s3_key_is_preserved(self):
+        err = AudioResolutionError(
+            "s1", "a1", "pfx", "glacier_storage_class",
+            detail="...", s3_key="path/to/file.wav",
+        )
+        self.assertEqual(err.s3_key, "path/to/file.wav")
+
+
+class PrefetchS3KeyPropagationTest(unittest.TestCase):
+    """Verify s3_key is propagated through prefetch error paths."""
+
+    def test_discard_before_decode_includes_s3_key(self):
+        entity = ArchiveEntity("s1", "a1", "prefix")
+        s3_key_value = "accounts/studio/takes/file.wav"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_root = Path(tmp)
+            audio_path = tmp_root / "a1.wav"
+            audio_path.write_bytes(b"fake")
+
+            def fake_resolve(**kwargs):
+                return audio_path, s3_key_value
+
+            with patch(
+                "audio_classification_playground.acoustic_events.orchestration"
+                ".prefetch.resolve_and_download",
+                side_effect=fake_resolve,
+            ):
+                pf = Prefetcher(max_workers=1, vad_workers=0)
+                try:
+                    pf.discard(entity)
+                    result = pf.get(entity)
+                    self.assertIsInstance(result, AudioResolutionError)
+                    self.assertEqual(result.s3_key, s3_key_value)
+                    self.assertEqual(result.error_type, "download_failed")
+                finally:
+                    pf.shutdown()
+
+    def test_decode_failure_includes_s3_key(self):
+        entity = ArchiveEntity("s1", "a1", "prefix")
+        s3_key_value = "accounts/studio/takes/file.wav"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_root = Path(tmp)
+            audio_path = tmp_root / "a1.wav"
+            audio_path.write_bytes(b"fake")
+
+            def fake_resolve(**kwargs):
+                return audio_path, s3_key_value
+
+            def fake_load_audio(path, *, sample_rate, recording_id):
+                raise RuntimeError("corrupt audio")
+
+            with patch.multiple(
+                "audio_classification_playground.acoustic_events.orchestration.prefetch",
+                resolve_and_download=fake_resolve,
+                load_audio=fake_load_audio,
+            ):
+                pf = Prefetcher(max_workers=1, vad_workers=0)
+                try:
+                    pf.submit(entity, precompute_vad=False)
+                    result = pf.get(entity)
+                    self.assertIsInstance(result, AudioResolutionError)
+                    self.assertEqual(result.s3_key, s3_key_value)
+                    self.assertEqual(result.error_type, "download_failed")
+                    self.assertIn("corrupt audio", result.detail)
+                finally:
+                    pf.shutdown()
+
+
 if __name__ == "__main__":
     unittest.main()

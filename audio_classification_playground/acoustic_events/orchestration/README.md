@@ -138,7 +138,7 @@ python -m audio_classification_playground.acoustic_events.orchestration reclaim-
 | Error type | Category | Behaviour |
 |---|---|---|
 | `no_matching_file` | Audio, permanent | Skipped forever |
-| `glacier_storage_class` | Audio, permanent | Skipped forever |
+| `glacier_storage_class` | Audio, transient | Retried on next encounter (see [Glacier Restore](#glacier-restore)) |
 | `download_failed` | Audio, transient | Retried on next encounter |
 | Inference exception | Inference | Retried up to `--max-retries` (default 3) |
 | Deterministic error (e.g. corrupt file) | Inference | Marked permanent on first hit |
@@ -260,7 +260,7 @@ Audio errors by type:
 
   no_matching_file             12 records,   10 archives (permanent)
     e.g. abc123/def456 — No audio file found in ...
-  glacier_storage_class          3 records,    3 archives (permanent)
+  glacier_storage_class          3 records,    3 archives (transient)
     e.g. xyz789/ghi012 — Object is in GLACIER...
   download_failed                2 records,    2 archives (transient)
     e.g. ...
@@ -273,6 +273,70 @@ Use `--kind inference` for inference errors (no permanent/transient label,
 since retries are the meaningful signal there).
 
 The original flat listing (`--summary` without `--group`) remains available.
+
+## Glacier Restore
+
+Archives stored in `GLACIER` or `DEEP_ARCHIVE` produce transient
+`glacier_storage_class` audio errors.  Each error JSON includes a
+structured `s3_key` field with the resolved S3 key, making it directly
+consumable by restore tooling.
+
+Workers retry Glacier archives on every pass (no retry budget for audio
+errors).  Once the S3 object is restored, the next attempt succeeds
+automatically.
+
+### Extracting S3 keys for a restore request
+
+```bash
+uv run python -c "
+import json, pathlib
+d = pathlib.Path('/efs/.../models-inference/_meta/audio_errors')
+keys = set()
+for f in d.glob('*.json'):
+    try:
+        data = json.loads(f.read_text())
+    except (json.JSONDecodeError, OSError):
+        continue
+    if data.get('error_type') == 'glacier_storage_class':
+        k = data.get('s3_key', '')
+        if k:
+            keys.add(k)
+for k in sorted(keys):
+    print(k)
+" > glacier_keys.txt
+```
+
+### Rollout with Glacier reclassification
+
+If upgrading from a version where `glacier_storage_class` was permanent,
+old error JSONs with `"is_permanent": true` will suppress retries until
+removed.  Workers cache `permanent_errors` in memory at startup, so the
+cleanup sequence matters:
+
+1. **Extract keys** from existing error files (see above).
+2. **Submit Glacier restore** request.
+3. **Stop all workers** — ensure no old-code pods remain.
+4. **Deploy new code** — workers remain stopped.
+5. **Delete old permanent Glacier error files:**
+
+```bash
+uv run python -c "
+import json, pathlib
+d = pathlib.Path('/efs/.../models-inference/_meta/audio_errors')
+removed = 0
+for f in sorted(d.glob('*.json')):
+    try:
+        data = json.loads(f.read_text())
+    except (json.JSONDecodeError, OSError):
+        continue
+    if data.get('error_type') == 'glacier_storage_class' and data.get('is_permanent'):
+        f.unlink()
+        removed += 1
+print(f'Removed {removed} old permanent glacier error files')
+"
+```
+
+6. **Start fresh new-code workers.**
 
 ## Deployment
 

@@ -223,6 +223,7 @@ class Prefetcher:
                     file_parent_dir=entity.file_parent_dir,
                     error_type="download_failed",
                     detail="Prefetch result was discarded before decode",
+                    s3_key=s3_key,
                 )
             self._tmp_paths[key] = local_path
 
@@ -242,6 +243,7 @@ class Prefetcher:
                 file_parent_dir=entity.file_parent_dir,
                 error_type="download_failed",
                 detail=f"Decode failed: {type(exc).__name__}: {exc}",
+                s3_key=s3_key,
             )
 
         return _DecodedResult(

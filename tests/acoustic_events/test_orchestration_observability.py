@@ -471,5 +471,92 @@ class TestCLIProgressFast(unittest.TestCase):
                 main(["progress", "--output", d])
 
 
+# ===========================================================================
+# Glacier transient classification and s3_key in error payloads
+# ===========================================================================
+
+
+class TestAppendAudioErrorS3Key(unittest.TestCase):
+    """Verify s3_key is included in the JSON payload written by append_audio_error."""
+
+    def test_s3_key_written_to_json(self):
+        from audio_classification_playground.acoustic_events.orchestration.audio_resolver import (
+            AudioResolutionError,
+        )
+        from audio_classification_playground.acoustic_events.orchestration.errors import (
+            append_audio_error,
+        )
+
+        with tempfile.TemporaryDirectory() as d:
+            base = Path(d)
+            err = AudioResolutionError(
+                session_id="s1",
+                archive_id="a1",
+                file_parent_dir="pfx",
+                error_type="glacier_storage_class",
+                detail="s3://bucket/key is in GLACIER",
+                s3_key="accounts/studio/takes/file.wav",
+            )
+            path = append_audio_error(base, err)
+            data = json.loads(path.read_text())
+
+            self.assertEqual(data["s3_key"], "accounts/studio/takes/file.wav")
+            self.assertFalse(data["is_permanent"])
+
+    def test_s3_key_defaults_to_empty_for_no_matching_file(self):
+        from audio_classification_playground.acoustic_events.orchestration.audio_resolver import (
+            AudioResolutionError,
+        )
+        from audio_classification_playground.acoustic_events.orchestration.errors import (
+            append_audio_error,
+        )
+
+        with tempfile.TemporaryDirectory() as d:
+            base = Path(d)
+            err = AudioResolutionError(
+                session_id="s1",
+                archive_id="a1",
+                file_parent_dir="pfx",
+                error_type="no_matching_file",
+                detail="No WAV/MP3 found",
+            )
+            path = append_audio_error(base, err)
+            data = json.loads(path.read_text())
+
+            self.assertEqual(data["s3_key"], "")
+            self.assertTrue(data["is_permanent"])
+
+
+class TestGlacierTransientInGroupedSummary(unittest.TestCase):
+    """Verify glacier errors appear as transient in grouped summaries."""
+
+    def test_glacier_is_transient_in_summary(self):
+        with tempfile.TemporaryDirectory() as d:
+            errors_dir = Path(d)
+            payload = {
+                "session_id": "s1",
+                "archive_id": "a1",
+                "error_type": "glacier_storage_class",
+                "detail": "s3://bucket/key is in GLACIER",
+                "s3_key": "key",
+                "is_permanent": False,
+            }
+            (errors_dir / "err.json").write_text(json.dumps(payload))
+
+            groups = summarize_errors_grouped(errors_dir)
+            self.assertEqual(len(groups), 1)
+            self.assertEqual(groups[0].error_type, "glacier_storage_class")
+            self.assertFalse(groups[0].is_permanent)
+            self.assertEqual(groups[0].record_count, 1)
+
+    def test_permanent_audio_error_types_excludes_glacier(self):
+        from audio_classification_playground.acoustic_events.orchestration.errors import (
+            PERMANENT_AUDIO_ERROR_TYPES,
+        )
+
+        self.assertNotIn("glacier_storage_class", PERMANENT_AUDIO_ERROR_TYPES)
+        self.assertIn("no_matching_file", PERMANENT_AUDIO_ERROR_TYPES)
+
+
 if __name__ == "__main__":
     unittest.main()

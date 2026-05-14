@@ -4,8 +4,10 @@ Each error event is written as an individual JSON file with a UUID name
 under ``_meta/audio_errors/`` or ``_meta/inference_errors/``.  This avoids
 any ``flock`` contention across pods.
 
-Audio errors are categorised as **permanent** (``no_matching_file``,
-``glacier_storage_class``) or **transient** (``download_failed``).
+Audio errors are categorised as **permanent** (``no_matching_file``) or
+**transient** (``glacier_storage_class``, ``download_failed``).
+``glacier_storage_class`` is transient because objects may be restored from
+Glacier, at which point the next retry succeeds automatically.
 Inference errors track per-archive attempt counts so a max-retry policy
 can be enforced.
 """
@@ -27,7 +29,7 @@ LOGGER = logging.getLogger(__name__)
 AUDIO_ERRORS_DIR = "_meta/audio_errors"
 INFERENCE_ERRORS_DIR = "_meta/inference_errors"
 
-PERMANENT_AUDIO_ERROR_TYPES = frozenset({"no_matching_file", "glacier_storage_class"})
+PERMANENT_AUDIO_ERROR_TYPES = frozenset({"no_matching_file"})
 
 DETERMINISTIC_ERRORS: tuple[str, ...] = (
     "SndfileError",
@@ -64,6 +66,7 @@ def append_audio_error(
         "file_parent_dir": error.file_parent_dir,
         "error_type": error.error_type,
         "detail": error.detail,
+        "s3_key": error.s3_key,
         "is_permanent": error.is_permanent,
         "timestamp": time.time(),
         "worker": os.environ.get("HOSTNAME", "unknown"),
