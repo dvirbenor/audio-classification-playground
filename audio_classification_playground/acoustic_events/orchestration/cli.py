@@ -55,7 +55,12 @@ def _cmd_run(args: argparse.Namespace) -> None:
     )
 
 
-def _cmd_progress(args: argparse.Namespace) -> None:
+# ---------------------------------------------------------------------------
+# progress
+# ---------------------------------------------------------------------------
+
+
+def _print_full_progress(args: argparse.Namespace) -> None:
     from .errors import load_inference_attempt_counts, load_permanent_error_set
     from .manifest import load_manifest
     from .progress import scan_progress
@@ -86,19 +91,53 @@ def _cmd_progress(args: argparse.Namespace) -> None:
     print("\n".join(lines))
 
 
-def _cmd_errors(args: argparse.Namespace) -> None:
+def _print_fast_progress(args: argparse.Namespace) -> None:
+    from .progress import quick_disk_summary
+
     output_base = Path(args.output)
-    kind = args.kind
+    s = quick_disk_summary(output_base)
 
-    if kind == "audio":
-        from .errors import AUDIO_ERRORS_DIR
+    lines = [
+        f"Complete (all 4 tasks):  {s.complete}",
+        f"Partially done:          {s.partial}",
+        f"Lock files:              {s.lock_count}",
+        "",
+        "Per-task artifact count:",
+    ]
+    for task, count in sorted(s.task_counts.items()):
+        lines.append(f"  {task:12s} {count}")
 
-        errors_dir = output_base / AUDIO_ERRORS_DIR
+    lines.append("")
+    lines.append(
+        f"Audio errors:      {s.audio_error_records} records, "
+        f"{s.permanent_audio_error_archives} permanent archives"
+    )
+    lines.append(
+        f"Inference errors:  {s.inference_error_records} records "
+        f"across {s.inference_error_archives} archives"
+    )
+    lines.append("")
+    lines.append("(--fast mode: totals/remaining unavailable without --parquet)")
+    print("\n".join(lines))
+
+
+def _cmd_progress(args: argparse.Namespace) -> None:
+    if args.fast and not args.parquet:
+        _print_fast_progress(args)
+    elif args.parquet:
+        _print_full_progress(args)
     else:
-        from .errors import INFERENCE_ERRORS_DIR
+        print("error: --parquet is required unless --fast is specified",
+              file=sys.stderr)
+        sys.exit(1)
 
-        errors_dir = output_base / INFERENCE_ERRORS_DIR
 
+# ---------------------------------------------------------------------------
+# errors
+# ---------------------------------------------------------------------------
+
+
+def _print_errors_flat(errors_dir: Path, kind: str, summary: bool) -> None:
     if not errors_dir.is_dir():
         print(f"No {kind} errors directory found at {errors_dir}")
         return
@@ -118,8 +157,58 @@ def _cmd_errors(args: argparse.Namespace) -> None:
         except (OSError, json.JSONDecodeError):
             continue
 
-    if args.summary:
+    if summary:
         print(f"\nTotal {kind} error records: {count}")
+
+
+def _print_errors_grouped(errors_dir: Path, kind: str) -> None:
+    from .errors import summarize_errors_grouped
+
+    groups = summarize_errors_grouped(errors_dir)
+    if not groups:
+        print(f"No {kind} errors found.")
+        return
+
+    total_records = 0
+    all_archives: set[tuple[str, str]] = set()
+
+    print(f"{kind.capitalize()} errors by type:\n")
+    for grp in groups:
+        total_records += grp.record_count
+        all_archives |= grp.unique_archives
+
+        n_archives = len(grp.unique_archives)
+        sid, aid = grp.example_archive
+        suffix = ""
+        if grp.is_permanent is True:
+            suffix = " (permanent)"
+        elif grp.is_permanent is False:
+            suffix = " (transient)"
+
+        print(
+            f"  {grp.error_type:24s} "
+            f"{grp.record_count:>4} records, {n_archives:>4} archives{suffix}"
+        )
+        print(f"    e.g. {sid}/{aid} \u2014 {grp.example_detail}")
+
+    print(f"\nTotal: {total_records} records, {len(all_archives)} unique archives")
+
+
+def _cmd_errors(args: argparse.Namespace) -> None:
+    output_base = Path(args.output)
+    kind = args.kind
+
+    if kind == "audio":
+        from .errors import AUDIO_ERRORS_DIR
+        errors_dir = output_base / AUDIO_ERRORS_DIR
+    else:
+        from .errors import INFERENCE_ERRORS_DIR
+        errors_dir = output_base / INFERENCE_ERRORS_DIR
+
+    if args.group:
+        _print_errors_grouped(errors_dir, kind)
+    else:
+        _print_errors_flat(errors_dir, kind, args.summary)
 
 
 def _cmd_reclaim_stale(args: argparse.Namespace) -> None:
@@ -162,14 +251,20 @@ def main(argv: list[str] | None = None) -> None:
 
     # --- progress ---
     p_progress = sub.add_parser("progress", help="Show pipeline progress")
-    p_progress.add_argument("--parquet", required=True)
+    p_progress.add_argument("--parquet", default=None,
+                            help="Path to all_archives.parquet (required unless --fast)")
     p_progress.add_argument("--output", required=True)
+    p_progress.add_argument("--fast", action="store_true",
+                            help="Quick disk-only summary without loading the manifest")
 
     # --- errors ---
     p_errors = sub.add_parser("errors", help="List error records")
     p_errors.add_argument("--output", required=True)
     p_errors.add_argument("--kind", choices=["audio", "inference"], default="audio")
-    p_errors.add_argument("--summary", action="store_true")
+    p_errors.add_argument("--summary", action="store_true",
+                          help="Append a total count (flat mode only)")
+    p_errors.add_argument("--group", action="store_true",
+                          help="Group errors by type with record/archive counts")
 
     # --- reclaim-stale ---
     p_reclaim = sub.add_parser("reclaim-stale", help="Remove orphan lock files")

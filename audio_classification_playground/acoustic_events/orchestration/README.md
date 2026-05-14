@@ -18,20 +18,30 @@ python -m audio_classification_playground.acoustic_events.orchestration run \
     --prefetch-workers 4 \
     --vad-prefetch-workers 1
 
-# Check progress (from any machine with EFS access)
+# Quick pulse check — no parquet needed, finishes in seconds
+python -m audio_classification_playground.acoustic_events.orchestration progress \
+    --output /efs/dvir/data/magic-clips-research/acoustic-understanding/models-inference \
+    --fast
+
+# Full progress with totals (requires the manifest parquet)
 python -m audio_classification_playground.acoustic_events.orchestration progress \
     --parquet /efs/dvir/data/magic-clips-research/dataset-reference/all_archives.parquet \
     --output  /efs/dvir/data/magic-clips-research/acoustic-understanding/models-inference
 
-# List audio errors
+# Grouped error summary — counts + archives per error type
+python -m audio_classification_playground.acoustic_events.orchestration errors \
+    --output /efs/dvir/data/magic-clips-research/acoustic-understanding/models-inference \
+    --kind audio --group
+
+# Flat error listing (one line per record)
 python -m audio_classification_playground.acoustic_events.orchestration errors \
     --output /efs/dvir/data/magic-clips-research/acoustic-understanding/models-inference \
     --kind audio --summary
 
-# List inference errors
+# Inference errors (same flags: --group or --summary)
 python -m audio_classification_playground.acoustic_events.orchestration errors \
     --output /efs/dvir/data/magic-clips-research/acoustic-understanding/models-inference \
-    --kind inference --summary
+    --kind inference --group
 
 # Reclaim stale locks from crashed pods
 python -m audio_classification_playground.acoustic_events.orchestration reclaim-stale \
@@ -119,7 +129,9 @@ python -m audio_classification_playground.acoustic_events.orchestration reclaim-
   no contention.
 - **Progress**: Derived from the directory structure: if
   `manifest.json + predictions.npz` exist for all four tasks in an archive
-  directory, that archive is complete.
+  directory, that archive is complete.  The progress scanner walks only
+  directories that exist on disk (via `os.scandir`) rather than probing
+  every expected path, keeping cost proportional to work done.
 
 ### Error Handling
 
@@ -186,6 +198,81 @@ Each `manifest.json` records:
 - `audio.sha256`: SHA-256 of the decoded mono 16 kHz float32 samples
 - `inference_config`: full config dict
 - `inference_config_hash`: 16-char hex digest of the config
+
+## Monitoring Progress and Errors
+
+### Quick pulse check (`--fast`)
+
+For a fast, parquet-free overview of what's on disk:
+
+```bash
+python -m audio_classification_playground.acoustic_events.orchestration progress \
+    --output /efs/.../models-inference --fast
+```
+
+Output:
+
+```
+Complete (all 4 tasks):  14
+Partially done:           1
+Lock files:               1
+
+Per-task artifact count:
+  affect       14
+  disfluency   14
+  emotion      14
+  vad          15
+
+Audio errors:      17 records, 15 permanent archives
+Inference errors:  93 records across 14 archives
+
+(--fast mode: totals/remaining unavailable without --parquet)
+```
+
+This walks the output tree with `os.scandir` and the `_meta/` directories.
+No manifest loading, no per-entity probing.  Finishes in seconds even on
+EFS with hundreds of thousands of archives.
+
+### Full progress (with `--parquet`)
+
+When you need totals and remaining counts, pass the manifest:
+
+```bash
+python -m audio_classification_playground.acoustic_events.orchestration progress \
+    --parquet /efs/.../all_archives.parquet \
+    --output  /efs/.../models-inference
+```
+
+This uses the same walk-based scanner internally, so it is dramatically
+faster than the original per-entity probe approach.
+
+### Grouped error summary (`--group`)
+
+```bash
+python -m audio_classification_playground.acoustic_events.orchestration errors \
+    --output /efs/.../models-inference --kind audio --group
+```
+
+Output:
+
+```
+Audio errors by type:
+
+  no_matching_file             12 records,   10 archives (permanent)
+    e.g. abc123/def456 — No audio file found in ...
+  glacier_storage_class          3 records,    3 archives (permanent)
+    e.g. xyz789/ghi012 — Object is in GLACIER...
+  download_failed                2 records,    2 archives (transient)
+    e.g. ...
+
+Total: 17 records, 15 unique archives
+```
+
+Groups are sorted by record count descending, then error type ascending.
+Use `--kind inference` for inference errors (no permanent/transient label,
+since retries are the meaningful signal there).
+
+The original flat listing (`--summary` without `--group`) remains available.
 
 ## Deployment
 

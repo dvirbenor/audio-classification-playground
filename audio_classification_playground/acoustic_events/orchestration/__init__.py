@@ -4,14 +4,22 @@ See ``orchestration/README.md`` for architecture overview, usage, and
 deployment instructions.
 """
 from .manifest import ArchiveEntity, load_manifest
-from .progress import ProgressSummary, is_archive_complete, scan_progress
+from .progress import (
+    ProgressSummary,
+    QuickSummary,
+    is_archive_complete,
+    quick_disk_summary,
+    scan_progress,
+)
 from .worker import run_worker
 
 __all__ = [
     "ArchiveEntity",
     "ProgressSummary",
+    "QuickSummary",
     "is_archive_complete",
     "load_manifest",
+    "quick_disk_summary",
     "run_worker",
     "scan_progress",
 ]

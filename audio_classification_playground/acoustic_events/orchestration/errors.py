@@ -17,6 +17,7 @@ import os
 import time
 import uuid
 from collections import Counter
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from .audio_resolver import AudioResolutionError
@@ -181,3 +182,62 @@ def is_deterministic_error(error: Exception) -> bool:
     """Return True if *error* is known to be non-retryable."""
     error_name = type(error).__name__
     return any(det in error_name for det in DETERMINISTIC_ERRORS)
+
+
+# ---------------------------------------------------------------------------
+# Grouped error summary
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ErrorGroup:
+    """One error type's aggregate stats across all error JSON files."""
+
+    error_type: str
+    record_count: int = 0
+    unique_archives: set[tuple[str, str]] = field(default_factory=set)
+    is_permanent: bool | None = None
+    example_detail: str = ""
+    example_archive: tuple[str, str] = ("", "")
+
+
+def summarize_errors_grouped(errors_dir: Path) -> list[ErrorGroup]:
+    """Read all JSON error files in *errors_dir* and group by ``error_type``.
+
+    Returns groups sorted by ``record_count`` descending, then
+    ``error_type`` ascending.  Malformed JSON files are silently skipped.
+    """
+    if not errors_dir.is_dir():
+        return []
+
+    groups: dict[str, ErrorGroup] = {}
+
+    for f in errors_dir.iterdir():
+        if not f.name.endswith(".json"):
+            continue
+        try:
+            data = json.loads(f.read_text(encoding="utf-8"))
+            etype = data.get("error_type", "unknown")
+            sid = data["session_id"]
+            aid = data["archive_id"]
+            detail = str(data.get("detail", ""))[:120].replace("\n", " ")
+            is_perm = data.get("is_permanent")  # None for inference errors
+        except (OSError, json.JSONDecodeError, KeyError):
+            continue
+
+        if etype not in groups:
+            groups[etype] = ErrorGroup(
+                error_type=etype,
+                is_permanent=is_perm,
+                example_detail=detail,
+                example_archive=(sid, aid),
+            )
+
+        grp = groups[etype]
+        grp.record_count += 1
+        grp.unique_archives.add((sid, aid))
+
+    return sorted(
+        groups.values(),
+        key=lambda g: (-g.record_count, g.error_type),
+    )
