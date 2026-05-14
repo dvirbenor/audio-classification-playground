@@ -37,6 +37,7 @@ from .runners import (
     DEFAULT_VAD_SPEECH_THRESHOLD,
     _load_affect_wrapper,
     _load_disfluency_wrapper,
+    resolve_task_batch_sizes,
 )
 
 LOGGER = get_logger()
@@ -44,6 +45,8 @@ ProgressFn = Callable[[str], None]
 
 
 def _batches(windows: np.ndarray, batch_size: int, task: str):
+    if batch_size <= 0:
+        raise ValueError(f"{task} batch size must be positive")
     n = len(windows)
     for start in range(0, n, batch_size):
         yield windows[start : min(start + batch_size, n)]
@@ -239,19 +242,28 @@ class ModelSuite:
         affect_backbone: str,
         disfluency_backbone: str,
         batch_size: int = 512,
+        affect_batch_size: int | None = None,
+        disfluency_batch_size: int | None = None,
+        emotion_batch_size: int | None = None,
         device: str | None = None,
         vad_threshold: float = DEFAULT_VAD_SPEECH_THRESHOLD,
         vad_min_speech_sec: float = DEFAULT_VAD_MIN_SPEECH_SEC,
         vad_min_silence_sec: float = DEFAULT_VAD_MIN_SILENCE_SEC,
         load_vad: bool = True,
     ) -> None:
+        batches = resolve_task_batch_sizes(
+            batch_size=batch_size,
+            affect_batch_size=affect_batch_size,
+            disfluency_batch_size=disfluency_batch_size,
+            emotion_batch_size=emotion_batch_size,
+        )
         self.affect = AffectPredictor(
-            backbone=affect_backbone, device=device, batch_size=batch_size,
+            backbone=affect_backbone, device=device, batch_size=batches["affect"],
         )
         self.disfluency = DisfluencyPredictor(
-            backbone=disfluency_backbone, device=device, batch_size=batch_size,
+            backbone=disfluency_backbone, device=device, batch_size=batches["disfluency"],
         )
-        self.emotion = EmotionPredictor(batch_size=batch_size, device=device)
+        self.emotion = EmotionPredictor(batch_size=batches["emotion"], device=device)
         self._vad_config = dict(
             threshold=vad_threshold,
             min_speech_sec=vad_min_speech_sec,

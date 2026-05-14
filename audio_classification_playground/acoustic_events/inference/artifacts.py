@@ -59,6 +59,32 @@ def inference_config_hash(config: Mapping) -> str:
     return hashlib.sha256(blob).hexdigest()[:16]
 
 
+def semantic_inference_config(config: Mapping) -> dict:
+    """Return the model/input semantics of an inference config.
+
+    ``batch_size`` is intentionally excluded: it is a runtime throughput
+    setting and does not change the prediction arrays for deterministic
+    inference.
+    """
+    return {
+        key: value
+        for key, value in dict(config).items()
+        if key != "batch_size"
+    }
+
+
+def inference_configs_match(
+    observed: Mapping,
+    expected: Mapping,
+    *,
+    ignore_batch_size: bool = False,
+) -> bool:
+    """Compare inference configs, optionally ignoring runtime-only fields."""
+    if ignore_batch_size:
+        return semantic_inference_config(observed) == semantic_inference_config(expected)
+    return dict(observed) == dict(expected)
+
+
 def artifact_dir(
     out_dir: str | Path,
     *,

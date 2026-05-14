@@ -13,6 +13,7 @@ python -m audio_classification_playground.acoustic_events.orchestration run \
     --affect-backbone wavlm \
     --disfluency-backbone whisper \
     --batch-size 512 \
+    --emotion-batch-size 64 \
     --prefetch-lookahead 4 \
     --prefetch-workers 4 \
     --vad-prefetch-workers 1
@@ -149,12 +150,31 @@ Async VAD prefetch means hard-killed pods can leave up to
 `--prefetch-lookahead` stale locks, not just the currently inferred archive.
 Keep `--prefetch-lookahead` conservative unless stale reclaim runs frequently.
 
+### Batch Sizes
+
+`--batch-size` remains the legacy default for affect and disfluency.
+Emotion2vec uses `--emotion-batch-size 64` by default in the worker because
+the fast batched path has much higher VRAM pressure than the old FunASR
+generate path. Explicit task flags always win:
+
+```bash
+--batch-size 512 \
+--affect-batch-size 384 \
+--disfluency-batch-size 512 \
+--emotion-batch-size 64
+```
+
+Tune these as rollout settings after profiling on the target GPU. Do not
+increase emotion back to 512 without a target-GPU VRAM check.
+
 ### Config-Aware Completion
 
 With the flat output layout (`session/archive/task/`), the config hash is
 no longer embedded in the directory path. The worker reads each task's
-`manifest.json` and validates `inference_config_hash` against the current
-config. Stale artifacts (from a previous backbone, batch size, etc.) are
+`manifest.json` and validates it against the current model/input config.
+Batch size is treated as runtime-only for this flat layout, so existing
+complete artifacts are reused when only batch size changed. Stale artifacts
+from a previous backbone, window, hop, sample rate, model, or transform are
 automatically re-run.
 
 ### Data Provenance
@@ -196,6 +216,8 @@ spec:
     - whisper
     - --batch-size
     - "512"
+    - --emotion-batch-size
+    - "64"
     - --prefetch-lookahead
     - "4"
     - --prefetch-workers
@@ -225,7 +247,8 @@ python -m audio_classification_playground.acoustic_events.orchestration run \
     --output  /efs/pilot-test \
     --affect-backbone wavlm \
     --disfluency-backbone whisper \
-    --batch-size 512
+    --batch-size 512 \
+    --emotion-batch-size 64
 
 # Verify
 python -m audio_classification_playground.acoustic_events.orchestration progress \

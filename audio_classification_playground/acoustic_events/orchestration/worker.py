@@ -39,6 +39,7 @@ from ..inference.runners import (
     ShutdownRequested,
     cleanup_torch_memory,
     compute_inference_config,
+    resolve_task_batch_sizes,
     run_all_inference,
 )
 from .audio_resolver import AudioResolutionError, BUCKET
@@ -58,27 +59,41 @@ from .progress import is_archive_complete_for_config, is_task_complete_for_confi
 LOGGER = logging.getLogger(__name__)
 
 DEFAULT_BATCH_SIZE = 512
+DEFAULT_EMOTION_BATCH_SIZE = 64
 DEFAULT_MAX_INFERENCE_ATTEMPTS = 3
 PREFETCH_LOOKAHEAD = 4
 PREFETCH_WORKERS = 4
 VAD_PREFETCH_WORKERS = 1
 
 
-def build_expected_config_hashes(
+def build_expected_configs(
     *,
     affect_backbone: str,
     disfluency_backbone: str,
     batch_size: int,
+    affect_batch_size: int | None = None,
+    disfluency_batch_size: int | None = None,
+    emotion_batch_size: int | None = None,
     sample_rate: int = SAMPLE_RATE,
     vad_threshold: float = DEFAULT_VAD_SPEECH_THRESHOLD,
     vad_min_speech_sec: float = DEFAULT_VAD_MIN_SPEECH_SEC,
     vad_min_silence_sec: float = DEFAULT_VAD_MIN_SILENCE_SEC,
-) -> dict[str, str]:
-    """Compute expected ``inference_config_hash`` for each task.
+) -> dict[str, dict]:
+    """Compute expected inference configs for each task.
 
     Uses the same ``compute_inference_config`` helper as the runners so
-    config hashes cannot drift.
+    worker stale-artifact detection cannot drift.
     """
+    batches = resolve_task_batch_sizes(
+        batch_size=batch_size,
+        affect_batch_size=affect_batch_size,
+        disfluency_batch_size=disfluency_batch_size,
+        emotion_batch_size=(
+            DEFAULT_EMOTION_BATCH_SIZE
+            if emotion_batch_size is None
+            else emotion_batch_size
+        ),
+    )
     configs: dict[str, dict] = {}
     configs["affect"] = compute_inference_config(
         task="affect",
@@ -87,7 +102,7 @@ def build_expected_config_hashes(
         sample_rate=sample_rate,
         window_sec=AFFECT_WINDOW_SEC,
         hop_sec=DEFAULT_HOP_SEC,
-        batch_size=batch_size,
+        batch_size=batches["affect"],
         transform_policy="vox_profile_affect_sigmoid_heads_v1",
     )
     configs["disfluency"] = compute_inference_config(
@@ -97,7 +112,7 @@ def build_expected_config_hashes(
         sample_rate=sample_rate,
         window_sec=DISFLUENCY_WINDOW_SEC,
         hop_sec=DEFAULT_HOP_SEC,
-        batch_size=batch_size,
+        batch_size=batches["disfluency"],
         transform_policy="vox_profile_disfluency_raw_logits_v1",
     )
     configs["emotion"] = compute_inference_config(
@@ -107,7 +122,7 @@ def build_expected_config_hashes(
         sample_rate=sample_rate,
         window_sec=EMOTION_WINDOW_SEC,
         hop_sec=DEFAULT_HOP_SEC,
-        batch_size=batch_size,
+        batch_size=batches["emotion"],
         transform_policy="emotion2vec_fold_row_normalize_v1",
     )
     configs["vad"] = compute_inference_config(
@@ -127,7 +142,15 @@ def build_expected_config_hashes(
             "frame_speech_ratio_threshold": float(DEFAULT_VAD_FRAME_SPEECH_RATIO_THRESHOLD),
         },
     )
-    return {task: inference_config_hash(cfg) for task, cfg in configs.items()}
+    return configs
+
+
+def build_expected_config_hashes(**kwargs) -> dict[str, str]:
+    """Compute expected ``inference_config_hash`` for each task."""
+    return {
+        task: inference_config_hash(cfg)
+        for task, cfg in build_expected_configs(**kwargs).items()
+    }
 
 
 def run_worker(
@@ -137,6 +160,9 @@ def run_worker(
     affect_backbone: str,
     disfluency_backbone: str,
     batch_size: int = DEFAULT_BATCH_SIZE,
+    affect_batch_size: int | None = None,
+    disfluency_batch_size: int | None = None,
+    emotion_batch_size: int | None = None,
     device: str | None = None,
     sample_rate: int = SAMPLE_RATE,
     max_inference_attempts: int = DEFAULT_MAX_INFERENCE_ATTEMPTS,
@@ -157,6 +183,16 @@ def run_worker(
         raise ValueError("prefetch_lookahead must be >= 1")
     if vad_prefetch_workers < 0:
         raise ValueError("vad_prefetch_workers must be >= 0")
+    batches = resolve_task_batch_sizes(
+        batch_size=batch_size,
+        affect_batch_size=affect_batch_size,
+        disfluency_batch_size=disfluency_batch_size,
+        emotion_batch_size=(
+            DEFAULT_EMOTION_BATCH_SIZE
+            if emotion_batch_size is None
+            else emotion_batch_size
+        ),
+    )
 
     output_base = Path(output_base)
     shutdown_event = threading.Event()
@@ -176,15 +212,22 @@ def run_worker(
     permanent_errors = load_permanent_error_set(output_base)
     inference_attempts = load_inference_attempt_counts(output_base)
 
-    expected_hashes = build_expected_config_hashes(
+    expected_configs = build_expected_configs(
         affect_backbone=affect_backbone,
         disfluency_backbone=disfluency_backbone,
         batch_size=batch_size,
+        affect_batch_size=batches["affect"],
+        disfluency_batch_size=batches["disfluency"],
+        emotion_batch_size=batches["emotion"],
         sample_rate=sample_rate,
         vad_threshold=vad_threshold,
         vad_min_speech_sec=vad_min_speech_sec,
         vad_min_silence_sec=vad_min_silence_sec,
     )
+    expected_hashes = {
+        task: inference_config_hash(cfg)
+        for task, cfg in expected_configs.items()
+    }
 
     if shutdown_event.is_set():
         LOGGER.info("Shutdown requested before model loading; exiting early")
@@ -197,6 +240,9 @@ def run_worker(
         affect_backbone=affect_backbone,
         disfluency_backbone=disfluency_backbone,
         batch_size=batch_size,
+        affect_batch_size=batches["affect"],
+        disfluency_batch_size=batches["disfluency"],
+        emotion_batch_size=batches["emotion"],
         device=device,
         vad_threshold=vad_threshold,
         vad_min_speech_sec=vad_min_speech_sec,
@@ -263,7 +309,14 @@ def run_worker(
                 skipped += 1
                 continue
 
-            if is_archive_complete_for_config(output_base, sid, aid, expected_hashes):
+            if is_archive_complete_for_config(
+                output_base,
+                sid,
+                aid,
+                expected_hashes,
+                expected_configs=expected_configs,
+                ignore_batch_size=True,
+            ):
                 skipped += 1
                 continue
 
@@ -278,7 +331,14 @@ def run_worker(
                 skipped += 1
                 continue
 
-            if is_archive_complete_for_config(output_base, sid, aid, expected_hashes):
+            if is_archive_complete_for_config(
+                output_base,
+                sid,
+                aid,
+                expected_hashes,
+                expected_configs=expected_configs,
+                ignore_batch_size=True,
+            ):
                 release_claim(output_base, entity)
                 skipped += 1
                 continue
@@ -291,6 +351,8 @@ def run_worker(
                     aid,
                     "vad",
                     expected_hashes["vad"],
+                    expected_config=expected_configs["vad"],
+                    ignore_batch_size=True,
                 )
             )
             prefetcher.submit(entity, precompute_vad=precompute_vad)
@@ -339,6 +401,9 @@ def run_worker(
                     disfluency_backbone=disfluency_backbone,
                     reuse_cache=True,
                     batch_size=batch_size,
+                    affect_batch_size=batches["affect"],
+                    disfluency_batch_size=batches["disfluency"],
+                    emotion_batch_size=batches["emotion"],
                     device=device,
                     sample_rate=sample_rate,
                     vad_threshold=vad_threshold,

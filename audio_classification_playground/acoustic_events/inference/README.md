@@ -146,6 +146,7 @@ models = ModelSuite(
     affect_backbone="wavlm",
     disfluency_backbone="whisper",
     batch_size=512,
+    emotion_batch_size=64,
     device="cuda",
 )
 
@@ -154,6 +155,8 @@ result = run_all_inference(
     out_dir="artifacts",
     affect_backbone="wavlm",
     disfluency_backbone="whisper",
+    batch_size=512,
+    emotion_batch_size=64,
     predictors={
         "affect": models.affect,
         "disfluency": models.disfluency,
