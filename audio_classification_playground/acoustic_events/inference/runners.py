@@ -26,6 +26,7 @@ from .artifacts import (
     write_prediction_artifact,
 )
 from .audio import AudioData, frame_audio, load_audio
+from .emotion2vec import predict_emotion2vec_scores
 from .log import get_logger
 
 
@@ -287,6 +288,7 @@ def run_emotion_inference(
                 model_id=model_id,
                 sample_rate=sample_rate,
                 batch_size=batch_size,
+                device=device,
                 progress=progress,
             )
         )
@@ -877,27 +879,27 @@ def _predict_emotion2vec(
     model_id: str,
     sample_rate: int,
     batch_size: int,
+    device: str | None,
     progress: ProgressFn | None,
 ) -> tuple[np.ndarray, Sequence[str]]:
     from funasr import AutoModel
 
-    model = AutoModel(model=model_id)
-    all_scores = []
-    labels = None
-    for batch_np in _batches(windows, batch_size, progress, "emotion"):
-        batch = [np.ascontiguousarray(batch_np[i]) for i in range(len(batch_np))]
-        results = model.generate(
-            input=batch,
-            fs=sample_rate,
-            granularity="utterance",
-            extract_embedding=False,
-        )
-        if labels is None:
-            labels = list(results[0]["labels"])
-        all_scores.extend(result["scores"] for result in results)
-    if labels is None:
-        raise ValueError("emotion2vec produced no results")
-    return np.asarray(all_scores, dtype=np.float32), labels
+    auto_kwargs = {
+        "model": model_id,
+        "batch_size": batch_size,
+        "disable_update": True,
+        "disable_pbar": True,
+    }
+    if device is not None:
+        auto_kwargs["device"] = device
+    model = AutoModel(**auto_kwargs)
+    return predict_emotion2vec_scores(
+        model,
+        windows,
+        sample_rate=sample_rate,
+        batch_size=batch_size,
+        progress=progress,
+    )
 
 
 def _detect_silero_vad(
