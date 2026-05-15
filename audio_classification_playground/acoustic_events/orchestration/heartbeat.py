@@ -267,39 +267,41 @@ def build_fleet_heartbeat(
             ))
             continue
 
-        for ti in host_timings:
-            last_activity: float | None = ti.latest_ts
-            lock_ts = latest_lock_by_host.get(hostname)
-            if lock_ts is not None:
-                last_activity = max(last_activity or 0.0, lock_ts) or None
+        # A hostname may have multiple timing files when the orchestrator
+        # has been restarted (each launch generates a fresh UUID suffix).
+        # Collapse them into one row: sum done counts, derive pace from
+        # the currently-active instance only.
+        total_done = sum(ti.done for ti in host_timings)
+        active_ti = max(host_timings, key=lambda t: t.latest_ts or 0.0)
 
-            total_secs = [
-                r["total_sec"]
-                for r in ti.recent_records
-                if isinstance(r.get("total_sec"), (int, float))
-            ]
-            pace: float | None = None
-            if total_secs:
-                mean_sec = sum(total_secs) / len(total_secs)
-                if mean_sec > 0:
-                    pace = 3600.0 / mean_sec
-                    fleet_pace_sum += pace
-                    fleet_pace_count += 1
+        total_secs = [
+            r["total_sec"]
+            for r in active_ti.recent_records
+            if isinstance(r.get("total_sec"), (int, float))
+        ]
+        pace: float | None = None
+        if total_secs:
+            mean_sec = sum(total_secs) / len(total_secs)
+            if mean_sec > 0:
+                pace = 3600.0 / mean_sec
+                fleet_pace_sum += pace
+                fleet_pace_count += 1
 
-            fleet_done += ti.done
-            workers.append(WorkerHeartbeat(
-                worker_id=ti.worker_id,
-                hostname=hostname,
-                locks=host_locks,
-                done=ti.done,
-                last_activity_ts=last_activity,
-                pace_per_hour=pace,
-            ))
+        all_ts = [ti.latest_ts for ti in host_timings if ti.latest_ts is not None]
+        lock_ts = latest_lock_by_host.get(hostname)
+        if lock_ts is not None:
+            all_ts.append(lock_ts)
+        last_activity = max(all_ts) if all_ts else None
 
-    # When multiple worker_ids share a hostname (restarts), locks are
-    # counted once per hostname but assigned to every row from that host.
-    # Deduplicate by only counting locks for the hostname once.
-    fleet_locks = sum(lock_count_by_host.get(h, 0) for h in all_hostnames)
+        fleet_done += total_done
+        workers.append(WorkerHeartbeat(
+            worker_id=hostname,
+            hostname=hostname,
+            locks=host_locks,
+            done=total_done,
+            last_activity_ts=last_activity,
+            pace_per_hour=pace,
+        ))
 
     return FleetHeartbeat(
         workers=workers,
