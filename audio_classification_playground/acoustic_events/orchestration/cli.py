@@ -23,17 +23,54 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
+from datetime import datetime, timezone
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
+_LOG_FMT_CONSOLE = "%(asctime)s %(name)s %(levelname)s %(message)s"
+_LOG_FMT_FILE = "%(asctime)s [%(process)d] %(name)s %(levelname)s %(message)s"
+_LOG_MAX_BYTES = 50 * 1024 * 1024  # 50 MB
+_LOG_BACKUP_COUNT = 3
 
-def _configure_logging(verbose: bool = False) -> None:
+
+def _configure_logging(
+    verbose: bool = False,
+    log_dir: Path | None = None,
+    command: str | None = None,
+) -> None:
+    root = logging.getLogger()
     level = logging.DEBUG if verbose else logging.INFO
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s %(name)s %(levelname)s %(message)s",
-        stream=sys.stdout,
-    )
+    root.setLevel(logging.DEBUG)
+
+    console = logging.StreamHandler(sys.stdout)
+    console.setLevel(level)
+    console.setFormatter(logging.Formatter(_LOG_FMT_CONSOLE))
+    root.addHandler(console)
+
+    if log_dir is not None:
+        try:
+            log_dir.mkdir(parents=True, exist_ok=True)
+            hostname = os.environ.get("HOSTNAME", "local")
+            ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+            prefix = command or "orchestration"
+            filename = f"{prefix}_{hostname}_{os.getpid()}_{ts}.log"
+            file_handler = RotatingFileHandler(
+                log_dir / filename,
+                maxBytes=_LOG_MAX_BYTES,
+                backupCount=_LOG_BACKUP_COUNT,
+                encoding="utf-8",
+            )
+            file_handler.setLevel(logging.DEBUG)
+            file_handler.setFormatter(logging.Formatter(_LOG_FMT_FILE))
+            root.addHandler(file_handler)
+            root.info("Log file: %s", log_dir / filename)
+        except OSError as exc:
+            print(
+                f"warning: could not create log file in {log_dir}: {exc}",
+                file=sys.stderr,
+            )
 
 
 def _cmd_run(args: argparse.Namespace) -> None:
@@ -318,6 +355,10 @@ def main(argv: list[str] | None = None) -> None:
         description="Batch acoustic inference orchestration pipeline",
     )
     parser.add_argument("-v", "--verbose", action="store_true")
+    parser.add_argument(
+        "--log-dir", type=Path, default=None,
+        help="Directory for log files (default: {output}/_meta/logs/ for 'run')",
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     # --- run ---
@@ -391,7 +432,16 @@ def main(argv: list[str] | None = None) -> None:
                            help="Minutes since lock creation (default: 60)")
 
     args = parser.parse_args(argv)
-    _configure_logging(verbose=args.verbose)
+
+    log_dir = args.log_dir
+    if log_dir is None and args.command == "run":
+        log_dir = Path(args.output) / "_meta" / "logs"
+
+    _configure_logging(
+        verbose=args.verbose,
+        log_dir=log_dir,
+        command=args.command,
+    )
 
     handlers = {
         "run": _cmd_run,
