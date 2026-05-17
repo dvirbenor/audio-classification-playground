@@ -9,16 +9,17 @@ Two flavours of completion check:
   by the worker loop to avoid reusing stale artifacts produced with a
   different backbone, batch size, or model.
 
-Progress scanning uses a single ``os.scandir`` walk of the output tree
-rather than probing every expected path.  This keeps cost proportional to
-*work completed on disk* instead of total dataset size, which is critical
-on network filesystems like EFS where each ``stat()`` is a round-trip.
+Progress scanning uses ``find(1)`` to collect artifact paths in a single
+subprocess, falling back to ``os.scandir`` when ``find`` is unavailable.
+This keeps cost proportional to *work completed on disk* and minimises
+network round-trips on EFS.
 """
 from __future__ import annotations
 
 import json
 import logging
 import os
+import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -183,8 +184,56 @@ def _is_task_complete_via_scandir(task_path: str) -> bool:
     return _COMPLETE_FILES <= names
 
 
-def _walk_completed_tasks(output_base: Path) -> dict[tuple[str, str], set[str]]:
-    """Walk the output tree and return ``{(session_id, archive_id): {task_names}}``.
+def _walk_completed_tasks_find(output_base: Path) -> dict[tuple[str, str], set[str]]:
+    """Walk via ``find(1)`` — single subprocess, minimal EFS round-trips.
+
+    Locates ``manifest.json`` and ``predictions.npz`` at exactly depth 4
+    (``session/archive/task/file``), excludes ``_meta/``, and returns the
+    same ``{(session_id, archive_id): {task_names}}`` as the scandir
+    variant.  Raises ``RuntimeError`` if ``find`` fails so the caller can
+    fall back.
+    """
+    base_str = str(output_base)
+    prefix = base_str + "/"
+
+    proc = subprocess.run(
+        [
+            "find", base_str,
+            "-mindepth", "4", "-maxdepth", "4",
+            "-type", "f",
+            "(", "-name", MANIFEST_FILENAME,
+            "-o", "-name", PREDICTIONS_FILENAME, ")",
+            "-not", "-path", "*/_meta/*",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(proc.stderr.strip())
+
+    # (session, archive, task) -> set of filenames found
+    task_files: dict[tuple[str, str, str], set[str]] = {}
+    for line in proc.stdout.splitlines():
+        if not line.startswith(prefix):
+            continue
+        rel = line[len(prefix):]
+        parts = rel.split("/")
+        if len(parts) != 4 or parts[2] not in _TASKS_SET:
+            continue
+        key = (parts[0], parts[1], parts[2])
+        task_files.setdefault(key, set()).add(parts[3])
+
+    result: dict[tuple[str, str], set[str]] = {}
+    for (sid, aid, task), files in task_files.items():
+        if _COMPLETE_FILES <= files:
+            result.setdefault((sid, aid), set()).add(task)
+    return result
+
+
+def _walk_completed_tasks_scandir(
+    output_base: Path,
+) -> dict[tuple[str, str], set[str]]:
+    """Walk via nested ``os.scandir`` — portable fallback.
 
     Uses ``os.scandir`` context managers throughout and tolerates
     ``OSError`` / ``FileNotFoundError`` per-entry so that concurrent
@@ -221,7 +270,9 @@ def _walk_completed_tasks(output_base: Path) -> dict[tuple[str, str], set[str]]:
                                         try:
                                             if (
                                                 task_entry.name in _TASKS_SET
-                                                and task_entry.is_dir(follow_symlinks=False)
+                                                and task_entry.is_dir(
+                                                    follow_symlinks=False,
+                                                )
                                                 and _is_task_complete_via_scandir(
                                                     task_entry.path,
                                                 )
@@ -230,7 +281,7 @@ def _walk_completed_tasks(output_base: Path) -> dict[tuple[str, str], set[str]]:
                                         except OSError:
                                             continue
                             except (OSError, FileNotFoundError):
-                                pass  # preserve tasks_done collected before the error
+                                pass
                             if tasks_done:
                                 key = (session_entry.name, archive_entry.name)
                                 result[key] = tasks_done
@@ -239,6 +290,19 @@ def _walk_completed_tasks(output_base: Path) -> dict[tuple[str, str], set[str]]:
     except (OSError, FileNotFoundError):
         pass
     return result
+
+
+def _walk_completed_tasks(output_base: Path) -> dict[tuple[str, str], set[str]]:
+    """Walk the output tree and return ``{(session_id, archive_id): {task_names}}``.
+
+    Tries ``find(1)`` first for speed on network filesystems, falls back
+    to ``os.scandir`` if ``find`` is unavailable or fails.
+    """
+    try:
+        return _walk_completed_tasks_find(output_base)
+    except (RuntimeError, FileNotFoundError, OSError):
+        LOGGER.debug("find-based walk failed, falling back to scandir")
+        return _walk_completed_tasks_scandir(output_base)
 
 
 # ---------------------------------------------------------------------------

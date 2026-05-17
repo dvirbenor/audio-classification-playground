@@ -312,6 +312,33 @@ def build_fleet_heartbeat(
 
 
 # ---------------------------------------------------------------------------
+# Lightweight error counts (no tree walk)
+# ---------------------------------------------------------------------------
+
+
+def count_error_files(output_base: Path) -> tuple[int, int]:
+    """Count ``.json`` files in the audio and inference error directories.
+
+    Returns ``(audio_error_count, inference_error_count)``.  Cheap: two
+    flat ``iterdir`` calls with no JSON parsing.
+    """
+    from .errors import AUDIO_ERRORS_DIR, INFERENCE_ERRORS_DIR
+
+    def _count(d: Path) -> int:
+        if not d.is_dir():
+            return 0
+        try:
+            return sum(1 for f in d.iterdir() if f.name.endswith(".json"))
+        except OSError:
+            return 0
+
+    return (
+        _count(output_base / AUDIO_ERRORS_DIR),
+        _count(output_base / INFERENCE_ERRORS_DIR),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Formatting
 # ---------------------------------------------------------------------------
 
@@ -331,14 +358,32 @@ def _relative_time(epoch: float | None) -> str:
     return f"{delta / 86400:.1f}d ago"
 
 
+def _format_error_line(
+    audio_errors: int,
+    inference_errors: int,
+) -> str:
+    parts: list[str] = []
+    if audio_errors:
+        parts.append(f"{audio_errors} audio")
+    if inference_errors:
+        parts.append(f"{inference_errors} inference")
+    return f"Errors: {', '.join(parts)}" if parts else "Errors: 0"
+
+
 def format_heartbeat(
     heartbeat: FleetHeartbeat,
     disk_summary: object | None = None,
+    error_counts: tuple[int, int] | None = None,
 ) -> str:
     """Render a compact fleet dashboard.
 
-    *disk_summary* should be a ``progress.QuickSummary`` instance (or
-    ``None`` to omit the footer).
+    Footer modes (first match wins):
+
+    * *disk_summary* — full ``QuickSummary``: shows Completed, Partial,
+      and Errors.
+    * *error_counts* — ``(audio, inference)`` file counts: shows only
+      Errors (instant, no tree walk).
+    * Neither — no footer.
     """
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     title = f"Fleet heartbeat{' ' * 34}{now}"
@@ -410,16 +455,14 @@ def format_heartbeat(
         lines.append("")
         parts = [f"Completed: {disk_summary.complete:,}"]
         parts.append(f"Partial: {disk_summary.partial:,}")
-        err_parts: list[str] = []
-        if disk_summary.audio_error_records:
-            err_parts.append(f"{disk_summary.audio_error_records} audio")
-        if disk_summary.inference_error_records:
-            err_parts.append(f"{disk_summary.inference_error_records} inference")
-        if err_parts:
-            parts.append(f"Errors: {', '.join(err_parts)}")
-        else:
-            parts.append("Errors: 0")
+        parts.append(_format_error_line(
+            disk_summary.audio_error_records,
+            disk_summary.inference_error_records,
+        ))
         lines.append("  |  ".join(parts))
+    elif error_counts is not None:
+        lines.append("")
+        lines.append(_format_error_line(*error_counts))
 
     lines.append("")
     return "\n".join(lines)

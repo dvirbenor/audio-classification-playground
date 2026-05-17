@@ -322,18 +322,25 @@ def _cmd_timings(args: argparse.Namespace) -> None:
 def _cmd_status(args: argparse.Namespace) -> None:
     from .heartbeat import (
         build_fleet_heartbeat,
+        count_error_files,
         format_heartbeat,
         load_recent_timings,
         parse_active_locks,
     )
-    from .progress import quick_disk_summary
 
     output_base = Path(args.output)
     locks = parse_active_locks(output_base)
     timings = load_recent_timings(output_base, tail=args.tail)
     heartbeat = build_fleet_heartbeat(locks, timings)
-    disk = quick_disk_summary(output_base)
-    print(format_heartbeat(heartbeat, disk_summary=disk))
+
+    if args.summary:
+        from .progress import quick_disk_summary
+
+        disk = quick_disk_summary(output_base)
+        print(format_heartbeat(heartbeat, disk_summary=disk))
+    else:
+        errors = count_error_files(output_base)
+        print(format_heartbeat(heartbeat, error_counts=errors))
 
 
 def _cmd_reclaim_stale(args: argparse.Namespace) -> None:
@@ -424,6 +431,8 @@ def main(argv: list[str] | None = None) -> None:
     p_status.add_argument("--output", required=True, help="EFS output base directory")
     p_status.add_argument("--tail", type=int, default=20,
                           help="Recent timing records per worker for pace calculation")
+    p_status.add_argument("--summary", action="store_true",
+                          help="Include completed/partial counts (slower, walks output tree)")
 
     # --- reclaim-stale ---
     p_reclaim = sub.add_parser("reclaim-stale", help="Remove orphan lock files")

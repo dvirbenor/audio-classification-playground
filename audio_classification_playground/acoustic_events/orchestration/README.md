@@ -249,9 +249,9 @@ Inference errors:  93 records across 14 archives
 (--fast mode: totals/remaining unavailable without --parquet)
 ```
 
-This walks the output tree with `os.scandir` and the `_meta/` directories.
-No manifest loading, no per-entity probing.  Finishes in seconds even on
-EFS with hundreds of thousands of archives.
+This walks the output tree using `find(1)` for speed on network filesystems
+(falls back to `os.scandir` if `find` is unavailable).  No manifest loading,
+no per-entity probing.
 
 ### Full progress (with `--parquet`)
 
@@ -369,7 +369,8 @@ concatenated or moved.
 
 A compact, at-a-glance dashboard showing which pods are alive, how many
 archives each has completed, and the current processing pace.  No parquet
-or manifest required — reads only `_meta/` on EFS.
+or manifest required — reads only `_meta/` flat directories on EFS,
+so it completes instantly even with hundreds of thousands of archives.
 
 ```bash
 python -m audio_classification_playground.acoustic_events.orchestration status \
@@ -379,16 +380,29 @@ python -m audio_classification_playground.acoustic_events.orchestration status \
 Sample output:
 
 ```
-Fleet heartbeat                              2026-05-15 02:45:12 UTC
+Fleet heartbeat                              2026-05-17 09:30:00 UTC
 ================================================================
 
-Worker                  Locks  Done  Last activity  Pace (arc/h)
-----------------------  -----  ----  -------------  ------------
-pod-gpu-abc123_3f8a         4   312  12s ago              ~48.2
-pod-gpu-def456_a1b2         4   287  3s ago               ~45.7
-pod-gpu-ghi789_c9d0         3   301  47s ago              ~47.0
-----------------------  -----  ----  -------------  ------------
-Fleet (3 workers)          11   900                      ~140.9
+Worker          Locks  Done  Last activity  Pace (arc/h)
+--------------------------------------------------------
+pod-gpu-abc123      4   512  12s ago              ~48.2
+pod-gpu-def456      4   300  3s ago               ~51.4
+pod-gpu-ghi789      3   301  47s ago              ~47.0
+--------------------------------------------------------
+Fleet (3 workers)     11  1,113                      ~146.6
+
+Errors: 7 audio, 2 inference
+```
+
+Add `--summary` for completed/partial counts (triggers a tree walk, slower):
+
+```bash
+python -m audio_classification_playground.acoustic_events.orchestration status \
+    --output /efs/.../models-inference --summary
+```
+
+```
+...same table...
 
 Completed: 14,203  |  Partial: 42  |  Errors: 7 audio, 2 inference
 ```
@@ -405,6 +419,7 @@ Completed: 14,203  |  Partial: 42  |  Errors: 7 audio, 2 inference
 | Flag | Description |
 |---|---|
 | `--tail N` | Number of recent timing records per worker for pace calculation (default: 20) |
+| `--summary` | Include completed/partial counts from disk (walks the output tree) |
 
 For continuous monitoring, wrap with `watch`:
 
