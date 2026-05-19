@@ -3,6 +3,7 @@ import torch
 
 from audio_classification_playground.vox_profile.wavlm_inference import (
     prepare_wavlm_large_inputs,
+    stream_wavlm_weighted_features,
 )
 from audio_classification_playground.acoustic_events.inference.audio import (
     frame_audio,
@@ -89,3 +90,62 @@ def test_writable_contiguous_float32_copies_readonly_framed_views():
     assert batch.flags.writeable
     assert batch.dtype == np.float32
     torch.from_numpy(batch)
+
+
+def test_stream_wavlm_weighted_features_matches_hidden_state_stack():
+    from transformers import WavLMConfig, WavLMModel
+
+    for stable_layer_norm in (False, True):
+        torch.manual_seed(0)
+        config = WavLMConfig(
+            conv_dim=(4,),
+            conv_kernel=(3,),
+            conv_stride=(2,),
+            hidden_size=8,
+            intermediate_size=16,
+            num_attention_heads=2,
+            num_hidden_layers=2,
+            num_conv_pos_embeddings=4,
+            num_conv_pos_embedding_groups=1,
+            mask_time_prob=0.0,
+            mask_feature_prob=0.0,
+            hidden_dropout=0.0,
+            feat_proj_dropout=0.0,
+            attention_dropout=0.0,
+            layerdrop=0.0,
+            do_stable_layer_norm=stable_layer_norm,
+        )
+        model = WavLMModel(config).eval()
+        input_values = torch.randn(2, 20)
+        weights = torch.randn(config.num_hidden_layers + 1)
+
+        with torch.inference_mode():
+            hidden_states = model(input_values, output_hidden_states=True).hidden_states
+            stacked = torch.stack(hidden_states, dim=0)
+            expected = (
+                torch.nn.functional.softmax(weights, dim=-1).view(-1, 1, 1, 1)
+                * stacked
+            ).sum(dim=0)
+            actual = stream_wavlm_weighted_features(
+                model,
+                input_values,
+                weights,
+                use_conv_output=True,
+            )
+
+        assert torch.allclose(actual, expected, atol=1e-6, rtol=1e-6)
+
+        no_conv_weights = torch.randn(config.num_hidden_layers)
+        with torch.inference_mode():
+            expected_no_conv = (
+                torch.nn.functional.softmax(no_conv_weights, dim=-1).view(-1, 1, 1, 1)
+                * stacked[1:]
+            ).sum(dim=0)
+            actual_no_conv = stream_wavlm_weighted_features(
+                model,
+                input_values,
+                no_conv_weights,
+                use_conv_output=False,
+            )
+
+        assert torch.allclose(actual_no_conv, expected_no_conv, atol=1e-6, rtol=1e-6)

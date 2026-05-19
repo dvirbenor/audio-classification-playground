@@ -17,6 +17,7 @@ from audio_classification_playground.acoustic_events.inference.audio import fram
 from audio_classification_playground.acoustic_events.inference.models import (
     AffectPredictor,
     DisfluencyPredictor,
+    ModelSuite,
     configure_torch_matmul,
 )
 from audio_classification_playground.acoustic_events.inference.runners import (
@@ -88,7 +89,39 @@ def ensure_windows(audio, window_sec: float, min_windows: int, max_windows: int 
     return windows
 
 
+class PredictorHandle:
+    def __init__(self, predictor, owner=None):
+        self.predictor = predictor
+        self.owner = owner
+
+    def __call__(self, windows: np.ndarray):
+        return self.predictor(windows)
+
+
 def make_predictor(task: str, args: argparse.Namespace, *, candidate: bool):
+    runtime_kwargs = {}
+    if candidate:
+        runtime_kwargs.update(
+            wavlm_autocast_dtype=args.candidate_autocast_dtype,
+            wavlm_compile=args.candidate_compile,
+            wavlm_compile_mode=args.candidate_compile_mode,
+            wavlm_compile_dynamic=args.candidate_compile_dynamic,
+            wavlm_stream_layer_sum=args.candidate_stream_layer_sum,
+            allow_tf32=args.candidate_allow_tf32,
+        )
+    if args.resident_suite:
+        suite = ModelSuite(
+            affect_backbone="wavlm",
+            disfluency_backbone="wavlm",
+            batch_size=args.batch_size,
+            emotion_batch_size=args.emotion_batch_size,
+            device=args.device,
+            load_vad=False,
+            **runtime_kwargs,
+        )
+        predictor = suite.affect if task == "affect" else suite.disfluency
+        return PredictorHandle(predictor, owner=suite)
+
     kwargs = {
         "backbone": "wavlm",
         "device": args.device,
@@ -100,9 +133,10 @@ def make_predictor(task: str, args: argparse.Namespace, *, candidate: bool):
             wavlm_compile=args.candidate_compile,
             wavlm_compile_mode=args.candidate_compile_mode,
             wavlm_compile_dynamic=args.candidate_compile_dynamic,
+            wavlm_stream_layer_sum=args.candidate_stream_layer_sum,
         )
     cls = AffectPredictor if task == "affect" else DisfluencyPredictor
-    return cls(**kwargs)
+    return PredictorHandle(cls(**kwargs))
 
 
 def run_predictor(predictor, windows: np.ndarray, *, device: str) -> dict:
@@ -171,11 +205,14 @@ def run_task(task: str, windows: np.ndarray, args: argparse.Namespace) -> dict:
         "task": task,
         "window_count": int(len(windows)),
         "batch_size": args.batch_size,
+        "resident_suite": args.resident_suite,
+        "emotion_batch_size": args.emotion_batch_size if args.resident_suite else None,
         "candidate": {
             "autocast_dtype": args.candidate_autocast_dtype,
             "compile": args.candidate_compile,
             "compile_mode": args.candidate_compile_mode,
             "compile_dynamic": args.candidate_compile_dynamic,
+            "stream_layer_sum": args.candidate_stream_layer_sum,
             "allow_tf32": args.candidate_allow_tf32,
         },
         "status": "ok",
@@ -223,6 +260,12 @@ def run_task(task: str, windows: np.ndarray, args: argparse.Namespace) -> dict:
             result["baseline"]["elapsed_sec"]
             / max(result["candidate_run"]["elapsed_sec"], 1e-12)
         )
+        result["baseline_windows_per_sec"] = (
+            result["window_count"] / max(result["baseline"]["elapsed_sec"], 1e-12)
+        )
+        result["candidate_windows_per_sec"] = (
+            result["window_count"] / max(result["candidate_run"]["elapsed_sec"], 1e-12)
+        )
         result["time_saved_fraction"] = 1.0 - (
             result["candidate_run"]["elapsed_sec"]
             / max(result["baseline"]["elapsed_sec"], 1e-12)
@@ -255,6 +298,17 @@ def main() -> None:
         default=["affect", "disfluency"],
     )
     parser.add_argument("--batch-size", type=int, default=512)
+    parser.add_argument(
+        "--resident-suite",
+        action="store_true",
+        help="Load the full production ModelSuite so idle models remain in VRAM during the task run.",
+    )
+    parser.add_argument(
+        "--emotion-batch-size",
+        type=int,
+        default=64,
+        help="Emotion batch size used when --resident-suite loads the production ModelSuite.",
+    )
     parser.add_argument("--min-windows", type=int, default=512)
     parser.add_argument(
         "--max-windows",
@@ -266,6 +320,7 @@ def main() -> None:
     parser.add_argument("--candidate-compile", action="store_true")
     parser.add_argument("--candidate-compile-mode", default="reduce-overhead")
     parser.add_argument("--candidate-compile-dynamic", action="store_true")
+    parser.add_argument("--candidate-stream-layer-sum", action="store_true")
     parser.add_argument("--candidate-allow-tf32", action="store_true")
     parser.add_argument("--atol", type=float, default=1e-3)
     parser.add_argument("--rtol", type=float, default=1e-3)

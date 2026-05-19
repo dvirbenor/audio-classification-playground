@@ -11,6 +11,7 @@ from transformers import WavLMModel
 
 from audio_classification_playground.vox_profile.wavlm_inference import (
     prepare_wavlm_large_inputs,
+    stream_wavlm_weighted_features,
 )
 
 class WavLMEncoderLayer(nn.Module):
@@ -217,6 +218,55 @@ class WavLMWrapper(
                 nn.Linear(hidden_dim, 2)
             )
         
+    def _weighted_features_from_hidden_states(self, hidden_states):
+        if self.use_conv_output:
+            stacked_feature = torch.stack(hidden_states, dim=0)
+        else:
+            stacked_feature = torch.stack(hidden_states, dim=0)[1:]
+
+        _, *origin_shape = stacked_feature.shape
+        if self.use_conv_output:
+            stacked_feature = stacked_feature.view(
+                self.backbone_model.config.num_hidden_layers + 1,
+                -1,
+            )
+        else:
+            stacked_feature = stacked_feature.view(
+                self.backbone_model.config.num_hidden_layers,
+                -1,
+            )
+        norm_weights = F.softmax(self.weights, dim=-1)
+        weighted_feature = (norm_weights.unsqueeze(-1) * stacked_feature).sum(dim=0)
+        return weighted_feature.view(*origin_shape)
+
+    def _predict_from_features(self, features, length=None, return_feature=False):
+        # B x T x D
+        features = features.transpose(1, 2)
+        features = self.model_seq(features)
+        features = features.transpose(1, 2)
+
+        # Pooling
+        if length is not None:
+            mean, std = list(), list()
+            for snt_id in range(features.shape[0]):
+                # Avoiding padded time steps
+                actual_size = length[snt_id]
+                mean.append(torch.mean(features[snt_id, 0:actual_size, ...], dim=0))
+            features = torch.stack(mean)
+        else:
+            features = torch.mean(features, dim=1)
+
+        # B x D
+        arousal             = self.arousal_layer(features)
+        valence             = self.valence_layer(features)
+        dominance           = self.dominance_layer(features)
+
+        if(self.predict_gender):
+            gender_outputs = self.gender_layer(features)
+            return arousal, valence, dominance, gender_outputs
+
+        return arousal, valence, dominance
+
     def forward(self, x, length=None, return_feature=False):
         model_device = next(self.backbone_model.parameters()).device
         # 1. feature extraction and projections
@@ -236,61 +286,36 @@ class WavLMWrapper(
 
         if self.pretrain_model == "wavlm": 
             x = x.to(model_device)
-            x = self.backbone_model(
-                x, output_hidden_states=True
-            ).hidden_states
+            if getattr(self, "wavlm_stream_layer_sum", False):
+                features = stream_wavlm_weighted_features(
+                    self.backbone_model,
+                    x,
+                    self.weights,
+                    use_conv_output=self.use_conv_output,
+                )
+            else:
+                x = self.backbone_model(
+                    x, output_hidden_states=True
+                ).hidden_states
+                features = self._weighted_features_from_hidden_states(x)
         else: 
-            x = self.backbone_model(
-                signal, 
-                attention_mask=attention_mask, 
-                output_hidden_states=True
-            ).hidden_states
-        
-        # 4. stacked feature
-        if self.use_conv_output: stacked_feature = torch.stack(x, dim=0)
-        else: stacked_feature = torch.stack(x, dim=0)[1:]
-        
-        # 5. Weighted sum
-        _, *origin_shape = stacked_feature.shape
-        # Return transformer enc outputs [num_enc_layers, B, T, D]
-        if self.use_conv_output:
-            stacked_feature = stacked_feature.view(self.backbone_model.config.num_hidden_layers+1, -1)
-        else:
-            stacked_feature = stacked_feature.view(self.backbone_model.config.num_hidden_layers, -1)
-        norm_weights = F.softmax(self.weights, dim=-1)
-        
-        # Perform weighted average
-        weighted_feature = (norm_weights.unsqueeze(-1) * stacked_feature).sum(dim=0)
-        features = weighted_feature.view(*origin_shape)
-        
-        # 6. Pass the weighted average to point-wise 1D Conv
-        # B x T x D
-        features = features.transpose(1, 2)
-        features = self.model_seq(features)
-        features = features.transpose(1, 2)
-        
-        # 7. Pooling
-        if length is not None:
-            mean, std = list(), list()
-            for snt_id in range(features.shape[0]):
-                # Avoiding padded time steps
-                actual_size = length[snt_id]
-                mean.append(torch.mean(features[snt_id, 0:actual_size, ...], dim=0))
-            features = torch.stack(mean)
-        else:
-            features = torch.mean(features, dim=1)
+            if getattr(self, "wavlm_stream_layer_sum", False):
+                features = stream_wavlm_weighted_features(
+                    self.backbone_model,
+                    signal,
+                    self.weights,
+                    attention_mask=attention_mask,
+                    use_conv_output=self.use_conv_output,
+                )
+            else:
+                x = self.backbone_model(
+                    signal,
+                    attention_mask=attention_mask,
+                    output_hidden_states=True
+                ).hidden_states
+                features = self._weighted_features_from_hidden_states(x)
 
-        # 8. Output predictions
-        # B x D
-        arousal             = self.arousal_layer(features)
-        valence             = self.valence_layer(features)
-        dominance           = self.dominance_layer(features)
-        
-        if(self.predict_gender):
-            gender_outputs = self.gender_layer(features)
-            return arousal, valence, dominance, gender_outputs
-        
-        return arousal, valence, dominance
+        return self._predict_from_features(features, length=length, return_feature=return_feature)
     
     # From huggingface
     def get_feat_extract_output_lengths(self, input_length):
