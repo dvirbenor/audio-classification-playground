@@ -27,8 +27,8 @@ from .artifacts import (
     load_prediction_artifact,
     write_prediction_artifact,
 )
-from .audio import AudioData, frame_audio, load_audio
-from .emotion2vec import predict_emotion2vec_scores
+from .audio import AudioData, count_audio_frames, frame_audio, load_audio
+from .emotion2vec import predict_emotion2vec_scores, predict_emotion2vec_scores_from_audio
 from .log import get_logger
 
 
@@ -249,6 +249,10 @@ def run_emotion_inference(
     sample_rate: int = SAMPLE_RATE,
     batch_size: int = 128,
     device: str | None = None,
+    autocast_dtype: str | None = None,
+    compile_model: bool = False,
+    compile_mode: str = "reduce-overhead",
+    allow_tf32: bool = False,
     predictor: Callable[[np.ndarray], tuple[np.ndarray, Sequence[str]]] | None = None,
     progress: ProgressFn | None = None,
     cleanup_cuda: Callable[[], None] | None = None,
@@ -267,33 +271,59 @@ def run_emotion_inference(
         hop_sec=hop_sec,
         batch_size=batch_size,
         transform_policy="emotion2vec_fold_row_normalize_v1",
+        extra=_emotion_runtime_config_extra(
+            autocast_dtype=autocast_dtype,
+            compile_model=compile_model,
+            compile_mode=compile_mode,
+            allow_tf32=allow_tf32,
+        ),
     )
     cached = _maybe_cached(out_dir, audio, "emotion", config, reuse_cache, artifact_path)
     if cached is not None:
         _progress(progress, f"emotion cache hit: {cached.path}")
         return TaskRun(cached, True)
 
-    _progress(progress, "emotion framing audio")
-    windows = frame_audio(
+    n_windows = count_audio_frames(
         audio.samples,
         sample_rate=sample_rate,
         window_sec=window_sec,
         hop_sec=hop_sec,
     )
-    _progress(progress, f"emotion windows: {len(windows)}")
+    _progress(progress, f"emotion windows: {n_windows}")
     try:
-        raw_scores, raw_labels = (
-            predictor(windows)
-            if predictor is not None
-            else _predict_emotion2vec(
-                windows,
-                model_id=model_id,
+        predict_audio = getattr(predictor, "predict_audio", None) if predictor is not None else None
+        if callable(predict_audio):
+            raw_scores, raw_labels = predict_audio(
+                audio.samples,
                 sample_rate=sample_rate,
-                batch_size=batch_size,
-                device=device,
+                window_sec=window_sec,
+                hop_sec=hop_sec,
                 progress=progress,
             )
-        )
+        elif predictor is not None:
+            _progress(progress, "emotion framing audio")
+            windows = frame_audio(
+                audio.samples,
+                sample_rate=sample_rate,
+                window_sec=window_sec,
+                hop_sec=hop_sec,
+            )
+            raw_scores, raw_labels = predictor(windows)
+        else:
+            raw_scores, raw_labels = _predict_emotion2vec(
+                audio.samples,
+                model_id=model_id,
+                sample_rate=sample_rate,
+                window_sec=window_sec,
+                hop_sec=hop_sec,
+                batch_size=batch_size,
+                device=device,
+                autocast_dtype=autocast_dtype,
+                compile_model=compile_model,
+                compile_mode=compile_mode,
+                allow_tf32=allow_tf32,
+                progress=progress,
+            )
         probabilities, labels = emotion2vec_scores_to_probabilities(raw_scores, raw_labels)
         artifact = _write_task_artifact(
             out_dir,
@@ -305,7 +335,7 @@ def run_emotion_inference(
                 "family": "emotion2vec",
                 "id": model_id,
             },
-            timing=_timing(sample_rate, window_sec, hop_sec, len(windows)),
+            timing=_timing(sample_rate, window_sec, hop_sec, n_windows),
             runtime=_runtime(device=device, batch_size=batch_size),
             labels=labels,
             artifact_path=artifact_path,
@@ -427,6 +457,10 @@ def run_all_inference(
     vad_threshold: float = DEFAULT_VAD_SPEECH_THRESHOLD,
     vad_min_speech_sec: float = DEFAULT_VAD_MIN_SPEECH_SEC,
     vad_min_silence_sec: float = DEFAULT_VAD_MIN_SILENCE_SEC,
+    emotion_autocast_dtype: str | None = None,
+    emotion_compile: bool = False,
+    emotion_compile_mode: str = "reduce-overhead",
+    allow_tf32: bool = False,
     progress: ProgressFn | None = None,
     predictors: Mapping[str, Callable] | None = None,
     vad_detector: Callable[[np.ndarray, int], Sequence[tuple[float, float]]] | None = None,
@@ -555,6 +589,10 @@ def run_all_inference(
                 reuse_cache=reuse_cache,
                 batch_size=resolved_batches["emotion"],
                 device=device,
+                autocast_dtype=emotion_autocast_dtype,
+                compile_model=emotion_compile,
+                compile_mode=emotion_compile_mode,
+                allow_tf32=allow_tf32,
                 predictor=predictors.get("emotion"),
                 progress=progress,
                 cleanup_cuda=cleanup_cuda,
@@ -655,6 +693,24 @@ def resolve_task_batch_sizes(
         if value <= 0:
             raise ValueError(f"{task} batch size must be positive")
     return batches
+
+
+def _emotion_runtime_config_extra(
+    *,
+    autocast_dtype: str | None,
+    compile_model: bool,
+    compile_mode: str,
+    allow_tf32: bool,
+) -> dict[str, object]:
+    extra: dict[str, object] = {}
+    if autocast_dtype is not None:
+        extra["torch_autocast_dtype"] = autocast_dtype
+    if compile_model:
+        extra["torch_compile"] = True
+        extra["torch_compile_mode"] = compile_mode
+    if allow_tf32:
+        extra["torch_allow_tf32"] = True
+    return extra
 
 
 def cleanup_torch_memory() -> None:
@@ -945,7 +1001,9 @@ def _predict_affect(
     arousal, valence, dominance = [], [], []
     with torch.inference_mode():
         for batch_np in _batches(windows, batch_size, progress, "affect"):
-            batch = torch.from_numpy(np.ascontiguousarray(batch_np)).to(run_device)
+            batch = torch.from_numpy(np.ascontiguousarray(batch_np))
+            if backbone != "wavlm":
+                batch = batch.to(run_device)
             a, v, d = model(batch)
             arousal.append(a.detach().cpu().reshape(-1).numpy())
             valence.append(v.detach().cpu().reshape(-1).numpy())
@@ -974,7 +1032,9 @@ def _predict_disfluency(
     fluency, dysfluency = [], []
     with torch.inference_mode():
         for batch_np in _batches(windows, batch_size, progress, "disfluency"):
-            batch = torch.from_numpy(np.ascontiguousarray(batch_np)).to(run_device)
+            batch = torch.from_numpy(np.ascontiguousarray(batch_np))
+            if backbone != "wavlm":
+                batch = batch.to(run_device)
             f, d = model(batch, return_feature=False)
             fluency.append(f.detach().cpu().numpy())
             dysfluency.append(d.detach().cpu().numpy())
@@ -985,15 +1045,24 @@ def _predict_disfluency(
 
 
 def _predict_emotion2vec(
-    windows: np.ndarray,
+    samples: np.ndarray,
     *,
     model_id: str,
     sample_rate: int,
+    window_sec: float,
+    hop_sec: float,
     batch_size: int,
     device: str | None,
+    autocast_dtype: str | None,
+    compile_model: bool,
+    compile_mode: str,
+    allow_tf32: bool,
     progress: ProgressFn | None,
 ) -> tuple[np.ndarray, Sequence[str]]:
     from funasr import AutoModel
+    from .models import configure_torch_matmul
+
+    configure_torch_matmul(allow_tf32=allow_tf32)
 
     auto_kwargs = {
         "model": model_id,
@@ -1004,11 +1073,18 @@ def _predict_emotion2vec(
     if device is not None:
         auto_kwargs["device"] = device
     model = AutoModel(**auto_kwargs)
-    return predict_emotion2vec_scores(
+    if compile_model:
+        import torch
+
+        model.model = torch.compile(model.model, mode=compile_mode)
+    return predict_emotion2vec_scores_from_audio(
         model,
-        windows,
+        samples,
         sample_rate=sample_rate,
+        window_sec=window_sec,
+        hop_sec=hop_sec,
         batch_size=batch_size,
+        autocast_dtype=autocast_dtype,
         progress=progress,
     )
 

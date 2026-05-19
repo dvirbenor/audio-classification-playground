@@ -26,7 +26,10 @@ from typing import Sequence
 import numpy as np
 
 from .artifacts import SAMPLE_RATE
-from .emotion2vec import predict_emotion2vec_scores
+from .emotion2vec import (
+    predict_emotion2vec_scores,
+    predict_emotion2vec_scores_from_audio,
+)
 from .log import get_logger
 from .runners import (
     DEFAULT_AFFECT_MODELS,
@@ -50,6 +53,19 @@ def _batches(windows: np.ndarray, batch_size: int, task: str):
     n = len(windows)
     for start in range(0, n, batch_size):
         yield windows[start : min(start + batch_size, n)]
+
+
+def configure_torch_matmul(*, allow_tf32: bool) -> None:
+    """Apply process-wide torch matmul precision knobs for inference workers."""
+    if not allow_tf32:
+        return
+    try:
+        import torch
+
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.set_float32_matmul_precision("high")
+    except Exception:
+        LOGGER.warning("Could not enable TF32 matmul settings", exc_info=True)
 
 
 class AffectPredictor:
@@ -82,7 +98,9 @@ class AffectPredictor:
         arousal, valence, dominance = [], [], []
         with torch.inference_mode():
             for batch_np in _batches(windows, self.batch_size, "affect"):
-                batch = torch.from_numpy(np.ascontiguousarray(batch_np)).to(self._device)
+                batch = torch.from_numpy(np.ascontiguousarray(batch_np))
+                if self.backbone != "wavlm":
+                    batch = batch.to(self._device)
                 a, v, d = self._model(batch)
                 arousal.append(a.detach().cpu().reshape(-1).numpy())
                 valence.append(v.detach().cpu().reshape(-1).numpy())
@@ -124,7 +142,9 @@ class DisfluencyPredictor:
         fluency, dysfluency = [], []
         with torch.inference_mode():
             for batch_np in _batches(windows, self.batch_size, "disfluency"):
-                batch = torch.from_numpy(np.ascontiguousarray(batch_np)).to(self._device)
+                batch = torch.from_numpy(np.ascontiguousarray(batch_np))
+                if self.backbone != "wavlm":
+                    batch = batch.to(self._device)
                 f, d = self._model(batch, return_feature=False)
                 fluency.append(f.detach().cpu().numpy())
                 dysfluency.append(d.detach().cpu().numpy())
@@ -146,6 +166,9 @@ class EmotionPredictor:
         sample_rate: int = SAMPLE_RATE,
         batch_size: int = 512,
         device: str | None = None,
+        autocast_dtype: str | None = None,
+        compile_model: bool = False,
+        compile_mode: str = "reduce-overhead",
     ) -> None:
         from funasr import AutoModel
 
@@ -153,6 +176,9 @@ class EmotionPredictor:
         self.sample_rate = sample_rate
         self.batch_size = batch_size
         self._device = device
+        self.autocast_dtype = autocast_dtype
+        self.compile_model = bool(compile_model)
+        self.compile_mode = compile_mode
         auto_kwargs = {
             "model": model_id,
             "batch_size": batch_size,
@@ -162,7 +188,16 @@ class EmotionPredictor:
         if device is not None:
             auto_kwargs["device"] = device
         self._model = AutoModel(**auto_kwargs)
-        LOGGER.info("EmotionPredictor loaded: %s", model_id)
+        if self.compile_model:
+            import torch
+
+            self._model.model = torch.compile(self._model.model, mode=compile_mode)
+        LOGGER.info(
+            "EmotionPredictor loaded: %s autocast=%s compile=%s",
+            model_id,
+            autocast_dtype,
+            self.compile_model,
+        )
 
     def __call__(self, windows: np.ndarray) -> tuple[np.ndarray, Sequence[str]]:
         return predict_emotion2vec_scores(
@@ -170,6 +205,31 @@ class EmotionPredictor:
             windows,
             sample_rate=self.sample_rate,
             batch_size=self.batch_size,
+            autocast_dtype=self.autocast_dtype,
+        )
+
+    def predict_audio(
+        self,
+        samples: np.ndarray,
+        *,
+        sample_rate: int,
+        window_sec: float,
+        hop_sec: float,
+        progress: ProgressFn | None = None,
+    ) -> tuple[np.ndarray, Sequence[str]]:
+        if int(sample_rate) != int(self.sample_rate):
+            raise ValueError(
+                f"EmotionPredictor loaded for {self.sample_rate} Hz, got {sample_rate} Hz"
+            )
+        return predict_emotion2vec_scores_from_audio(
+            self._model,
+            samples,
+            sample_rate=self.sample_rate,
+            window_sec=window_sec,
+            hop_sec=hop_sec,
+            batch_size=self.batch_size,
+            autocast_dtype=self.autocast_dtype,
+            progress=progress,
         )
 
 
@@ -250,7 +310,12 @@ class ModelSuite:
         vad_min_speech_sec: float = DEFAULT_VAD_MIN_SPEECH_SEC,
         vad_min_silence_sec: float = DEFAULT_VAD_MIN_SILENCE_SEC,
         load_vad: bool = True,
+        emotion_autocast_dtype: str | None = None,
+        emotion_compile: bool = False,
+        emotion_compile_mode: str = "reduce-overhead",
+        allow_tf32: bool = False,
     ) -> None:
+        configure_torch_matmul(allow_tf32=allow_tf32)
         batches = resolve_task_batch_sizes(
             batch_size=batch_size,
             affect_batch_size=affect_batch_size,
@@ -263,7 +328,13 @@ class ModelSuite:
         self.disfluency = DisfluencyPredictor(
             backbone=disfluency_backbone, device=device, batch_size=batches["disfluency"],
         )
-        self.emotion = EmotionPredictor(batch_size=batches["emotion"], device=device)
+        self.emotion = EmotionPredictor(
+            batch_size=batches["emotion"],
+            device=device,
+            autocast_dtype=emotion_autocast_dtype,
+            compile_model=emotion_compile,
+            compile_mode=emotion_compile_mode,
+        )
         self._vad_config = dict(
             threshold=vad_threshold,
             min_speech_sec=vad_min_speech_sec,

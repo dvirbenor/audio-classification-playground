@@ -42,6 +42,10 @@ def main(argv: list[str] | None = None) -> int:
             disfluency_batch_size=args.disfluency_batch_size,
             emotion_batch_size=args.emotion_batch_size,
             device=args.device,
+            emotion_autocast_dtype=args.emotion_autocast_dtype,
+            emotion_compile=args.emotion_compile,
+            emotion_compile_mode=args.emotion_compile_mode,
+            allow_tf32=args.allow_tf32,
             vad_threshold=args.vad_threshold,
             vad_min_speech_sec=args.vad_min_speech_sec,
             vad_min_silence_sec=args.vad_min_silence_sec,
@@ -82,6 +86,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common_run_args(run_sub.add_parser("disfluency", help="Run disfluency inference."))
     run_sub.choices["disfluency"].add_argument("--backbone", choices=("wavlm", "whisper"), required=True)
     _add_common_run_args(run_sub.add_parser("emotion", help="Run emotion2vec inference."))
+    _add_emotion_runtime_options(run_sub.choices["emotion"])
     _add_common_run_args(run_sub.add_parser("vad", help="Run shared VAD."))
     _add_vad_options(run_sub.choices["vad"])
 
@@ -93,6 +98,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_all.add_argument("--affect-batch-size", type=int)
     run_all.add_argument("--disfluency-batch-size", type=int)
     run_all.add_argument("--emotion-batch-size", type=int)
+    _add_emotion_runtime_options(run_all)
     _add_vad_options(run_all)
 
     cached = sub.add_parser("list-cached", help="List complete cached artifacts.")
@@ -139,6 +145,26 @@ def _add_vad_options(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_emotion_runtime_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--emotion-autocast-dtype",
+        choices=("fp16", "bf16"),
+        default=None,
+        help="Opt-in autocast dtype for emotion2vec; benchmark before production use.",
+    )
+    parser.add_argument(
+        "--emotion-compile",
+        action="store_true",
+        help="Compile the emotion2vec inner torch model before inference.",
+    )
+    parser.add_argument("--emotion-compile-mode", default="reduce-overhead")
+    parser.add_argument(
+        "--allow-tf32",
+        action="store_true",
+        help="Enable TF32 matmul precision for supported NVIDIA GPUs.",
+    )
+
+
 def _run_single(args, progress):
     common = {
         "out_dir": args.out,
@@ -159,7 +185,15 @@ def _run_single(args, progress):
             args.audio, backbone=args.backbone, **common, **batch_kwargs,
         )
     if args.task == "emotion":
-        return run_emotion_inference(args.audio, **common, **batch_kwargs)
+        return run_emotion_inference(
+            args.audio,
+            autocast_dtype=args.emotion_autocast_dtype,
+            compile_model=args.emotion_compile,
+            compile_mode=args.emotion_compile_mode,
+            allow_tf32=args.allow_tf32,
+            **common,
+            **batch_kwargs,
+        )
     if args.task == "vad":
         return run_vad(
             args.audio,

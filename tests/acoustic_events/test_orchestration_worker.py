@@ -60,6 +60,9 @@ class WorkerAsyncVadTest(unittest.TestCase):
                 batch_size=512,
                 affect_batch_size=384,
                 emotion_batch_size=64,
+                emotion_autocast_dtype="bf16",
+                emotion_compile=True,
+                allow_tf32=True,
                 prefetch_lookahead=1,
                 vad_prefetch_workers=1,
             )
@@ -67,9 +70,15 @@ class WorkerAsyncVadTest(unittest.TestCase):
         self.assertEqual(model_kwargs[0]["affect_batch_size"], 384)
         self.assertEqual(model_kwargs[0]["disfluency_batch_size"], 512)
         self.assertEqual(model_kwargs[0]["emotion_batch_size"], 64)
+        self.assertEqual(model_kwargs[0]["emotion_autocast_dtype"], "bf16")
+        self.assertTrue(model_kwargs[0]["emotion_compile"])
+        self.assertTrue(model_kwargs[0]["allow_tf32"])
         self.assertEqual(run_kwargs[0]["affect_batch_size"], 384)
         self.assertEqual(run_kwargs[0]["disfluency_batch_size"], 512)
         self.assertEqual(run_kwargs[0]["emotion_batch_size"], 64)
+        self.assertEqual(run_kwargs[0]["emotion_autocast_dtype"], "bf16")
+        self.assertTrue(run_kwargs[0]["emotion_compile"])
+        self.assertTrue(run_kwargs[0]["allow_tf32"])
 
     def test_orchestration_emotion_batch_defaults_to_64(self):
         entity = ArchiveEntity("s1", "a1", "prefix")

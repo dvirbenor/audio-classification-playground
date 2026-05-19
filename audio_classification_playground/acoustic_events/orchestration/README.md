@@ -199,6 +199,37 @@ generate path. Explicit task flags always win:
 Tune these as rollout settings after profiling on the target GPU. Do not
 increase emotion back to 512 without a target-GPU VRAM check.
 
+The persistent worker uses an audio-fed emotion2vec path: decoded audio is
+copied to the model device once, and the same overlapping 3s / 0.25s windows
+are formed there before the normal `extract_features -> mean -> proj -> softmax`
+classification path. To verify equivalence and speed on a target GPU:
+
+```bash
+uv run python scripts/compare_emotion2vec_feed_path.py \
+    --device cuda --batch-size 64 --max-windows-per-file 160 /path/to/audio.wav
+```
+
+The script compares the old framed-window feed to the audio-fed feed and
+prints label equality, absolute-difference stats, top-1 agreement, and speedup.
+It can also test optional runtime knobs against the FP32 eager audio-fed path:
+
+```bash
+uv run python scripts/compare_emotion2vec_feed_path.py \
+    --device cuda --batch-size 64 \
+    --candidate-autocast-dtype bf16 \
+    --candidate-compile \
+    --candidate-allow-tf32 \
+    /path/to/audio.wav
+```
+
+Only enable these knobs for artifact production after the A/B output shows an
+acceptable `max_abs_diff` and `top1_agreement` on representative audio. When
+enabled in the worker, they are recorded in the emotion inference config:
+
+```bash
+--emotion-autocast-dtype bf16 --emotion-compile --allow-tf32
+```
+
 ### Config-Aware Completion
 
 With the flat output layout (`session/archive/task/`), the config hash is

@@ -87,6 +87,10 @@ def _cmd_run(args: argparse.Namespace) -> None:
         emotion_batch_size=args.emotion_batch_size,
         device=args.device,
         max_inference_attempts=args.max_retries,
+        emotion_autocast_dtype=args.emotion_autocast_dtype,
+        emotion_compile=args.emotion_compile,
+        emotion_compile_mode=args.emotion_compile_mode,
+        allow_tf32=args.allow_tf32,
         prefetch_workers=args.prefetch_workers,
         prefetch_lookahead=args.prefetch_lookahead,
         vad_prefetch_workers=args.vad_prefetch_workers,
@@ -379,6 +383,23 @@ def main(argv: list[str] | None = None) -> None:
     p_run.add_argument("--disfluency-batch-size", type=int, default=None)
     p_run.add_argument("--emotion-batch-size", type=int, default=None)
     p_run.add_argument("--device", default=None)
+    p_run.add_argument(
+        "--emotion-autocast-dtype",
+        choices=("fp16", "bf16"),
+        default=None,
+        help="Opt-in autocast dtype for emotion2vec; benchmark before production use.",
+    )
+    p_run.add_argument(
+        "--emotion-compile",
+        action="store_true",
+        help="Compile the persistent emotion2vec inner torch model once.",
+    )
+    p_run.add_argument("--emotion-compile-mode", default="reduce-overhead")
+    p_run.add_argument(
+        "--allow-tf32",
+        action="store_true",
+        help="Enable TF32 matmul precision for supported NVIDIA GPUs.",
+    )
     p_run.add_argument("--max-retries", type=int, default=3)
     p_run.add_argument("--prefetch-workers", type=int, default=4)
     p_run.add_argument("--prefetch-lookahead", type=int, default=4)

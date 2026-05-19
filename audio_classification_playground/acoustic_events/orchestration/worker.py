@@ -84,6 +84,24 @@ def _append_timing_record(jsonl_path: Path, record: dict) -> None:
         LOGGER.warning("Failed to write timing record to %s", jsonl_path, exc_info=True)
 
 
+def _emotion_runtime_config_extra(
+    *,
+    emotion_autocast_dtype: str | None,
+    emotion_compile: bool,
+    emotion_compile_mode: str,
+    allow_tf32: bool,
+) -> dict[str, object]:
+    extra: dict[str, object] = {}
+    if emotion_autocast_dtype is not None:
+        extra["torch_autocast_dtype"] = emotion_autocast_dtype
+    if emotion_compile:
+        extra["torch_compile"] = True
+        extra["torch_compile_mode"] = emotion_compile_mode
+    if allow_tf32:
+        extra["torch_allow_tf32"] = True
+    return extra
+
+
 def build_expected_configs(
     *,
     affect_backbone: str,
@@ -96,6 +114,10 @@ def build_expected_configs(
     vad_threshold: float = DEFAULT_VAD_SPEECH_THRESHOLD,
     vad_min_speech_sec: float = DEFAULT_VAD_MIN_SPEECH_SEC,
     vad_min_silence_sec: float = DEFAULT_VAD_MIN_SILENCE_SEC,
+    emotion_autocast_dtype: str | None = None,
+    emotion_compile: bool = False,
+    emotion_compile_mode: str = "reduce-overhead",
+    allow_tf32: bool = False,
 ) -> dict[str, dict]:
     """Compute expected inference configs for each task.
 
@@ -142,6 +164,12 @@ def build_expected_configs(
         hop_sec=DEFAULT_HOP_SEC,
         batch_size=batches["emotion"],
         transform_policy="emotion2vec_fold_row_normalize_v1",
+        extra=_emotion_runtime_config_extra(
+            emotion_autocast_dtype=emotion_autocast_dtype,
+            emotion_compile=emotion_compile,
+            emotion_compile_mode=emotion_compile_mode,
+            allow_tf32=allow_tf32,
+        ),
     )
     configs["vad"] = compute_inference_config(
         task="vad",
@@ -187,6 +215,10 @@ def run_worker(
     vad_threshold: float = DEFAULT_VAD_SPEECH_THRESHOLD,
     vad_min_speech_sec: float = DEFAULT_VAD_MIN_SPEECH_SEC,
     vad_min_silence_sec: float = DEFAULT_VAD_MIN_SILENCE_SEC,
+    emotion_autocast_dtype: str | None = None,
+    emotion_compile: bool = False,
+    emotion_compile_mode: str = "reduce-overhead",
+    allow_tf32: bool = False,
     prefetch_workers: int = PREFETCH_WORKERS,
     prefetch_lookahead: int = PREFETCH_LOOKAHEAD,
     vad_prefetch_workers: int = VAD_PREFETCH_WORKERS,
@@ -243,6 +275,10 @@ def run_worker(
         vad_threshold=vad_threshold,
         vad_min_speech_sec=vad_min_speech_sec,
         vad_min_silence_sec=vad_min_silence_sec,
+        emotion_autocast_dtype=emotion_autocast_dtype,
+        emotion_compile=emotion_compile,
+        emotion_compile_mode=emotion_compile_mode,
+        allow_tf32=allow_tf32,
     )
     expected_hashes = {
         task: inference_config_hash(cfg)
@@ -268,6 +304,10 @@ def run_worker(
         vad_min_speech_sec=vad_min_speech_sec,
         vad_min_silence_sec=vad_min_silence_sec,
         load_vad=vad_prefetch_workers == 0,
+        emotion_autocast_dtype=emotion_autocast_dtype,
+        emotion_compile=emotion_compile,
+        emotion_compile_mode=emotion_compile_mode,
+        allow_tf32=allow_tf32,
     )
 
     def _new_vad_detector():
@@ -429,6 +469,10 @@ def run_worker(
                     vad_threshold=vad_threshold,
                     vad_min_speech_sec=vad_min_speech_sec,
                     vad_min_silence_sec=vad_min_silence_sec,
+                    emotion_autocast_dtype=emotion_autocast_dtype,
+                    emotion_compile=emotion_compile,
+                    emotion_compile_mode=emotion_compile_mode,
+                    allow_tf32=allow_tf32,
                     predictors={
                         "affect": models.affect,
                         "disfluency": models.disfluency,

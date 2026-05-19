@@ -17,6 +17,7 @@ from audio_classification_playground.acoustic_events.inference import (
     load_prediction_artifact,
     run_affect_inference,
     run_all_inference,
+    run_emotion_inference,
     run_vad,
 )
 from audio_classification_playground.acoustic_events.inference.runners import (
@@ -371,6 +372,60 @@ class InferenceArtifactTest(unittest.TestCase):
         self.assertGreater(float(probs[0, labels.index("other")]), 0.1)
         with self.assertRaisesRegex(ValueError, "zero-score"):
             emotion2vec_scores_to_probabilities(np.zeros((1, len(EMOTION2VEC_LABELS))), EMOTION2VEC_LABELS)
+
+    def test_emotion_runner_uses_audio_feed_predictor_when_available(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audio_path = _write_audio(Path(tmp) / "clip.wav")
+            calls = []
+
+            class AudioFeedPredictor:
+                def __call__(self, windows):
+                    raise AssertionError("framed-window path should not be used")
+
+                def predict_audio(self, samples, *, sample_rate, window_sec, hop_sec, progress=None):
+                    calls.append(
+                        {
+                            "samples": len(samples),
+                            "sample_rate": sample_rate,
+                            "window_sec": window_sec,
+                            "hop_sec": hop_sec,
+                        }
+                    )
+                    return _fake_emotion(np.zeros((1, 1), dtype=np.float32))
+
+            result = run_emotion_inference(
+                audio_path,
+                out_dir=Path(tmp) / "artifacts",
+                predictor=AudioFeedPredictor(),
+                progress=_quiet,
+            )
+
+            self.assertFalse(result.reused)
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(calls[0]["sample_rate"], 16000)
+            self.assertEqual(
+                result.artifact.manifest["timing"]["n_frames"],
+                1,
+            )
+
+    def test_emotion_runtime_knobs_are_recorded_in_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audio_path = _write_audio(Path(tmp) / "clip.wav")
+            result = run_emotion_inference(
+                audio_path,
+                out_dir=Path(tmp) / "artifacts",
+                predictor=_fake_emotion,
+                autocast_dtype="bf16",
+                compile_model=True,
+                allow_tf32=True,
+                progress=_quiet,
+            )
+
+            config = result.artifact.manifest["inference_config"]
+            self.assertEqual(config["torch_autocast_dtype"], "bf16")
+            self.assertTrue(config["torch_compile"])
+            self.assertEqual(config["torch_compile_mode"], "reduce-overhead")
+            self.assertTrue(config["torch_allow_tf32"])
 
     def test_artifacts_adapt_to_existing_producers(self):
         with tempfile.TemporaryDirectory() as tmp:
