@@ -176,7 +176,7 @@ class DirectEmotion2vecScorer:
         *,
         compile_model: bool = False,
         compile_mode: str = "reduce-overhead",
-        ) -> None:
+    ) -> None:
         import torch
 
         self.auto_model = auto_model
@@ -213,9 +213,12 @@ class DirectEmotion2vecScorer:
     def __call__(self, batch, *, autocast_dtype: str | None = None):
         import torch
 
+        if self.compiled:
+            _mark_cudagraph_step_begin(torch, self.device)
         with _autocast_context(torch, self.device, autocast_dtype):
             scores = self.core(batch)
-        return scores.to(dtype=torch.float32)
+        scores = scores.to(dtype=torch.float32)
+        return scores.clone() if self.compiled else scores
 
     def predict_windows(
         self,
@@ -460,3 +463,12 @@ def _autocast_context(torch, device, dtype: str | None):
         "bfloat16": torch.bfloat16,
     }[dtype]
     return torch.autocast("cuda", dtype=resolved)
+
+
+def _mark_cudagraph_step_begin(torch, device) -> None:
+    if device is None or getattr(device, "type", None) != "cuda":
+        return
+    compiler = getattr(torch, "compiler", None)
+    mark = getattr(compiler, "cudagraph_mark_step_begin", None)
+    if mark is not None:
+        mark()

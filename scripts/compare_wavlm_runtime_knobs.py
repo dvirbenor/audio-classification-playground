@@ -99,6 +99,7 @@ class PredictorHandle:
 
 
 def make_predictor(task: str, args: argparse.Namespace, *, candidate: bool):
+    batch_size = args.candidate_batch_size if candidate else args.batch_size
     runtime_kwargs = {}
     if candidate:
         runtime_kwargs.update(
@@ -113,7 +114,7 @@ def make_predictor(task: str, args: argparse.Namespace, *, candidate: bool):
         suite = ModelSuite(
             affect_backbone="wavlm",
             disfluency_backbone="wavlm",
-            batch_size=args.batch_size,
+            batch_size=batch_size,
             emotion_batch_size=args.emotion_batch_size,
             device=args.device,
             load_vad=False,
@@ -125,7 +126,7 @@ def make_predictor(task: str, args: argparse.Namespace, *, candidate: bool):
     kwargs = {
         "backbone": "wavlm",
         "device": args.device,
-        "batch_size": args.batch_size,
+        "batch_size": batch_size,
     }
     if candidate:
         kwargs.update(
@@ -204,7 +205,8 @@ def run_task(task: str, windows: np.ndarray, args: argparse.Namespace) -> dict:
     result = {
         "task": task,
         "window_count": int(len(windows)),
-        "batch_size": args.batch_size,
+        "baseline_batch_size": args.batch_size,
+        "candidate_batch_size": args.candidate_batch_size,
         "resident_suite": args.resident_suite,
         "emotion_batch_size": args.emotion_batch_size if args.resident_suite else None,
         "candidate": {
@@ -217,7 +219,8 @@ def run_task(task: str, windows: np.ndarray, args: argparse.Namespace) -> dict:
         },
         "status": "ok",
     }
-    warmup_windows = windows[: min(args.batch_size, len(windows))]
+    warmup_window_count = min(max(args.batch_size, args.candidate_batch_size), len(windows))
+    warmup_windows = windows[:warmup_window_count]
 
     try:
         cuda_reset()
@@ -299,6 +302,11 @@ def main() -> None:
     )
     parser.add_argument("--batch-size", type=int, default=512)
     parser.add_argument(
+        "--candidate-batch-size",
+        type=int,
+        help="Candidate batch size. Defaults to --batch-size.",
+    )
+    parser.add_argument(
         "--resident-suite",
         action="store_true",
         help="Load the full production ModelSuite so idle models remain in VRAM during the task run.",
@@ -326,6 +334,8 @@ def main() -> None:
     parser.add_argument("--rtol", type=float, default=1e-3)
     parser.add_argument("--json-out")
     args = parser.parse_args()
+    if args.candidate_batch_size is None:
+        args.candidate_batch_size = args.batch_size
 
     audio = load_audio(args.audio, sample_rate=SAMPLE_RATE)
     report = {
