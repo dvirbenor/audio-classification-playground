@@ -6,6 +6,7 @@ import torch
 
 from audio_classification_playground.acoustic_events.inference.emotion2vec import (
     predict_emotion2vec_scores,
+    predict_emotion2vec_scores_from_audio,
 )
 
 
@@ -86,6 +87,41 @@ class Emotion2vecFastPathTest(unittest.TestCase):
         self.assertEqual(labels, ["happy", "sad"])
         self.assertEqual(scores.shape, (5, 2))
         np.testing.assert_allclose(scores.sum(axis=1), np.ones(5), rtol=1e-6)
+
+    def test_audio_feed_path_matches_framed_window_path(self):
+        sample_rate = 16_000
+        samples = np.arange(8, dtype=np.float32)
+        windows = np.asarray(
+            [
+                [0.0, 1.0, 2.0, 3.0],
+                [1.0, 2.0, 3.0, 4.0],
+                [2.0, 3.0, 4.0, 5.0],
+                [3.0, 4.0, 5.0, 6.0],
+                [4.0, 5.0, 6.0, 7.0],
+            ],
+            dtype=np.float32,
+        )
+
+        framed_model = FakeEmotion2vec()
+        framed_scores, framed_labels = predict_emotion2vec_scores(
+            FakeAutoModel(framed_model, ["happy", "unuse_blank", "sad"]),
+            windows,
+            sample_rate=sample_rate,
+            batch_size=2,
+        )
+        audio_model = FakeEmotion2vec()
+        audio_scores, audio_labels = predict_emotion2vec_scores_from_audio(
+            FakeAutoModel(audio_model, ["happy", "unuse_blank", "sad"]),
+            samples,
+            sample_rate=sample_rate,
+            window_sec=4 / sample_rate,
+            hop_sec=1 / sample_rate,
+            batch_size=2,
+        )
+
+        self.assertEqual(audio_model.calls, framed_model.calls)
+        self.assertEqual(audio_labels, framed_labels)
+        np.testing.assert_allclose(audio_scores, framed_scores, rtol=0.0, atol=0.0)
 
     def test_generate_fallback_sets_funasr_batch_size(self):
         auto_model = GenerateOnlyAutoModel()
