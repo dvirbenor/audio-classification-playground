@@ -4,6 +4,10 @@ import torch
 from audio_classification_playground.vox_profile.wavlm_inference import (
     prepare_wavlm_large_inputs,
 )
+from audio_classification_playground.acoustic_events.inference.audio import (
+    frame_audio,
+    writable_contiguous_float32,
+)
 
 
 class _FakeFeatureExtractor:
@@ -48,7 +52,7 @@ def test_prepare_wavlm_large_inputs_matches_legacy_per_window_loop():
 
     assert attention_mask is None
     assert legacy_processor.call_shapes == [(1, 4), (1, 4), (1, 4)]
-    assert batch_processor.call_shapes == [(3, 4)]
+    assert batch_processor.call_shapes == []
     assert torch.equal(signal, legacy)
 
 
@@ -67,3 +71,21 @@ def test_prepare_wavlm_large_inputs_preserves_length_masks_when_provided():
         [True, True, True, True, True],
         [True, True, True, False, False],
     ]
+
+
+def test_writable_contiguous_float32_copies_readonly_framed_views():
+    samples = np.arange(16_000, dtype=np.float32)
+    windows = frame_audio(
+        samples,
+        sample_rate=16_000,
+        window_sec=0.25,
+        hop_sec=0.125,
+    )
+
+    batch = writable_contiguous_float32(windows[:2])
+
+    assert not windows.flags.writeable
+    assert batch.flags.c_contiguous
+    assert batch.flags.writeable
+    assert batch.dtype == np.float32
+    torch.from_numpy(batch)

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 
+import numpy as np
 from speechbrain.integrations.huggingface import make_padding_masks
 
 _AUTOCAST_DTYPES = {"fp16", "bf16"}
@@ -18,19 +19,15 @@ def prepare_wavlm_large_inputs(
 ):
     """Prepare a whole WavLM-large batch with legacy-equivalent normalization.
 
-    The previous wrappers called ``processor`` once per window and stacked the
-    returned tensors.  ``Wav2Vec2FeatureExtractor`` supports batched raw-speech
-    input, so this keeps the same per-row normalization while avoiding a Python
-    loop and many device round-trips.
+    For fixed 16 kHz waveform windows, ``Wav2Vec2FeatureExtractor`` only
+    performs per-row zero-mean/unit-variance normalization before tensor
+    conversion.  The vectorized NumPy implementation below is bit-identical
+    for this fixed-window path and avoids the feature extractor's Python
+    padding/container overhead.
     """
-    inputs = processor(
-        x.detach().cpu().numpy(),
-        sampling_rate=sample_rate,
-        return_tensors="pt",
-        padding=True,
-    )
     target_device = x.device if device is None else device
-    signal = inputs["input_values"].to(target_device)
+    signal_np = _zero_mean_unit_var_norm(x.detach().cpu().numpy())
+    signal = x.new_tensor(signal_np, device=target_device)
 
     attention_mask = None
     if length is not None:
@@ -40,6 +37,14 @@ def prepare_wavlm_large_inputs(
         ).to(target_device)
 
     return signal, attention_mask
+
+
+def _zero_mean_unit_var_norm(values) -> np.ndarray:
+    """Match Wav2Vec2FeatureExtractor zero-mean/unit-var normalization."""
+    array = np.asarray(values, dtype=np.float32)
+    mean = array.mean(axis=1, keepdims=True)
+    var = array.var(axis=1, keepdims=True)
+    return ((array - mean) / np.sqrt(var + 1e-7)).astype(np.float32, copy=False)
 
 
 def validate_autocast_dtype(autocast_dtype: str | None) -> str | None:

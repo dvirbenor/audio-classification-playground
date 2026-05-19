@@ -19,7 +19,11 @@ import torch
 from speechbrain.integrations.huggingface import make_padding_masks
 
 from audio_classification_playground.acoustic_events.inference.artifacts import SAMPLE_RATE
-from audio_classification_playground.acoustic_events.inference.audio import frame_audio, load_audio
+from audio_classification_playground.acoustic_events.inference.audio import (
+    frame_audio,
+    load_audio,
+    writable_contiguous_float32,
+)
 from audio_classification_playground.acoustic_events.inference.runners import (
     AFFECT_WINDOW_SEC,
     DEFAULT_AFFECT_MODELS,
@@ -222,8 +226,9 @@ def run_task(args, audio, task: str) -> dict:
     module, model_id, window_sec = task_spec(task)
     cls = module.WavLMWrapper
     windows = ensure_windows(audio, window_sec, args.min_windows)
-    batch_np = np.ascontiguousarray(windows[: args.batch_size])
-    batch = torch.from_numpy(batch_np).to(args.device)
+    batch_np = writable_contiguous_float32(windows[: args.batch_size])
+    batch_cpu = torch.from_numpy(batch_np)
+    batch_gpu = batch_cpu.to(args.device)
 
     cuda_reset()
     result = {
@@ -245,9 +250,9 @@ def run_task(args, audio, task: str) -> dict:
             model,
             cls,
             legacy_forward_factory(module, task),
-            batch,
+            batch_gpu,
         )
-        current = run_forward(model, cls, cls.forward, batch)
+        current = run_forward(model, cls, cls.forward, batch_cpu)
         result["legacy"] = {k: v for k, v in legacy.items() if k != "outputs"}
         result["current"] = {k: v for k, v in current.items() if k != "outputs"}
         result["comparison"] = compare_outputs(legacy, current)
