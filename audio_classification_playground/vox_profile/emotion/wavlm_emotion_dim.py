@@ -2,13 +2,16 @@ import torch
 import numpy as np
 import loralib as lora
 import transformers.models.wavlm.modeling_wavlm as wavlm
-from speechbrain.integrations.huggingface import make_padding_masks
 
 from torch import nn
 from torch.nn import functional as F
 from huggingface_hub import PyTorchModelHubMixin
 from transformers import Wav2Vec2FeatureExtractor
 from transformers import WavLMModel
+
+from audio_classification_playground.vox_profile.wavlm_inference import (
+    prepare_wavlm_large_inputs,
+)
 
 class WavLMEncoderLayer(nn.Module):
     def __init__(self, layer_idx, config, has_relative_position_bias: bool = True):
@@ -215,24 +218,24 @@ class WavLMWrapper(
             )
         
     def forward(self, x, length=None, return_feature=False):
+        model_device = next(self.backbone_model.parameters()).device
         # 1. feature extraction and projections
         if self.pretrain_model == "wavlm_large":  
             with torch.no_grad():
-                signal, attention_mask = list(), list()
-                if length is not None: attention_mask = make_padding_masks(x, wav_len=length/length.max()).to(x.device)
-                else: attention_mask = make_padding_masks(x, wav_len=torch.ones(len(x)).to(x.device)).to(x.device)
-
-                for idx in range(len(x)):
-                    input = self.processor(x[idx], sampling_rate=16_000, return_tensors="pt", padding=True)
-                    signal.append(input["input_values"][0].to(x.device))
-                signal = torch.stack(signal)
+                signal, attention_mask = prepare_wavlm_large_inputs(
+                    self.processor,
+                    x,
+                    length=length,
+                    device=model_device,
+                )
 
         # 2. get length and mask
         if length is not None:
             length = self.get_feat_extract_output_lengths(length.detach().cpu())
-            length = length.cuda()
+            length = length.to(model_device)
 
         if self.pretrain_model == "wavlm": 
+            x = x.to(model_device)
             x = self.backbone_model(
                 x, output_hidden_states=True
             ).hidden_states
