@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import glob
+import os
 import time
 
 import numpy as np
@@ -67,9 +68,18 @@ def sync_if_cuda(auto_model) -> None:
 
 
 def configure_tf32(*, enabled: bool) -> None:
-    if enabled:
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.set_float32_matmul_precision("high")
+    torch.backends.cuda.matmul.allow_tf32 = bool(enabled)
+    torch.backends.cudnn.allow_tf32 = bool(enabled)
+    torch.set_float32_matmul_precision("high" if enabled else "highest")
+
+
+def precision_state() -> dict[str, object]:
+    return {
+        "matmul_allow_tf32": bool(torch.backends.cuda.matmul.allow_tf32),
+        "cudnn_allow_tf32": bool(torch.backends.cudnn.allow_tf32),
+        "float32_matmul_precision": torch.get_float32_matmul_precision(),
+        "NVIDIA_TF32_OVERRIDE": os.environ.get("NVIDIA_TF32_OVERRIDE"),
+    }
 
 
 def run_framed(
@@ -285,6 +295,9 @@ def main() -> None:
         f"tf32={args.candidate_allow_tf32}"
     )
 
+    configure_tf32(enabled=False)
+    print(f"Reference precision state: {precision_state()}")
+
     warm = [signals[0]]
     _ = run_audio_fed(auto_model, warm, args.batch_size)
     sync_if_cuda(auto_model)
@@ -320,6 +333,7 @@ def main() -> None:
         or args.candidate_allow_tf32
     ):
         configure_tf32(enabled=args.candidate_allow_tf32)
+        print(f"Candidate precision state: {precision_state()}")
         if args.candidate_compile:
             print(f"\nCompiling inner model with mode={args.candidate_compile_mode!r}")
             auto_model.model = torch.compile(
