@@ -28,7 +28,13 @@ from .artifacts import (
     load_prediction_artifact,
     write_prediction_artifact,
 )
-from .audio import AudioData, count_audio_frames, frame_audio, load_audio
+from .audio import (
+    AudioData,
+    count_audio_frames,
+    frame_audio,
+    load_audio,
+    writable_contiguous_float32,
+)
 from .emotion2vec import predict_emotion2vec_scores, predict_emotion2vec_scores_from_audio
 from .log import get_logger
 
@@ -1089,7 +1095,7 @@ def _predict_affect(
     arousal, valence, dominance = [], [], []
     with torch.inference_mode():
         for batch_np in _batches(windows, batch_size, progress, "affect"):
-            batch = torch.from_numpy(np.ascontiguousarray(batch_np))
+            batch = torch.from_numpy(writable_contiguous_float32(batch_np))
             if backbone != "wavlm":
                 batch = batch.to(run_device)
             with autocast_context(
@@ -1138,7 +1144,7 @@ def _predict_disfluency(
     fluency, dysfluency = [], []
     with torch.inference_mode():
         for batch_np in _batches(windows, batch_size, progress, "disfluency"):
-            batch = torch.from_numpy(np.ascontiguousarray(batch_np))
+            batch = torch.from_numpy(writable_contiguous_float32(batch_np))
             if backbone != "wavlm":
                 batch = batch.to(run_device)
             with autocast_context(
@@ -1221,7 +1227,7 @@ def _detect_silero_vad(
     get_speech_timestamps = utils[0]
     model = model.to("cpu")
     timestamps = get_speech_timestamps(
-        torch.from_numpy(np.asarray(samples, dtype=np.float32)),
+        torch.from_numpy(writable_contiguous_float32(samples)),
         model,
         sampling_rate=sample_rate,
         threshold=float(threshold),
