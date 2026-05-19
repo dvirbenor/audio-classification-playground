@@ -87,6 +87,10 @@ def _cmd_run(args: argparse.Namespace) -> None:
         emotion_batch_size=args.emotion_batch_size,
         device=args.device,
         max_inference_attempts=args.max_retries,
+        wavlm_autocast_dtype=args.wavlm_autocast_dtype,
+        wavlm_compile=args.wavlm_compile,
+        wavlm_compile_mode=args.wavlm_compile_mode,
+        wavlm_compile_dynamic=args.wavlm_compile_dynamic,
         emotion_autocast_dtype=args.emotion_autocast_dtype,
         emotion_compile=args.emotion_compile,
         emotion_compile_mode=args.emotion_compile_mode,
@@ -383,6 +387,23 @@ def main(argv: list[str] | None = None) -> None:
     p_run.add_argument("--disfluency-batch-size", type=int, default=None)
     p_run.add_argument("--emotion-batch-size", type=int, default=None)
     p_run.add_argument("--device", default=None)
+    p_run.add_argument(
+        "--wavlm-autocast-dtype",
+        choices=("fp16", "bf16"),
+        default=None,
+        help="Opt-in autocast dtype for WavLM affect/disfluency; benchmark before production use.",
+    )
+    p_run.add_argument(
+        "--wavlm-compile",
+        action="store_true",
+        help="Compile persistent WavLM backbones once; benchmark cold start and parity first.",
+    )
+    p_run.add_argument("--wavlm-compile-mode", default="reduce-overhead")
+    p_run.add_argument(
+        "--wavlm-compile-dynamic",
+        action="store_true",
+        help="Compile WavLM backbones with dynamic shapes to reduce last-batch recompiles.",
+    )
     p_run.add_argument(
         "--emotion-autocast-dtype",
         choices=("fp16", "bf16"),

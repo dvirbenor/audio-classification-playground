@@ -102,6 +102,30 @@ def _emotion_runtime_config_extra(
     return extra
 
 
+def _wavlm_runtime_config_extra(
+    *,
+    backbone: str,
+    wavlm_autocast_dtype: str | None,
+    wavlm_compile: bool,
+    wavlm_compile_mode: str,
+    wavlm_compile_dynamic: bool,
+    allow_tf32: bool,
+) -> dict[str, object]:
+    if backbone != "wavlm":
+        return {}
+    extra: dict[str, object] = {}
+    if wavlm_autocast_dtype is not None:
+        extra["torch_autocast_dtype"] = wavlm_autocast_dtype
+    if wavlm_compile:
+        extra["torch_compile"] = True
+        extra["torch_compile_target"] = "wavlm_backbone"
+        extra["torch_compile_mode"] = wavlm_compile_mode
+        extra["torch_compile_dynamic"] = bool(wavlm_compile_dynamic)
+    if allow_tf32:
+        extra["torch_allow_tf32"] = True
+    return extra
+
+
 def build_expected_configs(
     *,
     affect_backbone: str,
@@ -114,6 +138,10 @@ def build_expected_configs(
     vad_threshold: float = DEFAULT_VAD_SPEECH_THRESHOLD,
     vad_min_speech_sec: float = DEFAULT_VAD_MIN_SPEECH_SEC,
     vad_min_silence_sec: float = DEFAULT_VAD_MIN_SILENCE_SEC,
+    wavlm_autocast_dtype: str | None = None,
+    wavlm_compile: bool = False,
+    wavlm_compile_mode: str = "reduce-overhead",
+    wavlm_compile_dynamic: bool = False,
     emotion_autocast_dtype: str | None = None,
     emotion_compile: bool = False,
     emotion_compile_mode: str = "reduce-overhead",
@@ -144,6 +172,14 @@ def build_expected_configs(
         hop_sec=DEFAULT_HOP_SEC,
         batch_size=batches["affect"],
         transform_policy="vox_profile_affect_sigmoid_heads_v1",
+        extra=_wavlm_runtime_config_extra(
+            backbone=affect_backbone,
+            wavlm_autocast_dtype=wavlm_autocast_dtype,
+            wavlm_compile=wavlm_compile,
+            wavlm_compile_mode=wavlm_compile_mode,
+            wavlm_compile_dynamic=wavlm_compile_dynamic,
+            allow_tf32=allow_tf32,
+        ),
     )
     configs["disfluency"] = compute_inference_config(
         task="disfluency",
@@ -154,6 +190,14 @@ def build_expected_configs(
         hop_sec=DEFAULT_HOP_SEC,
         batch_size=batches["disfluency"],
         transform_policy="vox_profile_disfluency_raw_logits_v1",
+        extra=_wavlm_runtime_config_extra(
+            backbone=disfluency_backbone,
+            wavlm_autocast_dtype=wavlm_autocast_dtype,
+            wavlm_compile=wavlm_compile,
+            wavlm_compile_mode=wavlm_compile_mode,
+            wavlm_compile_dynamic=wavlm_compile_dynamic,
+            allow_tf32=allow_tf32,
+        ),
     )
     configs["emotion"] = compute_inference_config(
         task="emotion",
@@ -215,6 +259,10 @@ def run_worker(
     vad_threshold: float = DEFAULT_VAD_SPEECH_THRESHOLD,
     vad_min_speech_sec: float = DEFAULT_VAD_MIN_SPEECH_SEC,
     vad_min_silence_sec: float = DEFAULT_VAD_MIN_SILENCE_SEC,
+    wavlm_autocast_dtype: str | None = None,
+    wavlm_compile: bool = False,
+    wavlm_compile_mode: str = "reduce-overhead",
+    wavlm_compile_dynamic: bool = False,
     emotion_autocast_dtype: str | None = None,
     emotion_compile: bool = False,
     emotion_compile_mode: str = "reduce-overhead",
@@ -275,6 +323,10 @@ def run_worker(
         vad_threshold=vad_threshold,
         vad_min_speech_sec=vad_min_speech_sec,
         vad_min_silence_sec=vad_min_silence_sec,
+        wavlm_autocast_dtype=wavlm_autocast_dtype,
+        wavlm_compile=wavlm_compile,
+        wavlm_compile_mode=wavlm_compile_mode,
+        wavlm_compile_dynamic=wavlm_compile_dynamic,
         emotion_autocast_dtype=emotion_autocast_dtype,
         emotion_compile=emotion_compile,
         emotion_compile_mode=emotion_compile_mode,
@@ -304,6 +356,10 @@ def run_worker(
         vad_min_speech_sec=vad_min_speech_sec,
         vad_min_silence_sec=vad_min_silence_sec,
         load_vad=vad_prefetch_workers == 0,
+        wavlm_autocast_dtype=wavlm_autocast_dtype,
+        wavlm_compile=wavlm_compile,
+        wavlm_compile_mode=wavlm_compile_mode,
+        wavlm_compile_dynamic=wavlm_compile_dynamic,
         emotion_autocast_dtype=emotion_autocast_dtype,
         emotion_compile=emotion_compile,
         emotion_compile_mode=emotion_compile_mode,
@@ -469,6 +525,10 @@ def run_worker(
                     vad_threshold=vad_threshold,
                     vad_min_speech_sec=vad_min_speech_sec,
                     vad_min_silence_sec=vad_min_silence_sec,
+                    wavlm_autocast_dtype=wavlm_autocast_dtype,
+                    wavlm_compile=wavlm_compile,
+                    wavlm_compile_mode=wavlm_compile_mode,
+                    wavlm_compile_dynamic=wavlm_compile_dynamic,
                     emotion_autocast_dtype=emotion_autocast_dtype,
                     emotion_compile=emotion_compile,
                     emotion_compile_mode=emotion_compile_mode,

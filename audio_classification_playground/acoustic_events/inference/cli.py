@@ -42,6 +42,10 @@ def main(argv: list[str] | None = None) -> int:
             disfluency_batch_size=args.disfluency_batch_size,
             emotion_batch_size=args.emotion_batch_size,
             device=args.device,
+            wavlm_autocast_dtype=args.wavlm_autocast_dtype,
+            wavlm_compile=args.wavlm_compile,
+            wavlm_compile_mode=args.wavlm_compile_mode,
+            wavlm_compile_dynamic=args.wavlm_compile_dynamic,
             emotion_autocast_dtype=args.emotion_autocast_dtype,
             emotion_compile=args.emotion_compile,
             emotion_compile_mode=args.emotion_compile_mode,
@@ -83,8 +87,12 @@ def build_parser() -> argparse.ArgumentParser:
     run_sub = run.add_subparsers(dest="task", required=True)
     _add_common_run_args(run_sub.add_parser("affect", help="Run dimensional affect inference."))
     run_sub.choices["affect"].add_argument("--backbone", choices=("wavlm", "whisper"), required=True)
+    _add_wavlm_runtime_options(run_sub.choices["affect"])
+    _add_allow_tf32_option(run_sub.choices["affect"])
     _add_common_run_args(run_sub.add_parser("disfluency", help="Run disfluency inference."))
     run_sub.choices["disfluency"].add_argument("--backbone", choices=("wavlm", "whisper"), required=True)
+    _add_wavlm_runtime_options(run_sub.choices["disfluency"])
+    _add_allow_tf32_option(run_sub.choices["disfluency"])
     _add_common_run_args(run_sub.add_parser("emotion", help="Run emotion2vec inference."))
     _add_emotion_runtime_options(run_sub.choices["emotion"])
     _add_common_run_args(run_sub.add_parser("vad", help="Run shared VAD."))
@@ -98,6 +106,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_all.add_argument("--affect-batch-size", type=int)
     run_all.add_argument("--disfluency-batch-size", type=int)
     run_all.add_argument("--emotion-batch-size", type=int)
+    _add_wavlm_runtime_options(run_all)
     _add_emotion_runtime_options(run_all)
     _add_vad_options(run_all)
 
@@ -158,6 +167,30 @@ def _add_emotion_runtime_options(parser: argparse.ArgumentParser) -> None:
         help="Compile the emotion2vec inner torch model before inference.",
     )
     parser.add_argument("--emotion-compile-mode", default="reduce-overhead")
+    _add_allow_tf32_option(parser)
+
+
+def _add_wavlm_runtime_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--wavlm-autocast-dtype",
+        choices=("fp16", "bf16"),
+        default=None,
+        help="Opt-in autocast dtype for WavLM affect/disfluency; benchmark before production use.",
+    )
+    parser.add_argument(
+        "--wavlm-compile",
+        action="store_true",
+        help="Compile the WavLM backbone before inference.",
+    )
+    parser.add_argument("--wavlm-compile-mode", default="reduce-overhead")
+    parser.add_argument(
+        "--wavlm-compile-dynamic",
+        action="store_true",
+        help="Compile WavLM with dynamic shapes for variable final batches.",
+    )
+
+
+def _add_allow_tf32_option(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--allow-tf32",
         action="store_true",
@@ -178,11 +211,27 @@ def _run_single(args, progress):
         batch_kwargs["batch_size"] = args.batch_size
     if args.task == "affect":
         return run_affect_inference(
-            args.audio, backbone=args.backbone, **common, **batch_kwargs,
+            args.audio,
+            backbone=args.backbone,
+            wavlm_autocast_dtype=args.wavlm_autocast_dtype,
+            wavlm_compile=args.wavlm_compile,
+            wavlm_compile_mode=args.wavlm_compile_mode,
+            wavlm_compile_dynamic=args.wavlm_compile_dynamic,
+            allow_tf32=args.allow_tf32,
+            **common,
+            **batch_kwargs,
         )
     if args.task == "disfluency":
         return run_disfluency_inference(
-            args.audio, backbone=args.backbone, **common, **batch_kwargs,
+            args.audio,
+            backbone=args.backbone,
+            wavlm_autocast_dtype=args.wavlm_autocast_dtype,
+            wavlm_compile=args.wavlm_compile,
+            wavlm_compile_mode=args.wavlm_compile_mode,
+            wavlm_compile_dynamic=args.wavlm_compile_dynamic,
+            allow_tf32=args.allow_tf32,
+            **common,
+            **batch_kwargs,
         )
     if args.task == "emotion":
         return run_emotion_inference(

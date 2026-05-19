@@ -25,6 +25,11 @@ from typing import Sequence
 
 import numpy as np
 
+from ...vox_profile.wavlm_inference import (
+    autocast_context,
+    compile_wavlm_backbone,
+    validate_autocast_dtype,
+)
 from .artifacts import SAMPLE_RATE
 from .emotion2vec import (
     predict_emotion2vec_scores,
@@ -80,17 +85,39 @@ class AffectPredictor:
         model_id: str | None = None,
         device: str | None = None,
         batch_size: int = 512,
+        wavlm_autocast_dtype: str | None = None,
+        wavlm_compile: bool = False,
+        wavlm_compile_mode: str = "reduce-overhead",
+        wavlm_compile_dynamic: bool = False,
     ) -> None:
         import torch
 
         self.backbone = backbone
         self.batch_size = batch_size
+        self.wavlm_autocast_dtype = (
+            validate_autocast_dtype(wavlm_autocast_dtype)
+            if backbone == "wavlm"
+            else None
+        )
+        self.wavlm_compile = bool(wavlm_compile and backbone == "wavlm")
         resolved_id = model_id or DEFAULT_AFFECT_MODELS[backbone]
         self.model_id = resolved_id
         self._device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         wrapper = _load_affect_wrapper(backbone)
         self._model = wrapper.from_pretrained(resolved_id).to(self._device).eval()
-        LOGGER.info("AffectPredictor loaded: %s on %s", resolved_id, self._device)
+        if self.wavlm_compile:
+            compile_wavlm_backbone(
+                self._model,
+                mode=wavlm_compile_mode,
+                dynamic=wavlm_compile_dynamic,
+            )
+        LOGGER.info(
+            "AffectPredictor loaded: %s on %s autocast=%s compile=%s",
+            resolved_id,
+            self._device,
+            self.wavlm_autocast_dtype,
+            self.wavlm_compile,
+        )
 
     def __call__(self, windows: np.ndarray) -> dict[str, np.ndarray]:
         import torch
@@ -101,10 +128,11 @@ class AffectPredictor:
                 batch = torch.from_numpy(np.ascontiguousarray(batch_np))
                 if self.backbone != "wavlm":
                     batch = batch.to(self._device)
-                a, v, d = self._model(batch)
-                arousal.append(a.detach().cpu().reshape(-1).numpy())
-                valence.append(v.detach().cpu().reshape(-1).numpy())
-                dominance.append(d.detach().cpu().reshape(-1).numpy())
+                with autocast_context(torch, self._device, self.wavlm_autocast_dtype):
+                    a, v, d = self._model(batch)
+                arousal.append(a.detach().float().cpu().reshape(-1).numpy())
+                valence.append(v.detach().float().cpu().reshape(-1).numpy())
+                dominance.append(d.detach().float().cpu().reshape(-1).numpy())
         return {
             "arousal": np.concatenate(arousal),
             "valence": np.concatenate(valence),
@@ -124,17 +152,39 @@ class DisfluencyPredictor:
         model_id: str | None = None,
         device: str | None = None,
         batch_size: int = 512,
+        wavlm_autocast_dtype: str | None = None,
+        wavlm_compile: bool = False,
+        wavlm_compile_mode: str = "reduce-overhead",
+        wavlm_compile_dynamic: bool = False,
     ) -> None:
         import torch
 
         self.backbone = backbone
         self.batch_size = batch_size
+        self.wavlm_autocast_dtype = (
+            validate_autocast_dtype(wavlm_autocast_dtype)
+            if backbone == "wavlm"
+            else None
+        )
+        self.wavlm_compile = bool(wavlm_compile and backbone == "wavlm")
         resolved_id = model_id or DEFAULT_DISFLUENCY_MODELS[backbone]
         self.model_id = resolved_id
         self._device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         wrapper = _load_disfluency_wrapper(backbone)
         self._model = wrapper.from_pretrained(resolved_id).to(self._device).eval()
-        LOGGER.info("DisfluencyPredictor loaded: %s on %s", resolved_id, self._device)
+        if self.wavlm_compile:
+            compile_wavlm_backbone(
+                self._model,
+                mode=wavlm_compile_mode,
+                dynamic=wavlm_compile_dynamic,
+            )
+        LOGGER.info(
+            "DisfluencyPredictor loaded: %s on %s autocast=%s compile=%s",
+            resolved_id,
+            self._device,
+            self.wavlm_autocast_dtype,
+            self.wavlm_compile,
+        )
 
     def __call__(self, windows: np.ndarray) -> dict[str, np.ndarray]:
         import torch
@@ -145,9 +195,10 @@ class DisfluencyPredictor:
                 batch = torch.from_numpy(np.ascontiguousarray(batch_np))
                 if self.backbone != "wavlm":
                     batch = batch.to(self._device)
-                f, d = self._model(batch, return_feature=False)
-                fluency.append(f.detach().cpu().numpy())
-                dysfluency.append(d.detach().cpu().numpy())
+                with autocast_context(torch, self._device, self.wavlm_autocast_dtype):
+                    f, d = self._model(batch, return_feature=False)
+                fluency.append(f.detach().float().cpu().numpy())
+                dysfluency.append(d.detach().float().cpu().numpy())
         return {
             "fluency_logits": np.concatenate(fluency, axis=0),
             "disfluency_type_logits": np.concatenate(dysfluency, axis=0),
@@ -310,6 +361,10 @@ class ModelSuite:
         vad_min_speech_sec: float = DEFAULT_VAD_MIN_SPEECH_SEC,
         vad_min_silence_sec: float = DEFAULT_VAD_MIN_SILENCE_SEC,
         load_vad: bool = True,
+        wavlm_autocast_dtype: str | None = None,
+        wavlm_compile: bool = False,
+        wavlm_compile_mode: str = "reduce-overhead",
+        wavlm_compile_dynamic: bool = False,
         emotion_autocast_dtype: str | None = None,
         emotion_compile: bool = False,
         emotion_compile_mode: str = "reduce-overhead",
@@ -323,10 +378,22 @@ class ModelSuite:
             emotion_batch_size=emotion_batch_size,
         )
         self.affect = AffectPredictor(
-            backbone=affect_backbone, device=device, batch_size=batches["affect"],
+            backbone=affect_backbone,
+            device=device,
+            batch_size=batches["affect"],
+            wavlm_autocast_dtype=wavlm_autocast_dtype,
+            wavlm_compile=wavlm_compile,
+            wavlm_compile_mode=wavlm_compile_mode,
+            wavlm_compile_dynamic=wavlm_compile_dynamic,
         )
         self.disfluency = DisfluencyPredictor(
-            backbone=disfluency_backbone, device=device, batch_size=batches["disfluency"],
+            backbone=disfluency_backbone,
+            device=device,
+            batch_size=batches["disfluency"],
+            wavlm_autocast_dtype=wavlm_autocast_dtype,
+            wavlm_compile=wavlm_compile,
+            wavlm_compile_mode=wavlm_compile_mode,
+            wavlm_compile_dynamic=wavlm_compile_dynamic,
         )
         self.emotion = EmotionPredictor(
             batch_size=batches["emotion"],

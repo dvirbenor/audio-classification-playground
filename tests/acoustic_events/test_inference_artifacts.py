@@ -427,6 +427,29 @@ class InferenceArtifactTest(unittest.TestCase):
             self.assertEqual(config["torch_compile_mode"], "reduce-overhead")
             self.assertTrue(config["torch_allow_tf32"])
 
+    def test_wavlm_runtime_knobs_are_recorded_in_affect_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audio_path = _write_audio(Path(tmp) / "clip.wav")
+            result = run_affect_inference(
+                audio_path,
+                out_dir=Path(tmp) / "artifacts",
+                backbone="wavlm",
+                predictor=_fake_affect,
+                wavlm_autocast_dtype="bf16",
+                wavlm_compile=True,
+                wavlm_compile_dynamic=True,
+                allow_tf32=True,
+                progress=_quiet,
+            )
+
+            config = result.artifact.manifest["inference_config"]
+            self.assertEqual(config["torch_autocast_dtype"], "bf16")
+            self.assertTrue(config["torch_compile"])
+            self.assertEqual(config["torch_compile_target"], "wavlm_backbone")
+            self.assertEqual(config["torch_compile_mode"], "reduce-overhead")
+            self.assertTrue(config["torch_compile_dynamic"])
+            self.assertTrue(config["torch_allow_tf32"])
+
     def test_artifacts_adapt_to_existing_producers(self):
         with tempfile.TemporaryDirectory() as tmp:
             audio_path = _write_audio(Path(tmp) / "clip.wav")
