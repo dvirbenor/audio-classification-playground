@@ -63,6 +63,7 @@ class WorkerAsyncVadTest(unittest.TestCase):
                 wavlm_autocast_dtype="bf16",
                 wavlm_compile=True,
                 wavlm_compile_dynamic=True,
+                wavlm_stream_layer_sum=True,
                 emotion_autocast_dtype="bf16",
                 emotion_compile=True,
                 allow_tf32=True,
@@ -76,6 +77,7 @@ class WorkerAsyncVadTest(unittest.TestCase):
         self.assertEqual(model_kwargs[0]["wavlm_autocast_dtype"], "bf16")
         self.assertTrue(model_kwargs[0]["wavlm_compile"])
         self.assertTrue(model_kwargs[0]["wavlm_compile_dynamic"])
+        self.assertTrue(model_kwargs[0]["wavlm_stream_layer_sum"])
         self.assertEqual(model_kwargs[0]["emotion_autocast_dtype"], "bf16")
         self.assertTrue(model_kwargs[0]["emotion_compile"])
         self.assertTrue(model_kwargs[0]["allow_tf32"])
@@ -85,6 +87,7 @@ class WorkerAsyncVadTest(unittest.TestCase):
         self.assertEqual(run_kwargs[0]["wavlm_autocast_dtype"], "bf16")
         self.assertTrue(run_kwargs[0]["wavlm_compile"])
         self.assertTrue(run_kwargs[0]["wavlm_compile_dynamic"])
+        self.assertTrue(run_kwargs[0]["wavlm_stream_layer_sum"])
         self.assertEqual(run_kwargs[0]["emotion_autocast_dtype"], "bf16")
         self.assertTrue(run_kwargs[0]["emotion_compile"])
         self.assertTrue(run_kwargs[0]["allow_tf32"])

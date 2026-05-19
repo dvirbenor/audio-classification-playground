@@ -25,6 +25,8 @@ def predict_emotion2vec_scores(
     sample_rate: int,
     batch_size: int,
     autocast_dtype: str | None = None,
+    compile_model: bool = False,
+    compile_mode: str = "reduce-overhead",
     progress: ProgressFn | None = None,
 ) -> tuple[np.ndarray, Sequence[str]]:
     """Return raw emotion2vec scores and labels for framed audio windows.
@@ -45,6 +47,8 @@ def predict_emotion2vec_scores(
             windows,
             batch_size=batch_size,
             autocast_dtype=autocast_dtype,
+            compile_model=compile_model,
+            compile_mode=compile_mode,
             progress=progress,
         )
     return _predict_via_generate(
@@ -66,6 +70,8 @@ def predict_emotion2vec_scores_from_audio(
     hop_sec: float,
     batch_size: int,
     autocast_dtype: str | None = None,
+    compile_model: bool = False,
+    compile_mode: str = "reduce-overhead",
     progress: ProgressFn | None = None,
 ) -> tuple[np.ndarray, Sequence[str]]:
     """Return emotion2vec scores for the same windows as ``frame_audio``.
@@ -88,6 +94,8 @@ def predict_emotion2vec_scores_from_audio(
             hop_sec=hop_sec,
             batch_size=batch_size,
             autocast_dtype=autocast_dtype,
+            compile_model=compile_model,
+            compile_mode=compile_mode,
             progress=progress,
         )
 
@@ -103,6 +111,8 @@ def predict_emotion2vec_scores_from_audio(
         sample_rate=sample_rate,
         batch_size=batch_size,
         autocast_dtype=autocast_dtype,
+        compile_model=compile_model,
+        compile_mode=compile_mode,
         progress=progress,
     )
 
@@ -123,52 +133,191 @@ def _supports_direct_batched_scores(auto_model, sample_rate: int) -> bool:
     )
 
 
+class _Emotion2vecScoreCore:
+    """Tiny torch module for the actual hot-path classifier."""
+
+    def __new__(cls, *args, **kwargs):
+        import torch
+
+        class ScoreCore(torch.nn.Module):
+            def __init__(self, model, unuse_mask, keep_index_tensor, normalize: bool):
+                super().__init__()
+                self.model = model
+                self.normalize = bool(normalize)
+                self.register_buffer("unuse_mask", unuse_mask)
+                self.register_buffer("keep_index_tensor", keep_index_tensor)
+
+            def forward(self, batch):
+                import torch.nn.functional as F
+
+                if self.normalize:
+                    batch = F.layer_norm(batch, batch.shape[1:])
+                feats = self.model.extract_features(batch, padding_mask=None)
+                x = feats["x"].mean(dim=1)
+                logits = self.model.proj(x)
+                logits = logits.masked_fill(self.unuse_mask.unsqueeze(0), -torch.inf)
+                scores = torch.softmax(logits, dim=-1)
+                return scores.index_select(1, self.keep_index_tensor)
+
+        return ScoreCore(*args, **kwargs)
+
+
+class DirectEmotion2vecScorer:
+    """Reusable direct emotion2vec scorer.
+
+    This caches label masks on the model device and, when requested, compiles
+    the actual ``extract_features -> proj -> softmax`` scorer rather than the
+    FunASR wrapper object.
+    """
+
+    def __init__(
+        self,
+        auto_model,
+        *,
+        compile_model: bool = False,
+        compile_mode: str = "reduce-overhead",
+    ) -> None:
+        import torch
+
+        self.auto_model = auto_model
+        model = auto_model.model
+        kwargs = getattr(auto_model, "kwargs", {}) or {}
+        tokenizer = kwargs["tokenizer"]
+        labels = list(tokenizer.token_list)
+        keep_indices = [
+            idx for idx, label in enumerate(labels) if not str(label).startswith("unuse")
+        ]
+        if not keep_indices:
+            raise ValueError("emotion2vec tokenizer has no usable labels")
+
+        self.device = _model_device(model, kwargs)
+        self.selected_labels = [labels[idx] for idx in keep_indices]
+        unuse_mask = torch.tensor(
+            [str(label).startswith("unuse") for label in labels],
+            dtype=torch.bool,
+            device=self.device,
+        )
+        keep_index_tensor = torch.tensor(keep_indices, dtype=torch.long, device=self.device)
+        model.eval()
+        core = _Emotion2vecScoreCore(
+            model,
+            unuse_mask,
+            keep_index_tensor,
+            bool(_cfg_get(getattr(model, "cfg", None), "normalize", False)),
+        ).to(self.device).eval()
+        if compile_model:
+            core = torch.compile(core, mode=compile_mode)
+        self.core = core
+
+    def __call__(self, batch, *, autocast_dtype: str | None = None):
+        import torch
+
+        with _autocast_context(torch, self.device, autocast_dtype):
+            scores = self.core(batch)
+        return scores.to(dtype=torch.float32)
+
+    def predict_windows(
+        self,
+        windows: np.ndarray,
+        *,
+        batch_size: int,
+        autocast_dtype: str | None,
+        progress: ProgressFn | None = None,
+    ) -> tuple[np.ndarray, Sequence[str]]:
+        import torch
+
+        out = torch.empty(
+            (len(windows), len(self.selected_labels)),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        with torch.inference_mode():
+            for start, batch_np in _batches(windows, batch_size, progress, "emotion"):
+                end = start + len(batch_np)
+                batch = torch.from_numpy(writable_contiguous_float32(batch_np)).to(self.device)
+                out[start:end] = self(batch, autocast_dtype=autocast_dtype)
+        return out.detach().cpu().numpy(), self.selected_labels
+
+    def predict_audio(
+        self,
+        samples: np.ndarray,
+        *,
+        sample_rate: int,
+        window_sec: float,
+        hop_sec: float,
+        batch_size: int,
+        autocast_dtype: str | None,
+        progress: ProgressFn | None = None,
+    ) -> tuple[np.ndarray, Sequence[str]]:
+        import torch
+        import torch.nn.functional as F
+
+        audio_np = writable_contiguous_float32(samples)
+        n_frames, window_samples, hop_samples, pad_needed = frame_audio_geometry(
+            len(audio_np),
+            sample_rate=sample_rate,
+            window_sec=window_sec,
+            hop_sec=hop_sec,
+        )
+        out = torch.empty(
+            (n_frames, len(self.selected_labels)),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        with torch.inference_mode():
+            audio = torch.from_numpy(audio_np).to(self.device)
+            if pad_needed:
+                audio = F.pad(audio, (0, pad_needed))
+            windows = audio.as_strided(
+                size=(n_frames, window_samples),
+                stride=(hop_samples, 1),
+            )
+            for start in range(0, n_frames, batch_size):
+                end = min(start + batch_size, n_frames)
+                if progress is not None:
+                    progress(f"emotion batch {start}:{end} / {n_frames}")
+                batch = windows[start:end].contiguous()
+                out[start:end] = self(batch, autocast_dtype=autocast_dtype)
+        return out.detach().cpu().numpy(), self.selected_labels
+
+
+def make_direct_emotion2vec_scorer(
+    auto_model,
+    *,
+    sample_rate: int,
+    compile_model: bool = False,
+    compile_mode: str = "reduce-overhead",
+) -> DirectEmotion2vecScorer | None:
+    if not _supports_direct_batched_scores(auto_model, sample_rate):
+        return None
+    return DirectEmotion2vecScorer(
+        auto_model,
+        compile_model=compile_model,
+        compile_mode=compile_mode,
+    )
+
+
 def _predict_direct_batched(
     auto_model,
     windows: np.ndarray,
     *,
     batch_size: int,
     autocast_dtype: str | None,
+    compile_model: bool,
+    compile_mode: str,
     progress: ProgressFn | None,
 ) -> tuple[np.ndarray, Sequence[str]]:
-    import torch
-    import torch.nn.functional as F
-
-    model = auto_model.model
-    kwargs = getattr(auto_model, "kwargs", {}) or {}
-    tokenizer = kwargs["tokenizer"]
-    labels = list(tokenizer.token_list)
-    keep_indices = [idx for idx, label in enumerate(labels) if not str(label).startswith("unuse")]
-    if not keep_indices:
-        raise ValueError("emotion2vec tokenizer has no usable labels")
-
-    device = _model_device(model, kwargs)
-    unuse_mask = torch.tensor(
-        [str(label).startswith("unuse") for label in labels],
-        dtype=torch.bool,
-        device=device,
+    scorer = DirectEmotion2vecScorer(
+        auto_model,
+        compile_model=compile_model,
+        compile_mode=compile_mode,
     )
-    keep_index_tensor = torch.tensor(keep_indices, dtype=torch.long, device=device)
-    selected_labels = [labels[idx] for idx in keep_indices]
-
-    model.eval()
-    out = np.empty((len(windows), len(keep_indices)), dtype=np.float32)
-    with torch.inference_mode():
-        for start, batch_np in _batches(windows, batch_size, progress, "emotion"):
-            end = start + len(batch_np)
-            batch = torch.from_numpy(writable_contiguous_float32(batch_np)).to(device)
-            with _autocast_context(torch, device, autocast_dtype):
-                if _cfg_get(getattr(model, "cfg", None), "normalize", False):
-                    batch = F.layer_norm(batch, batch.shape[1:])
-
-                feats = model.extract_features(batch, padding_mask=None)
-                x = feats["x"].mean(dim=1)
-                logits = model.proj(x)
-                logits = logits.masked_fill(unuse_mask.unsqueeze(0), -torch.inf)
-                scores = torch.softmax(logits, dim=-1)
-            out[start:end] = scores.index_select(1, keep_index_tensor).detach().cpu().numpy()
-
-    return out, selected_labels
+    return scorer.predict_windows(
+        windows,
+        batch_size=batch_size,
+        autocast_dtype=autocast_dtype,
+        progress=progress,
+    )
 
 
 def _predict_direct_batched_from_audio(
@@ -180,63 +329,24 @@ def _predict_direct_batched_from_audio(
     hop_sec: float,
     batch_size: int,
     autocast_dtype: str | None,
+    compile_model: bool,
+    compile_mode: str,
     progress: ProgressFn | None,
 ) -> tuple[np.ndarray, Sequence[str]]:
-    import torch
-    import torch.nn.functional as F
-
-    model = auto_model.model
-    kwargs = getattr(auto_model, "kwargs", {}) or {}
-    tokenizer = kwargs["tokenizer"]
-    labels = list(tokenizer.token_list)
-    keep_indices = [idx for idx, label in enumerate(labels) if not str(label).startswith("unuse")]
-    if not keep_indices:
-        raise ValueError("emotion2vec tokenizer has no usable labels")
-
-    device = _model_device(model, kwargs)
-    unuse_mask = torch.tensor(
-        [str(label).startswith("unuse") for label in labels],
-        dtype=torch.bool,
-        device=device,
+    scorer = DirectEmotion2vecScorer(
+        auto_model,
+        compile_model=compile_model,
+        compile_mode=compile_mode,
     )
-    keep_index_tensor = torch.tensor(keep_indices, dtype=torch.long, device=device)
-    selected_labels = [labels[idx] for idx in keep_indices]
-
-    audio_np = writable_contiguous_float32(samples)
-    n_frames, window_samples, hop_samples, pad_needed = frame_audio_geometry(
-        len(audio_np),
+    return scorer.predict_audio(
+        samples,
         sample_rate=sample_rate,
         window_sec=window_sec,
         hop_sec=hop_sec,
+        batch_size=batch_size,
+        autocast_dtype=autocast_dtype,
+        progress=progress,
     )
-
-    model.eval()
-    out = np.empty((n_frames, len(keep_indices)), dtype=np.float32)
-    with torch.inference_mode():
-        audio = torch.from_numpy(audio_np).to(device)
-        if pad_needed:
-            audio = F.pad(audio, (0, pad_needed))
-        windows = audio.as_strided(
-            size=(n_frames, window_samples),
-            stride=(hop_samples, 1),
-        )
-        for start in range(0, n_frames, batch_size):
-            end = min(start + batch_size, n_frames)
-            if progress is not None:
-                progress(f"emotion batch {start}:{end} / {n_frames}")
-            batch = windows[start:end].contiguous()
-            with _autocast_context(torch, device, autocast_dtype):
-                if _cfg_get(getattr(model, "cfg", None), "normalize", False):
-                    batch = F.layer_norm(batch, batch.shape[1:])
-
-                feats = model.extract_features(batch, padding_mask=None)
-                x = feats["x"].mean(dim=1)
-                logits = model.proj(x)
-                logits = logits.masked_fill(unuse_mask.unsqueeze(0), -torch.inf)
-                scores = torch.softmax(logits, dim=-1)
-            out[start:end] = scores.index_select(1, keep_index_tensor).detach().cpu().numpy()
-
-    return out, selected_labels
 
 
 def _predict_via_generate(

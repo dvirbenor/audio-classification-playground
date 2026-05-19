@@ -91,6 +91,7 @@ def run_affect_inference(
     wavlm_compile: bool = False,
     wavlm_compile_mode: str = "reduce-overhead",
     wavlm_compile_dynamic: bool = False,
+    wavlm_stream_layer_sum: bool = False,
     allow_tf32: bool = False,
     predictor: Callable[[np.ndarray], Mapping[str, np.ndarray]] | None = None,
     progress: ProgressFn | None = None,
@@ -119,6 +120,7 @@ def run_affect_inference(
             compile_model=wavlm_compile,
             compile_mode=wavlm_compile_mode,
             compile_dynamic=wavlm_compile_dynamic,
+            stream_layer_sum=wavlm_stream_layer_sum,
             allow_tf32=allow_tf32,
         ),
     )
@@ -149,6 +151,7 @@ def run_affect_inference(
                 wavlm_compile=wavlm_compile,
                 wavlm_compile_mode=wavlm_compile_mode,
                 wavlm_compile_dynamic=wavlm_compile_dynamic,
+                wavlm_stream_layer_sum=wavlm_stream_layer_sum,
                 allow_tf32=allow_tf32,
                 progress=progress,
             )
@@ -194,6 +197,7 @@ def run_disfluency_inference(
     wavlm_compile: bool = False,
     wavlm_compile_mode: str = "reduce-overhead",
     wavlm_compile_dynamic: bool = False,
+    wavlm_stream_layer_sum: bool = False,
     allow_tf32: bool = False,
     predictor: Callable[[np.ndarray], Mapping[str, np.ndarray]] | None = None,
     progress: ProgressFn | None = None,
@@ -222,6 +226,7 @@ def run_disfluency_inference(
             compile_model=wavlm_compile,
             compile_mode=wavlm_compile_mode,
             compile_dynamic=wavlm_compile_dynamic,
+            stream_layer_sum=wavlm_stream_layer_sum,
             allow_tf32=allow_tf32,
         ),
     )
@@ -252,6 +257,7 @@ def run_disfluency_inference(
                 wavlm_compile=wavlm_compile,
                 wavlm_compile_mode=wavlm_compile_mode,
                 wavlm_compile_dynamic=wavlm_compile_dynamic,
+                wavlm_stream_layer_sum=wavlm_stream_layer_sum,
                 allow_tf32=allow_tf32,
                 progress=progress,
             )
@@ -504,6 +510,7 @@ def run_all_inference(
     wavlm_compile: bool = False,
     wavlm_compile_mode: str = "reduce-overhead",
     wavlm_compile_dynamic: bool = False,
+    wavlm_stream_layer_sum: bool = False,
     emotion_autocast_dtype: str | None = None,
     emotion_compile: bool = False,
     emotion_compile_mode: str = "reduce-overhead",
@@ -607,6 +614,7 @@ def run_all_inference(
                 wavlm_compile=wavlm_compile,
                 wavlm_compile_mode=wavlm_compile_mode,
                 wavlm_compile_dynamic=wavlm_compile_dynamic,
+                wavlm_stream_layer_sum=wavlm_stream_layer_sum,
                 allow_tf32=allow_tf32,
                 predictor=predictors.get("affect"),
                 progress=progress,
@@ -629,6 +637,7 @@ def run_all_inference(
                 wavlm_compile=wavlm_compile,
                 wavlm_compile_mode=wavlm_compile_mode,
                 wavlm_compile_dynamic=wavlm_compile_dynamic,
+                wavlm_stream_layer_sum=wavlm_stream_layer_sum,
                 allow_tf32=allow_tf32,
                 predictor=predictors.get("disfluency"),
                 progress=progress,
@@ -777,6 +786,7 @@ def _wavlm_runtime_config_extra(
     compile_model: bool,
     compile_mode: str,
     compile_dynamic: bool,
+    stream_layer_sum: bool,
     allow_tf32: bool,
 ) -> dict[str, object]:
     if backbone != "wavlm":
@@ -789,6 +799,8 @@ def _wavlm_runtime_config_extra(
         extra["torch_compile_target"] = "wavlm_backbone"
         extra["torch_compile_mode"] = compile_mode
         extra["torch_compile_dynamic"] = bool(compile_dynamic)
+    if stream_layer_sum:
+        extra["wavlm_stream_layer_sum"] = True
     if allow_tf32:
         extra["torch_allow_tf32"] = True
     return extra
@@ -1076,6 +1088,7 @@ def _predict_affect(
     wavlm_compile: bool,
     wavlm_compile_mode: str,
     wavlm_compile_dynamic: bool,
+    wavlm_stream_layer_sum: bool,
     allow_tf32: bool,
     progress: ProgressFn | None,
 ) -> dict[str, np.ndarray]:
@@ -1086,6 +1099,8 @@ def _predict_affect(
     wrapper = _load_affect_wrapper(backbone)
     run_device = device or _default_device()
     model = wrapper.from_pretrained(model_id).to(run_device).eval()
+    if backbone == "wavlm" and wavlm_stream_layer_sum:
+        model.wavlm_stream_layer_sum = True
     if backbone == "wavlm" and wavlm_compile:
         compile_wavlm_backbone(
             model,
@@ -1125,6 +1140,7 @@ def _predict_disfluency(
     wavlm_compile: bool,
     wavlm_compile_mode: str,
     wavlm_compile_dynamic: bool,
+    wavlm_stream_layer_sum: bool,
     allow_tf32: bool,
     progress: ProgressFn | None,
 ) -> dict[str, np.ndarray]:
@@ -1135,6 +1151,8 @@ def _predict_disfluency(
     wrapper = _load_disfluency_wrapper(backbone)
     run_device = device or _default_device()
     model = wrapper.from_pretrained(model_id).to(run_device).eval()
+    if backbone == "wavlm" and wavlm_stream_layer_sum:
+        model.wavlm_stream_layer_sum = True
     if backbone == "wavlm" and wavlm_compile:
         compile_wavlm_backbone(
             model,
@@ -1190,10 +1208,6 @@ def _predict_emotion2vec(
     if device is not None:
         auto_kwargs["device"] = device
     model = AutoModel(**auto_kwargs)
-    if compile_model:
-        import torch
-
-        model.model = torch.compile(model.model, mode=compile_mode)
     return predict_emotion2vec_scores_from_audio(
         model,
         samples,
@@ -1202,6 +1216,8 @@ def _predict_emotion2vec(
         hop_sec=hop_sec,
         batch_size=batch_size,
         autocast_dtype=autocast_dtype,
+        compile_model=compile_model,
+        compile_mode=compile_mode,
         progress=progress,
     )
 

@@ -109,6 +109,7 @@ def _wavlm_runtime_config_extra(
     wavlm_compile: bool,
     wavlm_compile_mode: str,
     wavlm_compile_dynamic: bool,
+    wavlm_stream_layer_sum: bool,
     allow_tf32: bool,
 ) -> dict[str, object]:
     if backbone != "wavlm":
@@ -121,6 +122,8 @@ def _wavlm_runtime_config_extra(
         extra["torch_compile_target"] = "wavlm_backbone"
         extra["torch_compile_mode"] = wavlm_compile_mode
         extra["torch_compile_dynamic"] = bool(wavlm_compile_dynamic)
+    if wavlm_stream_layer_sum:
+        extra["wavlm_stream_layer_sum"] = True
     if allow_tf32:
         extra["torch_allow_tf32"] = True
     return extra
@@ -142,6 +145,7 @@ def build_expected_configs(
     wavlm_compile: bool = False,
     wavlm_compile_mode: str = "reduce-overhead",
     wavlm_compile_dynamic: bool = False,
+    wavlm_stream_layer_sum: bool = False,
     emotion_autocast_dtype: str | None = None,
     emotion_compile: bool = False,
     emotion_compile_mode: str = "reduce-overhead",
@@ -178,6 +182,7 @@ def build_expected_configs(
             wavlm_compile=wavlm_compile,
             wavlm_compile_mode=wavlm_compile_mode,
             wavlm_compile_dynamic=wavlm_compile_dynamic,
+            wavlm_stream_layer_sum=wavlm_stream_layer_sum,
             allow_tf32=allow_tf32,
         ),
     )
@@ -196,6 +201,7 @@ def build_expected_configs(
             wavlm_compile=wavlm_compile,
             wavlm_compile_mode=wavlm_compile_mode,
             wavlm_compile_dynamic=wavlm_compile_dynamic,
+            wavlm_stream_layer_sum=wavlm_stream_layer_sum,
             allow_tf32=allow_tf32,
         ),
     )
@@ -263,6 +269,7 @@ def run_worker(
     wavlm_compile: bool = False,
     wavlm_compile_mode: str = "reduce-overhead",
     wavlm_compile_dynamic: bool = False,
+    wavlm_stream_layer_sum: bool = False,
     emotion_autocast_dtype: str | None = None,
     emotion_compile: bool = False,
     emotion_compile_mode: str = "reduce-overhead",
@@ -327,6 +334,7 @@ def run_worker(
         wavlm_compile=wavlm_compile,
         wavlm_compile_mode=wavlm_compile_mode,
         wavlm_compile_dynamic=wavlm_compile_dynamic,
+        wavlm_stream_layer_sum=wavlm_stream_layer_sum,
         emotion_autocast_dtype=emotion_autocast_dtype,
         emotion_compile=emotion_compile,
         emotion_compile_mode=emotion_compile_mode,
@@ -360,6 +368,7 @@ def run_worker(
         wavlm_compile=wavlm_compile,
         wavlm_compile_mode=wavlm_compile_mode,
         wavlm_compile_dynamic=wavlm_compile_dynamic,
+        wavlm_stream_layer_sum=wavlm_stream_layer_sum,
         emotion_autocast_dtype=emotion_autocast_dtype,
         emotion_compile=emotion_compile,
         emotion_compile_mode=emotion_compile_mode,
@@ -529,6 +538,7 @@ def run_worker(
                     wavlm_compile=wavlm_compile,
                     wavlm_compile_mode=wavlm_compile_mode,
                     wavlm_compile_dynamic=wavlm_compile_dynamic,
+                    wavlm_stream_layer_sum=wavlm_stream_layer_sum,
                     emotion_autocast_dtype=emotion_autocast_dtype,
                     emotion_compile=emotion_compile,
                     emotion_compile_mode=emotion_compile_mode,

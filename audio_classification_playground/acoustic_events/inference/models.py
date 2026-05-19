@@ -33,6 +33,7 @@ from ...vox_profile.wavlm_inference import (
 from .artifacts import SAMPLE_RATE
 from .audio import writable_contiguous_float32
 from .emotion2vec import (
+    make_direct_emotion2vec_scorer,
     predict_emotion2vec_scores,
     predict_emotion2vec_scores_from_audio,
 )
@@ -89,6 +90,7 @@ class AffectPredictor:
         wavlm_compile: bool = False,
         wavlm_compile_mode: str = "reduce-overhead",
         wavlm_compile_dynamic: bool = False,
+        wavlm_stream_layer_sum: bool = False,
     ) -> None:
         import torch
 
@@ -100,11 +102,14 @@ class AffectPredictor:
             else None
         )
         self.wavlm_compile = bool(wavlm_compile and backbone == "wavlm")
+        self.wavlm_stream_layer_sum = bool(wavlm_stream_layer_sum and backbone == "wavlm")
         resolved_id = model_id or DEFAULT_AFFECT_MODELS[backbone]
         self.model_id = resolved_id
         self._device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         wrapper = _load_affect_wrapper(backbone)
         self._model = wrapper.from_pretrained(resolved_id).to(self._device).eval()
+        if self.wavlm_stream_layer_sum:
+            self._model.wavlm_stream_layer_sum = True
         if self.wavlm_compile:
             compile_wavlm_backbone(
                 self._model,
@@ -112,11 +117,12 @@ class AffectPredictor:
                 dynamic=wavlm_compile_dynamic,
             )
         LOGGER.info(
-            "AffectPredictor loaded: %s on %s autocast=%s compile=%s",
+            "AffectPredictor loaded: %s on %s autocast=%s compile=%s stream_layer_sum=%s",
             resolved_id,
             self._device,
             self.wavlm_autocast_dtype,
             self.wavlm_compile,
+            self.wavlm_stream_layer_sum,
         )
 
     def __call__(self, windows: np.ndarray) -> dict[str, np.ndarray]:
@@ -156,6 +162,7 @@ class DisfluencyPredictor:
         wavlm_compile: bool = False,
         wavlm_compile_mode: str = "reduce-overhead",
         wavlm_compile_dynamic: bool = False,
+        wavlm_stream_layer_sum: bool = False,
     ) -> None:
         import torch
 
@@ -167,11 +174,14 @@ class DisfluencyPredictor:
             else None
         )
         self.wavlm_compile = bool(wavlm_compile and backbone == "wavlm")
+        self.wavlm_stream_layer_sum = bool(wavlm_stream_layer_sum and backbone == "wavlm")
         resolved_id = model_id or DEFAULT_DISFLUENCY_MODELS[backbone]
         self.model_id = resolved_id
         self._device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         wrapper = _load_disfluency_wrapper(backbone)
         self._model = wrapper.from_pretrained(resolved_id).to(self._device).eval()
+        if self.wavlm_stream_layer_sum:
+            self._model.wavlm_stream_layer_sum = True
         if self.wavlm_compile:
             compile_wavlm_backbone(
                 self._model,
@@ -179,11 +189,12 @@ class DisfluencyPredictor:
                 dynamic=wavlm_compile_dynamic,
             )
         LOGGER.info(
-            "DisfluencyPredictor loaded: %s on %s autocast=%s compile=%s",
+            "DisfluencyPredictor loaded: %s on %s autocast=%s compile=%s stream_layer_sum=%s",
             resolved_id,
             self._device,
             self.wavlm_autocast_dtype,
             self.wavlm_compile,
+            self.wavlm_stream_layer_sum,
         )
 
     def __call__(self, windows: np.ndarray) -> dict[str, np.ndarray]:
@@ -239,10 +250,12 @@ class EmotionPredictor:
         if device is not None:
             auto_kwargs["device"] = device
         self._model = AutoModel(**auto_kwargs)
-        if self.compile_model:
-            import torch
-
-            self._model.model = torch.compile(self._model.model, mode=compile_mode)
+        self._direct_scorer = make_direct_emotion2vec_scorer(
+            self._model,
+            sample_rate=self.sample_rate,
+            compile_model=self.compile_model,
+            compile_mode=self.compile_mode,
+        )
         LOGGER.info(
             "EmotionPredictor loaded: %s autocast=%s compile=%s",
             model_id,
@@ -251,12 +264,20 @@ class EmotionPredictor:
         )
 
     def __call__(self, windows: np.ndarray) -> tuple[np.ndarray, Sequence[str]]:
+        if self._direct_scorer is not None:
+            return self._direct_scorer.predict_windows(
+                windows,
+                batch_size=self.batch_size,
+                autocast_dtype=self.autocast_dtype,
+            )
         return predict_emotion2vec_scores(
             self._model,
             windows,
             sample_rate=self.sample_rate,
             batch_size=self.batch_size,
             autocast_dtype=self.autocast_dtype,
+            compile_model=self.compile_model,
+            compile_mode=self.compile_mode,
         )
 
     def predict_audio(
@@ -272,6 +293,16 @@ class EmotionPredictor:
             raise ValueError(
                 f"EmotionPredictor loaded for {self.sample_rate} Hz, got {sample_rate} Hz"
             )
+        if self._direct_scorer is not None:
+            return self._direct_scorer.predict_audio(
+                samples,
+                sample_rate=self.sample_rate,
+                window_sec=window_sec,
+                hop_sec=hop_sec,
+                batch_size=self.batch_size,
+                autocast_dtype=self.autocast_dtype,
+                progress=progress,
+            )
         return predict_emotion2vec_scores_from_audio(
             self._model,
             samples,
@@ -280,6 +311,8 @@ class EmotionPredictor:
             hop_sec=hop_sec,
             batch_size=self.batch_size,
             autocast_dtype=self.autocast_dtype,
+            compile_model=self.compile_model,
+            compile_mode=self.compile_mode,
             progress=progress,
         )
 
@@ -365,6 +398,7 @@ class ModelSuite:
         wavlm_compile: bool = False,
         wavlm_compile_mode: str = "reduce-overhead",
         wavlm_compile_dynamic: bool = False,
+        wavlm_stream_layer_sum: bool = False,
         emotion_autocast_dtype: str | None = None,
         emotion_compile: bool = False,
         emotion_compile_mode: str = "reduce-overhead",
@@ -385,6 +419,7 @@ class ModelSuite:
             wavlm_compile=wavlm_compile,
             wavlm_compile_mode=wavlm_compile_mode,
             wavlm_compile_dynamic=wavlm_compile_dynamic,
+            wavlm_stream_layer_sum=wavlm_stream_layer_sum,
         )
         self.disfluency = DisfluencyPredictor(
             backbone=disfluency_backbone,
@@ -394,6 +429,7 @@ class ModelSuite:
             wavlm_compile=wavlm_compile,
             wavlm_compile_mode=wavlm_compile_mode,
             wavlm_compile_dynamic=wavlm_compile_dynamic,
+            wavlm_stream_layer_sum=wavlm_stream_layer_sum,
         )
         self.emotion = EmotionPredictor(
             batch_size=batches["emotion"],

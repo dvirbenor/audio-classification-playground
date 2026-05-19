@@ -438,6 +438,7 @@ class InferenceArtifactTest(unittest.TestCase):
                 wavlm_autocast_dtype="bf16",
                 wavlm_compile=True,
                 wavlm_compile_dynamic=True,
+                wavlm_stream_layer_sum=True,
                 allow_tf32=True,
                 progress=_quiet,
             )
@@ -448,6 +449,7 @@ class InferenceArtifactTest(unittest.TestCase):
             self.assertEqual(config["torch_compile_target"], "wavlm_backbone")
             self.assertEqual(config["torch_compile_mode"], "reduce-overhead")
             self.assertTrue(config["torch_compile_dynamic"])
+            self.assertTrue(config["wavlm_stream_layer_sum"])
             self.assertTrue(config["torch_allow_tf32"])
 
     def test_artifacts_adapt_to_existing_producers(self):

@@ -91,6 +91,7 @@ def _cmd_run(args: argparse.Namespace) -> None:
         wavlm_compile=args.wavlm_compile,
         wavlm_compile_mode=args.wavlm_compile_mode,
         wavlm_compile_dynamic=args.wavlm_compile_dynamic,
+        wavlm_stream_layer_sum=args.wavlm_stream_layer_sum,
         emotion_autocast_dtype=args.emotion_autocast_dtype,
         emotion_compile=args.emotion_compile,
         emotion_compile_mode=args.emotion_compile_mode,
@@ -403,6 +404,11 @@ def main(argv: list[str] | None = None) -> None:
         "--wavlm-compile-dynamic",
         action="store_true",
         help="Compile WavLM backbones with dynamic shapes to reduce last-batch recompiles.",
+    )
+    p_run.add_argument(
+        "--wavlm-stream-layer-sum",
+        action="store_true",
+        help="Accumulate WavLM learned layer mixtures without materializing every hidden state.",
     )
     p_run.add_argument(
         "--emotion-autocast-dtype",

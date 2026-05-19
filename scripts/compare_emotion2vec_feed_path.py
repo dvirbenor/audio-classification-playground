@@ -13,6 +13,7 @@ from funasr import AutoModel
 
 from audio_classification_playground.acoustic_events.inference.audio import frame_audio
 from audio_classification_playground.acoustic_events.inference.emotion2vec import (
+    make_direct_emotion2vec_scorer,
     predict_emotion2vec_scores,
     predict_emotion2vec_scores_from_audio,
 )
@@ -88,6 +89,8 @@ def run_framed(
     batch_size: int,
     *,
     autocast_dtype: str | None = None,
+    compile_model: bool = False,
+    compile_mode: str = "reduce-overhead",
 ):
     all_scores = []
     labels = None
@@ -104,6 +107,8 @@ def run_framed(
             sample_rate=SAMPLE_RATE,
             batch_size=batch_size,
             autocast_dtype=autocast_dtype,
+            compile_model=compile_model,
+            compile_mode=compile_mode,
         )
         if labels is None:
             labels = list(labels_i)
@@ -119,19 +124,34 @@ def run_audio_fed(
     batch_size: int,
     *,
     autocast_dtype: str | None = None,
+    direct_scorer=None,
+    compile_model: bool = False,
+    compile_mode: str = "reduce-overhead",
 ):
     all_scores = []
     labels = None
     for samples in signals:
-        scores, labels_i = predict_emotion2vec_scores_from_audio(
-            auto_model,
-            samples,
-            sample_rate=SAMPLE_RATE,
-            window_sec=WINDOW_SEC,
-            hop_sec=HOP_SEC,
-            batch_size=batch_size,
-            autocast_dtype=autocast_dtype,
-        )
+        if direct_scorer is not None:
+            scores, labels_i = direct_scorer.predict_audio(
+                samples,
+                sample_rate=SAMPLE_RATE,
+                window_sec=WINDOW_SEC,
+                hop_sec=HOP_SEC,
+                batch_size=batch_size,
+                autocast_dtype=autocast_dtype,
+            )
+        else:
+            scores, labels_i = predict_emotion2vec_scores_from_audio(
+                auto_model,
+                samples,
+                sample_rate=SAMPLE_RATE,
+                window_sec=WINDOW_SEC,
+                hop_sec=HOP_SEC,
+                batch_size=batch_size,
+                autocast_dtype=autocast_dtype,
+                compile_model=compile_model,
+                compile_mode=compile_mode,
+            )
         if labels is None:
             labels = list(labels_i)
         elif list(labels_i) != labels:
@@ -335,16 +355,21 @@ def main() -> None:
         configure_tf32(enabled=args.candidate_allow_tf32)
         print(f"Candidate precision state: {precision_state()}")
         if args.candidate_compile:
-            print(f"\nCompiling inner model with mode={args.candidate_compile_mode!r}")
-            auto_model.model = torch.compile(
-                auto_model.model,
-                mode=args.candidate_compile_mode,
-            )
+            print(f"\nCompiling direct scorer with mode={args.candidate_compile_mode!r}")
+        candidate_scorer = make_direct_emotion2vec_scorer(
+            auto_model,
+            sample_rate=SAMPLE_RATE,
+            compile_model=args.candidate_compile,
+            compile_mode=args.candidate_compile_mode,
+        )
         _ = run_audio_fed(
             auto_model,
             warm,
             args.batch_size,
             autocast_dtype=args.candidate_autocast_dtype,
+            direct_scorer=candidate_scorer,
+            compile_model=args.candidate_compile,
+            compile_mode=args.candidate_compile_mode,
         )
         sync_if_cuda(auto_model)
         start = time.perf_counter()
@@ -353,6 +378,9 @@ def main() -> None:
             signals,
             args.batch_size,
             autocast_dtype=args.candidate_autocast_dtype,
+            direct_scorer=candidate_scorer,
+            compile_model=args.candidate_compile,
+            compile_mode=args.candidate_compile_mode,
         )
         sync_if_cuda(auto_model)
         candidate_sec = time.perf_counter() - start

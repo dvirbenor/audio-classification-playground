@@ -46,6 +46,7 @@ def main(argv: list[str] | None = None) -> int:
             wavlm_compile=args.wavlm_compile,
             wavlm_compile_mode=args.wavlm_compile_mode,
             wavlm_compile_dynamic=args.wavlm_compile_dynamic,
+            wavlm_stream_layer_sum=args.wavlm_stream_layer_sum,
             emotion_autocast_dtype=args.emotion_autocast_dtype,
             emotion_compile=args.emotion_compile,
             emotion_compile_mode=args.emotion_compile_mode,
@@ -188,6 +189,11 @@ def _add_wavlm_runtime_options(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="Compile WavLM with dynamic shapes for variable final batches.",
     )
+    parser.add_argument(
+        "--wavlm-stream-layer-sum",
+        action="store_true",
+        help="Accumulate the WavLM learned layer mixture without materializing every hidden state.",
+    )
 
 
 def _add_allow_tf32_option(parser: argparse.ArgumentParser) -> None:
@@ -217,6 +223,7 @@ def _run_single(args, progress):
             wavlm_compile=args.wavlm_compile,
             wavlm_compile_mode=args.wavlm_compile_mode,
             wavlm_compile_dynamic=args.wavlm_compile_dynamic,
+            wavlm_stream_layer_sum=args.wavlm_stream_layer_sum,
             allow_tf32=args.allow_tf32,
             **common,
             **batch_kwargs,
@@ -229,6 +236,7 @@ def _run_single(args, progress):
             wavlm_compile=args.wavlm_compile,
             wavlm_compile_mode=args.wavlm_compile_mode,
             wavlm_compile_dynamic=args.wavlm_compile_dynamic,
+            wavlm_stream_layer_sum=args.wavlm_stream_layer_sum,
             allow_tf32=args.allow_tf32,
             **common,
             **batch_kwargs,
