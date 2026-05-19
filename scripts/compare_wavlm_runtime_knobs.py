@@ -123,17 +123,22 @@ def make_predictor(task: str, args: argparse.Namespace, *, candidate: bool):
         predictor = suite.affect if task == "affect" else suite.disfluency
         return PredictorHandle(predictor, owner=suite)
     if args.resident_companions == "wavlm":
+        predictor_kwargs = {
+            key: value
+            for key, value in runtime_kwargs.items()
+            if key != "allow_tf32"
+        }
         affect = AffectPredictor(
             backbone="wavlm",
             device=args.device,
             batch_size=batch_size,
-            **runtime_kwargs,
+            **predictor_kwargs,
         )
         disfluency = DisfluencyPredictor(
             backbone="wavlm",
             device=args.device,
             batch_size=batch_size,
-            **runtime_kwargs,
+            **predictor_kwargs,
         )
         predictor = affect if task == "affect" else disfluency
         return PredictorHandle(predictor, owner=(affect, disfluency))

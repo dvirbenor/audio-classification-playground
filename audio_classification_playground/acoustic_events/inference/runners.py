@@ -1119,13 +1119,13 @@ def _predict_affect(
                 wavlm_autocast_dtype if backbone == "wavlm" else None,
             ):
                 a, v, d = model(batch)
-            arousal.append(a.detach().float().cpu().reshape(-1).numpy())
-            valence.append(v.detach().float().cpu().reshape(-1).numpy())
-            dominance.append(d.detach().float().cpu().reshape(-1).numpy())
+            arousal.append(a.detach().float().reshape(-1))
+            valence.append(v.detach().float().reshape(-1))
+            dominance.append(d.detach().float().reshape(-1))
     return {
-        "arousal": np.concatenate(arousal),
-        "valence": np.concatenate(valence),
-        "dominance": np.concatenate(dominance),
+        "arousal": torch.cat(arousal).cpu().numpy(),
+        "valence": torch.cat(valence).cpu().numpy(),
+        "dominance": torch.cat(dominance).cpu().numpy(),
     }
 
 
@@ -1171,11 +1171,11 @@ def _predict_disfluency(
                 wavlm_autocast_dtype if backbone == "wavlm" else None,
             ):
                 f, d = model(batch, return_feature=False)
-            fluency.append(f.detach().float().cpu().numpy())
-            dysfluency.append(d.detach().float().cpu().numpy())
+            fluency.append(f.detach().float())
+            dysfluency.append(d.detach().float())
     return {
-        "fluency_logits": np.concatenate(fluency, axis=0),
-        "disfluency_type_logits": np.concatenate(dysfluency, axis=0),
+        "fluency_logits": torch.cat(fluency, dim=0).cpu().numpy(),
+        "disfluency_type_logits": torch.cat(dysfluency, dim=0).cpu().numpy(),
     }
 
 
