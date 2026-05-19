@@ -13,7 +13,7 @@ from contextlib import nullcontext
 
 import numpy as np
 
-from .audio import frame_audio, frame_audio_geometry
+from .audio import frame_audio, frame_audio_geometry, writable_contiguous_float32
 
 ProgressFn = Callable[[str], None]
 
@@ -156,7 +156,7 @@ def _predict_direct_batched(
     with torch.inference_mode():
         for start, batch_np in _batches(windows, batch_size, progress, "emotion"):
             end = start + len(batch_np)
-            batch = torch.from_numpy(np.ascontiguousarray(batch_np, dtype=np.float32)).to(device)
+            batch = torch.from_numpy(writable_contiguous_float32(batch_np)).to(device)
             with _autocast_context(torch, device, autocast_dtype):
                 if _cfg_get(getattr(model, "cfg", None), "normalize", False):
                     batch = F.layer_norm(batch, batch.shape[1:])
@@ -202,7 +202,7 @@ def _predict_direct_batched_from_audio(
     keep_index_tensor = torch.tensor(keep_indices, dtype=torch.long, device=device)
     selected_labels = [labels[idx] for idx in keep_indices]
 
-    audio_np = np.ascontiguousarray(samples, dtype=np.float32)
+    audio_np = writable_contiguous_float32(samples)
     n_frames, window_samples, hop_samples, pad_needed = frame_audio_geometry(
         len(audio_np),
         sample_rate=sample_rate,
