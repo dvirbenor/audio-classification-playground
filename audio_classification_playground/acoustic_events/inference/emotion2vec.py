@@ -176,10 +176,11 @@ class DirectEmotion2vecScorer:
         *,
         compile_model: bool = False,
         compile_mode: str = "reduce-overhead",
-    ) -> None:
+        ) -> None:
         import torch
 
         self.auto_model = auto_model
+        self.compiled = bool(compile_model)
         model = auto_model.model
         kwargs = getattr(auto_model, "kwargs", {}) or {}
         tokenizer = kwargs["tokenizer"]
@@ -205,7 +206,7 @@ class DirectEmotion2vecScorer:
             keep_index_tensor,
             bool(_cfg_get(getattr(model, "cfg", None), "normalize", False)),
         ).to(self.device).eval()
-        if compile_model:
+        if self.compiled:
             core = torch.compile(core, mode=compile_mode)
         self.core = core
 
@@ -225,6 +226,15 @@ class DirectEmotion2vecScorer:
         progress: ProgressFn | None = None,
     ) -> tuple[np.ndarray, Sequence[str]]:
         import torch
+
+        if not self.compiled:
+            all_scores: list[np.ndarray] = []
+            with torch.inference_mode():
+                for _, batch_np in _batches(windows, batch_size, progress, "emotion"):
+                    batch = torch.from_numpy(writable_contiguous_float32(batch_np)).to(self.device)
+                    scores = self(batch, autocast_dtype=autocast_dtype)
+                    all_scores.append(scores.detach().cpu().numpy())
+            return np.concatenate(all_scores, axis=0).astype(np.float32, copy=False), self.selected_labels
 
         out = torch.empty(
             (len(windows), len(self.selected_labels)),
@@ -259,6 +269,25 @@ class DirectEmotion2vecScorer:
             window_sec=window_sec,
             hop_sec=hop_sec,
         )
+        if not self.compiled:
+            all_scores: list[np.ndarray] = []
+            with torch.inference_mode():
+                audio = torch.from_numpy(audio_np).to(self.device)
+                if pad_needed:
+                    audio = F.pad(audio, (0, pad_needed))
+                windows = audio.as_strided(
+                    size=(n_frames, window_samples),
+                    stride=(hop_samples, 1),
+                )
+                for start in range(0, n_frames, batch_size):
+                    end = min(start + batch_size, n_frames)
+                    if progress is not None:
+                        progress(f"emotion batch {start}:{end} / {n_frames}")
+                    batch = windows[start:end].contiguous()
+                    scores = self(batch, autocast_dtype=autocast_dtype)
+                    all_scores.append(scores.detach().cpu().numpy())
+            return np.concatenate(all_scores, axis=0).astype(np.float32, copy=False), self.selected_labels
+
         out = torch.empty(
             (n_frames, len(self.selected_labels)),
             dtype=torch.float32,
