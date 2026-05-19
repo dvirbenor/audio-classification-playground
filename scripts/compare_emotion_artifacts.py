@@ -55,6 +55,12 @@ def compare_probabilities(reference_path: str, candidate_path: str, *, diagnosti
     flip_rows = np.flatnonzero(~top1_match)
 
     print("=== probability comparison ===")
+    print(f"reference_path: {reference.path}")
+    print(f"candidate_path: {candidate.path}")
+    print(f"reference_config_hash: {reference.manifest.get('inference_config_hash')}")
+    print(f"candidate_config_hash: {candidate.manifest.get('inference_config_hash')}")
+    print(f"reference_runtime_config: {_runtime_config_summary(reference.manifest)}")
+    print(f"candidate_runtime_config: {_runtime_config_summary(candidate.manifest)}")
     print(f"labels_equal: {ref_labels == cand_labels}")
     print(f"shape: {ref_probs.shape}")
     print(f"max_abs_diff: {float(diff.max()):.10g}")
@@ -81,6 +87,21 @@ def compare_probabilities(reference_path: str, candidate_path: str, *, diagnosti
                 f"reference_margin={ref_margins[row]:.8f} "
                 f"row_max_abs_diff={diff[row].max():.8f}"
             )
+
+
+def _runtime_config_summary(manifest: dict) -> dict:
+    config = manifest.get("inference_config", {})
+    return {
+        key: config.get(key)
+        for key in (
+            "batch_size",
+            "torch_allow_tf32",
+            "torch_autocast_dtype",
+            "torch_compile",
+            "torch_compile_mode",
+        )
+        if key in config
+    }
 
 
 def compare_events(reference_path: str, candidate_path: str, vad_path: str) -> None:

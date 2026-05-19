@@ -31,6 +31,7 @@ from ...vox_profile.wavlm_inference import (
     validate_autocast_dtype,
 )
 from .artifacts import SAMPLE_RATE
+from .audio import writable_contiguous_float32
 from .emotion2vec import (
     predict_emotion2vec_scores,
     predict_emotion2vec_scores_from_audio,
@@ -62,15 +63,14 @@ def _batches(windows: np.ndarray, batch_size: int, task: str):
 
 def configure_torch_matmul(*, allow_tf32: bool) -> None:
     """Apply process-wide torch matmul precision knobs for inference workers."""
-    if not allow_tf32:
-        return
     try:
         import torch
 
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.set_float32_matmul_precision("high")
+        torch.backends.cuda.matmul.allow_tf32 = bool(allow_tf32)
+        torch.backends.cudnn.allow_tf32 = bool(allow_tf32)
+        torch.set_float32_matmul_precision("high" if allow_tf32 else "highest")
     except Exception:
-        LOGGER.warning("Could not enable TF32 matmul settings", exc_info=True)
+        LOGGER.warning("Could not configure torch matmul settings", exc_info=True)
 
 
 class AffectPredictor:
@@ -125,7 +125,7 @@ class AffectPredictor:
         arousal, valence, dominance = [], [], []
         with torch.inference_mode():
             for batch_np in _batches(windows, self.batch_size, "affect"):
-                batch = torch.from_numpy(np.ascontiguousarray(batch_np))
+                batch = torch.from_numpy(writable_contiguous_float32(batch_np))
                 if self.backbone != "wavlm":
                     batch = batch.to(self._device)
                 with autocast_context(torch, self._device, self.wavlm_autocast_dtype):
@@ -192,7 +192,7 @@ class DisfluencyPredictor:
         fluency, dysfluency = [], []
         with torch.inference_mode():
             for batch_np in _batches(windows, self.batch_size, "disfluency"):
-                batch = torch.from_numpy(np.ascontiguousarray(batch_np))
+                batch = torch.from_numpy(writable_contiguous_float32(batch_np))
                 if self.backbone != "wavlm":
                     batch = batch.to(self._device)
                 with autocast_context(torch, self._device, self.wavlm_autocast_dtype):
@@ -318,7 +318,7 @@ class VadDetector:
         import torch
 
         timestamps = self._get_speech_timestamps(
-            torch.from_numpy(np.asarray(samples, dtype=np.float32)),
+            torch.from_numpy(writable_contiguous_float32(samples)),
             self._model,
             sampling_rate=sample_rate,
             threshold=self.threshold,
