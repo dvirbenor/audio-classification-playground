@@ -141,10 +141,12 @@ def summarize_pair(
     pass_label: str,
     *,
     max_abs_tolerance: float,
+    diagnostic_rows: int,
 ):
     diff = np.abs(reference_scores - candidate_scores)
     reference_top = np.argmax(reference_scores, axis=1)
     candidate_top = np.argmax(candidate_scores, axis=1)
+    top1_match = reference_top == candidate_top
     print(f"\n=== {title} ===")
     print(f"labels_equal: {reference_labels == candidate_labels}")
     print(f"shape_reference: {reference_scores.shape}")
@@ -155,14 +157,65 @@ def summarize_pair(
     print(f"max_abs_diff: {float(diff.max()):.10g}")
     print(f"mean_abs_diff: {float(diff.mean()):.10g}")
     print(f"p99_abs_diff: {float(np.quantile(diff, 0.99)):.10g}")
-    print(f"top1_agreement: {float(np.mean(reference_top == candidate_top)):.6f}")
+    print(f"top1_agreement: {float(np.mean(top1_match)):.6f}")
+    _print_top1_diagnostics(
+        reference_scores,
+        candidate_scores,
+        reference_labels,
+        reference_top,
+        candidate_top,
+        diff,
+        max_rows=diagnostic_rows,
+    )
     passed = (
         reference_labels == candidate_labels
         and reference_scores.shape == candidate_scores.shape
         and float(diff.max()) <= max_abs_tolerance
-        and float(np.mean(reference_top == candidate_top)) == 1.0
+        and float(np.mean(top1_match)) == 1.0
     )
     print(f"{pass_label}: {passed}")
+
+
+def _top2_margins(scores: np.ndarray) -> np.ndarray:
+    if scores.shape[1] < 2:
+        return np.full(scores.shape[0], np.inf, dtype=np.float32)
+    top2 = np.partition(scores, -2, axis=1)[:, -2:]
+    return top2[:, 1] - top2[:, 0]
+
+
+def _print_top1_diagnostics(
+    reference_scores: np.ndarray,
+    candidate_scores: np.ndarray,
+    labels: list[str],
+    reference_top: np.ndarray,
+    candidate_top: np.ndarray,
+    diff: np.ndarray,
+    *,
+    max_rows: int,
+) -> None:
+    flip_rows = np.flatnonzero(reference_top != candidate_top)
+    print(f"top1_flip_count: {int(len(flip_rows))}")
+    if len(flip_rows) == 0:
+        return
+
+    reference_margins = _top2_margins(reference_scores)
+    candidate_margins = _top2_margins(candidate_scores)
+    print(f"top1_flip_reference_margin_min: {float(reference_margins[flip_rows].min()):.10g}")
+    print(f"top1_flip_reference_margin_median: {float(np.median(reference_margins[flip_rows])):.10g}")
+    print(f"top1_flip_candidate_margin_median: {float(np.median(candidate_margins[flip_rows])):.10g}")
+    print(f"top1_flip_row_max_abs_diff_max: {float(diff[flip_rows].max(axis=1).max()):.10g}")
+    for row in flip_rows[:max(0, max_rows)]:
+        ref_i = int(reference_top[row])
+        cand_i = int(candidate_top[row])
+        print(
+            "top1_flip: "
+            f"row={int(row)} "
+            f"time_sec={row * HOP_SEC:.2f} "
+            f"reference={labels[ref_i]!r}:{reference_scores[row, ref_i]:.8f} "
+            f"candidate={labels[cand_i]!r}:{candidate_scores[row, cand_i]:.8f} "
+            f"reference_margin={reference_margins[row]:.8f} "
+            f"row_max_abs_diff={diff[row].max():.8f}"
+        )
 
 
 def main() -> None:
@@ -183,6 +236,12 @@ def main() -> None:
         type=float,
         default=1e-3,
         help="Acceptance threshold for optional runtime knobs.",
+    )
+    parser.add_argument(
+        "--diagnostic-rows",
+        type=int,
+        default=5,
+        help="Number of top-1 flip rows to print.",
     )
     args = parser.parse_args()
 
@@ -252,6 +311,7 @@ def main() -> None:
         audio_sec,
         "PASS_FEED_PATH_EQUIVALENCE",
         max_abs_tolerance=1e-6,
+        diagnostic_rows=args.diagnostic_rows,
     )
 
     if (
@@ -292,6 +352,7 @@ def main() -> None:
             candidate_sec,
             "PASS_RUNTIME_KNOB_TOLERANCE",
             max_abs_tolerance=args.candidate_max_abs_tolerance,
+            diagnostic_rows=args.diagnostic_rows,
         )
 
 
