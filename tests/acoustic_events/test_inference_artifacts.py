@@ -424,7 +424,7 @@ class InferenceArtifactTest(unittest.TestCase):
             config = result.artifact.manifest["inference_config"]
             self.assertEqual(config["torch_autocast_dtype"], "bf16")
             self.assertTrue(config["torch_compile"])
-            self.assertEqual(config["torch_compile_mode"], "reduce-overhead")
+            self.assertEqual(config["torch_compile_mode"], "default")
             self.assertTrue(config["torch_allow_tf32"])
 
     def test_wavlm_runtime_knobs_are_recorded_in_affect_config(self):

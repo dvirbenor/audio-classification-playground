@@ -90,7 +90,7 @@ def run_framed(
     *,
     autocast_dtype: str | None = None,
     compile_model: bool = False,
-    compile_mode: str = "reduce-overhead",
+    compile_mode: str = "default",
 ):
     all_scores = []
     labels = None
@@ -126,7 +126,7 @@ def run_audio_fed(
     autocast_dtype: str | None = None,
     direct_scorer=None,
     compile_model: bool = False,
-    compile_mode: str = "reduce-overhead",
+    compile_mode: str = "default",
 ):
     all_scores = []
     labels = None
@@ -259,7 +259,7 @@ def main() -> None:
     parser.add_argument("--max-windows-per-file", type=int, default=160)
     parser.add_argument("--candidate-autocast-dtype", choices=("fp16", "bf16"))
     parser.add_argument("--candidate-compile", action="store_true")
-    parser.add_argument("--candidate-compile-mode", default="reduce-overhead")
+    parser.add_argument("--candidate-compile-mode", default="default")
     parser.add_argument("--candidate-allow-tf32", action="store_true")
     parser.add_argument(
         "--candidate-max-abs-tolerance",

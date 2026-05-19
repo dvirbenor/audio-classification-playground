@@ -230,7 +230,7 @@ class EmotionPredictor:
         device: str | None = None,
         autocast_dtype: str | None = None,
         compile_model: bool = False,
-        compile_mode: str = "reduce-overhead",
+        compile_mode: str = "default",
     ) -> None:
         from funasr import AutoModel
 
@@ -401,7 +401,7 @@ class ModelSuite:
         wavlm_stream_layer_sum: bool = False,
         emotion_autocast_dtype: str | None = None,
         emotion_compile: bool = False,
-        emotion_compile_mode: str = "reduce-overhead",
+        emotion_compile_mode: str = "default",
         allow_tf32: bool = False,
     ) -> None:
         configure_torch_matmul(allow_tf32=allow_tf32)

@@ -148,7 +148,7 @@ def build_expected_configs(
     wavlm_stream_layer_sum: bool = False,
     emotion_autocast_dtype: str | None = None,
     emotion_compile: bool = False,
-    emotion_compile_mode: str = "reduce-overhead",
+    emotion_compile_mode: str = "default",
     allow_tf32: bool = False,
 ) -> dict[str, dict]:
     """Compute expected inference configs for each task.
@@ -272,7 +272,7 @@ def run_worker(
     wavlm_stream_layer_sum: bool = False,
     emotion_autocast_dtype: str | None = None,
     emotion_compile: bool = False,
-    emotion_compile_mode: str = "reduce-overhead",
+    emotion_compile_mode: str = "default",
     allow_tf32: bool = False,
     prefetch_workers: int = PREFETCH_WORKERS,
     prefetch_lookahead: int = PREFETCH_LOOKAHEAD,

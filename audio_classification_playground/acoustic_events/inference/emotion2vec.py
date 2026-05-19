@@ -26,7 +26,7 @@ def predict_emotion2vec_scores(
     batch_size: int,
     autocast_dtype: str | None = None,
     compile_model: bool = False,
-    compile_mode: str = "reduce-overhead",
+    compile_mode: str = "default",
     progress: ProgressFn | None = None,
 ) -> tuple[np.ndarray, Sequence[str]]:
     """Return raw emotion2vec scores and labels for framed audio windows.
@@ -71,7 +71,7 @@ def predict_emotion2vec_scores_from_audio(
     batch_size: int,
     autocast_dtype: str | None = None,
     compile_model: bool = False,
-    compile_mode: str = "reduce-overhead",
+    compile_mode: str = "default",
     progress: ProgressFn | None = None,
 ) -> tuple[np.ndarray, Sequence[str]]:
     """Return emotion2vec scores for the same windows as ``frame_audio``.
@@ -175,7 +175,7 @@ class DirectEmotion2vecScorer:
         auto_model,
         *,
         compile_model: bool = False,
-        compile_mode: str = "reduce-overhead",
+        compile_mode: str = "default",
     ) -> None:
         import torch
 
@@ -207,6 +207,7 @@ class DirectEmotion2vecScorer:
             bool(_cfg_get(getattr(model, "cfg", None), "normalize", False)),
         ).to(self.device).eval()
         if self.compiled:
+            _validate_compile_mode_for_device(compile_mode, self.device)
             core = torch.compile(core, mode=compile_mode)
         self.core = core
 
@@ -318,7 +319,7 @@ def make_direct_emotion2vec_scorer(
     *,
     sample_rate: int,
     compile_model: bool = False,
-    compile_mode: str = "reduce-overhead",
+    compile_mode: str = "default",
 ) -> DirectEmotion2vecScorer | None:
     if not _supports_direct_batched_scores(auto_model, sample_rate):
         return None
@@ -472,3 +473,14 @@ def _mark_cudagraph_step_begin(torch, device) -> None:
     mark = getattr(compiler, "cudagraph_mark_step_begin", None)
     if mark is not None:
         mark()
+
+
+def _validate_compile_mode_for_device(mode: str, device) -> None:
+    if mode != "reduce-overhead" or getattr(device, "type", None) != "cuda":
+        return
+    raise ValueError(
+        "emotion2vec torch.compile mode 'reduce-overhead' is not supported on CUDA "
+        "for this FunASR path because it uses CUDA Graph replay and can fail across "
+        "repeated batches with overwritten internal tensors. Use "
+        "--emotion-compile-mode default."
+    )

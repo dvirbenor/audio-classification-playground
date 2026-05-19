@@ -167,7 +167,7 @@ def _add_emotion_runtime_options(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="Compile the emotion2vec inner torch model before inference.",
     )
-    parser.add_argument("--emotion-compile-mode", default="reduce-overhead")
+    parser.add_argument("--emotion-compile-mode", default="default")
     _add_allow_tf32_option(parser)
 
 

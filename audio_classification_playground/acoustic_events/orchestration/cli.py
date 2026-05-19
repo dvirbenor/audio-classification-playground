@@ -421,7 +421,7 @@ def main(argv: list[str] | None = None) -> None:
         action="store_true",
         help="Compile the persistent emotion2vec inner torch model once.",
     )
-    p_run.add_argument("--emotion-compile-mode", default="reduce-overhead")
+    p_run.add_argument("--emotion-compile-mode", default="default")
     p_run.add_argument(
         "--allow-tf32",
         action="store_true",

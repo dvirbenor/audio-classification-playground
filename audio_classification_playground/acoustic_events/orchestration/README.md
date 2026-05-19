@@ -216,7 +216,6 @@ It can also test optional runtime knobs against the FP32 eager audio-fed path:
 ```bash
 uv run python scripts/compare_emotion2vec_feed_path.py \
     --device cuda --batch-size 64 \
-    --candidate-autocast-dtype bf16 \
     --candidate-compile \
     --candidate-allow-tf32 \
     /path/to/audio.wav
@@ -227,8 +226,13 @@ acceptable `max_abs_diff` and `top1_agreement` on representative audio. When
 enabled in the worker, they are recorded in the emotion inference config:
 
 ```bash
---emotion-autocast-dtype bf16 --emotion-compile --allow-tf32
+--emotion-compile --allow-tf32
 ```
+
+For emotion2vec, `--emotion-compile` defaults to PyTorch compile mode
+`default`. Avoid `--emotion-compile-mode reduce-overhead` for this FunASR model:
+it uses CUDA Graph replay and can fail with overwritten internal tensors across
+repeated batch calls. Use BF16/FP16 only after separate event-level validation.
 
 ### Config-Aware Completion
 

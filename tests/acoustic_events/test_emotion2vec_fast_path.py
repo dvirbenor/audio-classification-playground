@@ -5,6 +5,7 @@ import numpy as np
 import torch
 
 from audio_classification_playground.acoustic_events.inference.emotion2vec import (
+    _validate_compile_mode_for_device,
     predict_emotion2vec_scores,
     predict_emotion2vec_scores_from_audio,
 )
@@ -143,6 +144,13 @@ class Emotion2vecFastPathTest(unittest.TestCase):
                 {"len": 1, "batch_size": 1, "fs": 8_000, "disable_pbar": True},
             ],
         )
+
+    def test_reduce_overhead_compile_mode_is_rejected_for_cuda(self):
+        with self.assertRaisesRegex(ValueError, "reduce-overhead"):
+            _validate_compile_mode_for_device("reduce-overhead", torch.device("cuda"))
+
+        _validate_compile_mode_for_device("default", torch.device("cuda"))
+        _validate_compile_mode_for_device("reduce-overhead", torch.device("cpu"))
 
 
 if __name__ == "__main__":
