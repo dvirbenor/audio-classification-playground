@@ -109,3 +109,11 @@ def count_audio_frames(
         hop_sec=hop_sec,
     )
     return n_frames
+
+
+def writable_contiguous_float32(values: np.ndarray) -> np.ndarray:
+    """Return a C-contiguous, writable float32 array for torch.from_numpy."""
+    arr = np.asarray(values, dtype=np.float32)
+    if arr.flags.c_contiguous and arr.flags.writeable:
+        return arr
+    return np.array(arr, dtype=np.float32, order="C", copy=True)
