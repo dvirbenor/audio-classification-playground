@@ -110,7 +110,7 @@ def make_predictor(task: str, args: argparse.Namespace, *, candidate: bool):
             wavlm_stream_layer_sum=args.candidate_stream_layer_sum,
             allow_tf32=args.candidate_allow_tf32,
         )
-    if args.resident_suite:
+    if args.resident_companions == "all":
         suite = ModelSuite(
             affect_backbone="wavlm",
             disfluency_backbone="wavlm",
@@ -122,6 +122,21 @@ def make_predictor(task: str, args: argparse.Namespace, *, candidate: bool):
         )
         predictor = suite.affect if task == "affect" else suite.disfluency
         return PredictorHandle(predictor, owner=suite)
+    if args.resident_companions == "wavlm":
+        affect = AffectPredictor(
+            backbone="wavlm",
+            device=args.device,
+            batch_size=batch_size,
+            **runtime_kwargs,
+        )
+        disfluency = DisfluencyPredictor(
+            backbone="wavlm",
+            device=args.device,
+            batch_size=batch_size,
+            **runtime_kwargs,
+        )
+        predictor = affect if task == "affect" else disfluency
+        return PredictorHandle(predictor, owner=(affect, disfluency))
 
     kwargs = {
         "backbone": "wavlm",
@@ -207,8 +222,13 @@ def run_task(task: str, windows: np.ndarray, args: argparse.Namespace) -> dict:
         "window_count": int(len(windows)),
         "baseline_batch_size": args.batch_size,
         "candidate_batch_size": args.candidate_batch_size,
-        "resident_suite": args.resident_suite,
-        "emotion_batch_size": args.emotion_batch_size if args.resident_suite else None,
+        "resident_suite": args.resident_companions == "all",
+        "resident_companions": args.resident_companions,
+        "emotion_batch_size": (
+            args.emotion_batch_size
+            if args.resident_companions == "all"
+            else None
+        ),
         "candidate": {
             "autocast_dtype": args.candidate_autocast_dtype,
             "compile": args.candidate_compile,
@@ -309,7 +329,16 @@ def main() -> None:
     parser.add_argument(
         "--resident-suite",
         action="store_true",
-        help="Load the full production ModelSuite so idle models remain in VRAM during the task run.",
+        help="Alias for --resident-companions all.",
+    )
+    parser.add_argument(
+        "--resident-companions",
+        choices=("none", "wavlm", "all"),
+        default="none",
+        help=(
+            "Load idle companion models during the task run: none, both WavLM "
+            "models only, or the full production ModelSuite."
+        ),
     )
     parser.add_argument(
         "--emotion-batch-size",
@@ -334,6 +363,8 @@ def main() -> None:
     parser.add_argument("--rtol", type=float, default=1e-3)
     parser.add_argument("--json-out")
     args = parser.parse_args()
+    if args.resident_suite:
+        args.resident_companions = "all"
     if args.candidate_batch_size is None:
         args.candidate_batch_size = args.batch_size
 
