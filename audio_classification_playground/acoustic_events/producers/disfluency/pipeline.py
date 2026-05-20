@@ -4,6 +4,13 @@ This producer consumes already-computed window-pooled logits. It does not run
 model inference. The binary fluency head defines candidate regions, while the
 multi-label disfluency type head names and explains those regions.
 
+When VAD intervals are provided, candidate regions are filtered by speech
+support: a region must contain at least ``min_support_frames`` frames that
+overlap speech to be emitted as an event.  Event boundaries are preserved —
+the speech check decides whether to emit, not where to clip.  By default,
+VAD is required; callers without VAD get tracks-only output unless they pass
+``require_vad_for_events=False``.
+
 ``Sound Repetition``-dominant regions are suppressed by default because an
 audit on conversational/podcast-like audio found those regions were mostly
 laughter, background, or otherwise non-target audio. This is a use-case
@@ -48,11 +55,23 @@ def produce_disfluency_events(
     hop_sec: float,
     window_sec: float,
     audio_duration_sec: float | None = None,
+    vad_intervals: Sequence[tuple[float, float]] | None = None,
+    require_vad_for_events: bool = True,
     config: DisfluencyConfig | None = None,
     producer_id: str = DEFAULT_PRODUCER_ID,
     source_model: str = DEFAULT_SOURCE_MODEL,
 ) -> tuple[ProducerRun, list[RegularGridTrack], list[Event]]:
-    """Build a producer run, evidence tracks, and disfluency events."""
+    """Build a producer run, evidence tracks, and disfluency events.
+
+    Tracks are always computed over all frames regardless of VAD.  Events are
+    gated by speech activity when *vad_intervals* is provided: each candidate
+    region must contain at least ``min_support_frames`` speech-overlapping
+    frames to be emitted.
+
+    When *require_vad_for_events* is ``True`` (default) and *vad_intervals*
+    is ``None``, only tracks are produced — no events.  Pass
+    ``require_vad_for_events=False`` to reproduce legacy unfiltered behavior.
+    """
     cfg = config or DisfluencyConfig.balanced()
     fluency, type_logits = _validated_logits(
         fluency_logits,
@@ -78,12 +97,15 @@ def produce_disfluency_events(
         hop_sec=hop_sec,
         window_sec=window_sec,
         audio_duration_sec=audio_duration_sec,
+        vad_intervals=vad_intervals,
+        require_vad_for_events=require_vad_for_events,
         config=cfg,
         producer_id=producer_id,
     )
     run = make_producer_run(
         cfg,
         summary=summary,
+        require_vad_for_events=require_vad_for_events,
         producer_id=producer_id,
         source_model=source_model,
     )
@@ -150,6 +172,8 @@ def extract_events(
     hop_sec: float,
     window_sec: float,
     audio_duration_sec: float | None = None,
+    vad_intervals: Sequence[tuple[float, float]] | None = None,
+    require_vad_for_events: bool = True,
     config: DisfluencyConfig | None = None,
     producer_id: str = DEFAULT_PRODUCER_ID,
 ) -> list[Event]:
@@ -168,6 +192,8 @@ def extract_events(
         hop_sec=hop_sec,
         window_sec=window_sec,
         audio_duration_sec=audio_duration_sec,
+        vad_intervals=vad_intervals,
+        require_vad_for_events=require_vad_for_events,
         config=cfg,
         producer_id=producer_id,
     )
@@ -178,20 +204,29 @@ def make_producer_run(
     config: DisfluencyConfig | dict | None = None,
     *,
     summary: dict | None = None,
+    require_vad_for_events: bool = True,
     producer_id: str = DEFAULT_PRODUCER_ID,
     source_model: str = DEFAULT_SOURCE_MODEL,
 ) -> ProducerRun:
     """Build producer metadata for a disfluency extraction run."""
     cfg = config or DisfluencyConfig.balanced()
-    cfg_dict = asdict(cfg) if is_dataclass(cfg) else dict(cfg)
+    cfg_dict = _effective_config_dict(cfg, require_vad_for_events=require_vad_for_events)
     outputs = {
         "candidate_region_count": 0,
         "emitted_event_count": 0,
         "suppressed_pure_sound_repetition_count": 0,
         "suppressed_dominant_type_region_count": 0,
+        "suppressed_insufficient_speech_count": 0,
         "unspecified_region_count": 0,
         "emitted_unspecified_event_count": 0,
         "label_counts": {},
+        "vad": {
+            "provided": False,
+            "required_for_events": bool(require_vad_for_events),
+            "speech_frame_count": 0,
+            "total_frame_count": 0,
+            "no_event_reason": None,
+        },
         "audit_note": (
             "Sound Repetition-dominant regions are suppressed by default for "
             "conversational/podcast-like audio; set suppressed_types=() for "
@@ -220,16 +255,55 @@ def _extract_events_with_summary(
     hop_sec: float,
     window_sec: float,
     audio_duration_sec: float | None,
+    vad_intervals: Sequence[tuple[float, float]] | None,
+    require_vad_for_events: bool,
     config: DisfluencyConfig,
     producer_id: str,
 ) -> tuple[list[Event], dict]:
-    regions = _support_regions(p_disfluent, hop_sec, config)
-    events: list[Event] = []
-    counters = Counter()
+    n_frames = len(p_disfluent)
+    centers = _frame_centers(n_frames, hop_sec, window_sec)
 
-    centers = _frame_centers(len(p_disfluent), hop_sec, window_sec)
-    suppressed = set(config.suppressed_types)
+    # --- Build speech mask once; consumed by both policy and filter ----------
+    speech_mask: np.ndarray | None = None
+    if vad_intervals is not None:
+        speech_mask = _speech_mask(centers, hop_sec, vad_intervals)
+
+    # --- Three-way VAD policy ------------------------------------------------
+    no_event_reason: str | None = None
+    if vad_intervals is None and require_vad_for_events:
+        no_event_reason = "vad_required_but_missing"
+    elif speech_mask is not None and not speech_mask.any():
+        no_event_reason = "vad_found_no_speech"
+
+    if no_event_reason is not None:
+        return [], _empty_summary(
+            n_frames=n_frames,
+            speech_mask=speech_mask,
+            vad_intervals=vad_intervals,
+            require_vad_for_events=require_vad_for_events,
+            no_event_reason=no_event_reason,
+        )
+
+    # --- Candidate regions from model confidence -----------------------------
+    regions = _support_regions(p_disfluent, hop_sec, config)
+    candidate_region_count = len(regions)
+
+    # --- Speech-support filter (before type classification) ------------------
+    counters: Counter = Counter()
     min_support_frames = _min_support_frames(config.min_support_sec, hop_sec)
+
+    if speech_mask is not None:
+        filtered: list[tuple[int, int]] = []
+        for start, end in regions:
+            if int(speech_mask[start:end].sum()) >= min_support_frames:
+                filtered.append((start, end))
+            else:
+                counters["suppressed_insufficient_speech_count"] += 1
+        regions = filtered
+
+    # --- Type classification and event emission ------------------------------
+    events: list[Event] = []
+    suppressed = set(config.suppressed_types)
 
     for region in regions:
         candidate = _candidate_from_region(
@@ -277,6 +351,7 @@ def _extract_events_with_summary(
             label=label,
             event_index=len(events),
             producer_id=producer_id,
+            speech_mask=speech_mask,
             thresholds={
                 "seed_threshold": float(config.seed_threshold),
                 "shoulder_threshold": float(config.shoulder_threshold),
@@ -292,13 +367,21 @@ def _extract_events_with_summary(
 
     label_counts = Counter(event.label for event in events)
     summary = {
-        "candidate_region_count": len(regions),
+        "candidate_region_count": candidate_region_count,
         "emitted_event_count": len(events),
+        "suppressed_insufficient_speech_count": counters["suppressed_insufficient_speech_count"],
         "suppressed_pure_sound_repetition_count": counters["suppressed_pure_sound_repetition_count"],
         "suppressed_dominant_type_region_count": counters["suppressed_dominant_type_region_count"],
         "unspecified_region_count": counters["unspecified_region_count"],
         "emitted_unspecified_event_count": counters["emitted_unspecified_event_count"],
         "label_counts": dict(sorted(label_counts.items())),
+        "vad": {
+            "provided": vad_intervals is not None,
+            "required_for_events": bool(require_vad_for_events),
+            "speech_frame_count": int(speech_mask.sum()) if speech_mask is not None else 0,
+            "total_frame_count": n_frames,
+            "no_event_reason": no_event_reason,
+        },
     }
     return events, summary
 
@@ -386,12 +469,40 @@ def _event_from_candidate(
     label: str,
     event_index: int,
     producer_id: str,
+    speech_mask: np.ndarray | None,
     thresholds: dict,
 ) -> Event:
     normalized_label = LABEL_TO_EVENT_LABEL[label]
     event_id = f"{producer_id}.{EVENT_TYPE}.{event_index:06d}"
     start_sec = float(candidate["center_start_sec"])
     end_sec = float(candidate["center_end_sec"])
+    start_frame = int(candidate["support_start_frame"])
+    end_frame = int(candidate["support_end_frame"])
+
+    extra: dict = {
+        "support_start_frame": start_frame,
+        "support_end_frame": end_frame,
+        "peak_frame": int(candidate["peak_frame"]),
+        "center_support_bounds": {
+            "start_sec": start_sec,
+            "end_sec": end_sec,
+        },
+        "full_receptive_window_bounds": {
+            "start_sec": float(candidate["full_start_sec"]),
+            "end_sec": float(candidate["full_end_sec"]),
+        },
+        "model_label_order": {
+            "fluency": FLUENCY_LABELS,
+            "disfluency_type": DISFLUENCY_TYPE_LABELS,
+        },
+        "thresholds": thresholds,
+        "window_semantics": WINDOW_SEMANTICS,
+    }
+    if speech_mask is not None:
+        region_mask = speech_mask[start_frame:end_frame]
+        extra["speech_support_frames"] = int(region_mask.sum())
+        extra["speech_ratio"] = float(region_mask.mean())
+
     return Event(
         event_id=event_id,
         producer_id=producer_id,
@@ -415,25 +526,7 @@ def _event_from_candidate(
             "type_max": candidate["type_max"],
             "type_mean": candidate["type_mean"],
         },
-        extra={
-            "support_start_frame": int(candidate["support_start_frame"]),
-            "support_end_frame": int(candidate["support_end_frame"]),
-            "peak_frame": int(candidate["peak_frame"]),
-            "center_support_bounds": {
-                "start_sec": start_sec,
-                "end_sec": end_sec,
-            },
-            "full_receptive_window_bounds": {
-                "start_sec": float(candidate["full_start_sec"]),
-                "end_sec": float(candidate["full_end_sec"]),
-            },
-            "model_label_order": {
-                "fluency": FLUENCY_LABELS,
-                "disfluency_type": DISFLUENCY_TYPE_LABELS,
-            },
-            "thresholds": thresholds,
-            "window_semantics": WINDOW_SEMANTICS,
-        },
+        extra=extra,
     )
 
 
@@ -583,6 +676,84 @@ def _sigmoid(values: np.ndarray) -> np.ndarray:
     exp_values = np.exp(values[~positive])
     out[~positive] = exp_values / (1.0 + exp_values)
     return out
+
+
+def _normalize_intervals(
+    intervals: Sequence[tuple[float, float]],
+) -> tuple[tuple[float, float], ...]:
+    """Validate, sort, and merge overlapping VAD intervals."""
+    merged: list[list[float]] = []
+    for start, end in sorted((float(s), float(e)) for s, e in intervals):
+        if not math.isfinite(start) or not math.isfinite(end):
+            raise ValueError(
+                f"VAD interval contains non-finite value: ({start}, {end})"
+            )
+        if end <= start:
+            raise ValueError(
+                f"VAD interval has non-positive duration: ({start}, {end})"
+            )
+        if merged and start <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+    return tuple((s, e) for s, e in merged)
+
+
+def _speech_mask(
+    centers: np.ndarray,
+    hop_sec: float,
+    vad_intervals: Sequence[tuple[float, float]],
+) -> np.ndarray:
+    """Project VAD intervals onto frame hop bins as a boolean mask."""
+    mask = np.zeros(centers.shape[0], dtype=bool)
+    frame_start = centers - 0.5 * hop_sec
+    frame_end = centers + 0.5 * hop_sec
+    for start, end in _normalize_intervals(vad_intervals):
+        mask |= (start < frame_end) & (end > frame_start)
+    return mask
+
+
+def _effective_config_dict(
+    config: DisfluencyConfig | dict,
+    *,
+    require_vad_for_events: bool,
+) -> dict:
+    """Build the config dict used for hashing and provenance.
+
+    ``require_vad_for_events`` is a runtime mode, not a ``DisfluencyConfig``
+    field, but it affects the output and must participate in the config hash.
+    """
+    cfg = asdict(config) if is_dataclass(config) else dict(config)
+    cfg["require_vad_for_events"] = bool(require_vad_for_events)
+    return cfg
+
+
+def _empty_summary(
+    *,
+    n_frames: int,
+    speech_mask: np.ndarray | None,
+    vad_intervals: Sequence[tuple[float, float]] | None,
+    require_vad_for_events: bool,
+    no_event_reason: str,
+) -> dict:
+    """Summary for early-exit paths where no events are produced."""
+    return {
+        "candidate_region_count": 0,
+        "emitted_event_count": 0,
+        "suppressed_insufficient_speech_count": 0,
+        "suppressed_pure_sound_repetition_count": 0,
+        "suppressed_dominant_type_region_count": 0,
+        "unspecified_region_count": 0,
+        "emitted_unspecified_event_count": 0,
+        "label_counts": {},
+        "vad": {
+            "provided": vad_intervals is not None,
+            "required_for_events": bool(require_vad_for_events),
+            "speech_frame_count": int(speech_mask.sum()) if speech_mask is not None else 0,
+            "total_frame_count": n_frames,
+            "no_event_reason": no_event_reason,
+        },
+    }
 
 
 def _config_hash(config: dict) -> str:

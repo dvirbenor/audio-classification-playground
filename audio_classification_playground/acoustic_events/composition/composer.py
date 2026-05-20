@@ -76,26 +76,41 @@ def compose_affect_from_artifacts(
 def compose_disfluency_from_artifacts(
     *,
     disfluency_artifact: PredictionArtifact | str | Path,
+    vad_artifact: PredictionArtifact | str | Path | None = None,
     config: DisfluencyConfig | Mapping | None = None,
 ) -> tuple[ProducerRun, list[PredictionTrack], list[Event]]:
-    """Run the disfluency producer from an inference artifact."""
+    """Run the disfluency producer from inference artifacts.
+
+    When *vad_artifact* is omitted, the default ``require_vad_for_events=True``
+    means only tracks are produced — no events.  Pass a VAD artifact to enable
+    speech-gated event extraction, or use a config override to opt out.
+    """
     artifact = _coerce_artifact(disfluency_artifact)
     _require_task(artifact, "disfluency")
+    vad_source = _coerce_artifact(vad_artifact) if vad_artifact is not None else None
+    if vad_source is not None:
+        _require_task(vad_source, "vad")
+        _validate_same_audio([artifact, vad_source])
     cfg = _resolve_config(DisfluencyConfig.balanced(), config)
     fluency, types, hop_sec, window_sec, duration = artifact_to_disfluency_logits(artifact)
+    vad_intervals = artifact_to_vad(vad_source).intervals if vad_source is not None else None
     run, tracks, events = produce_disfluency_events(
         fluency_logits=fluency,
         disfluency_type_logits=types,
         hop_sec=hop_sec,
         window_sec=window_sec,
         audio_duration_sec=duration,
+        vad_intervals=vad_intervals,
         config=cfg,
         source_model=_source_model(artifact),
     )
+    provenance: dict = {"disfluency": _artifact_provenance(artifact)}
+    if vad_source is not None:
+        provenance["vad"] = _artifact_provenance(vad_source)
     run = _with_outputs(
         run,
-        inference_artifacts={"disfluency": _artifact_provenance(artifact)},
-        composition={"vad_applied": False},
+        inference_artifacts=provenance,
+        composition={"vad_applied": vad_source is not None},
     )
     return run, list(tracks), list(events)
 
@@ -183,6 +198,7 @@ def compose_review_package(
     LOGGER.info("composing disfluency")
     disfluency_run, disfluency_tracks, disfluency_events = compose_disfluency_from_artifacts(
         disfluency_artifact=artifacts["disfluency"],
+        vad_artifact=artifacts["vad"],
         config=configs.get("disfluency"),
     )
     LOGGER.info("disfluency: %d events, %d tracks", len(disfluency_events), len(disfluency_tracks))

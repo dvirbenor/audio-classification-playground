@@ -102,6 +102,8 @@ class CompositionPackageTest(unittest.TestCase):
                 self.assertEqual(prov["inference_config_hash"], source["inference_config_hash"])
                 self.assertEqual(prov["model"], source["model"])
             self.assertIn("vad", by_task["emotion"]["outputs"]["inference_artifacts"])
+            self.assertIn("vad", by_task["disfluency"]["outputs"]["inference_artifacts"])
+            self.assertTrue(by_task["disfluency"]["outputs"]["composition"]["vad_applied"])
 
     def test_config_override_changes_package_id(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -115,7 +117,7 @@ class CompositionPackageTest(unittest.TestCase):
                 out_dir=root / "packages",
             )
             cfg_path = root / "disfluency_config.json"
-            cfg_path.write_text(json.dumps({"seed_threshold": 0.85}), encoding="utf-8")
+            cfg_path.write_text(json.dumps({"seed_threshold": 0.75}), encoding="utf-8")
             changed = compose_review_package(
                 affect_artifact=artifacts["affect"].path,
                 disfluency_artifact=artifacts["disfluency"].path,
@@ -130,7 +132,7 @@ class CompositionPackageTest(unittest.TestCase):
                 r for r in load_review_package(changed).package["producer_runs"]
                 if r["task"] == "disfluency"
             )
-            self.assertEqual(run["config"]["seed_threshold"], 0.85)
+            self.assertEqual(run["config"]["seed_threshold"], 0.75)
 
     def test_rejects_mixed_audio_artifacts(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -159,8 +161,14 @@ class CompositionPackageTest(unittest.TestCase):
                 affect_artifact=artifacts["affect"],
                 vad_artifact=artifacts["vad"],
             )
-            d1 = compose_disfluency_from_artifacts(disfluency_artifact=artifacts["disfluency"])
-            d2 = compose_disfluency_from_artifacts(disfluency_artifact=artifacts["disfluency"])
+            d1 = compose_disfluency_from_artifacts(
+                disfluency_artifact=artifacts["disfluency"],
+                vad_artifact=artifacts["vad"],
+            )
+            d2 = compose_disfluency_from_artifacts(
+                disfluency_artifact=artifacts["disfluency"],
+                vad_artifact=artifacts["vad"],
+            )
             e1 = compose_emotion_from_artifacts(emotion_artifact=artifacts["emotion"])
             e2 = compose_emotion_from_artifacts(emotion_artifact=artifacts["emotion"])
 
@@ -256,6 +264,32 @@ class CompositionPackageTest(unittest.TestCase):
             self.assertNotIn("data_path", meta)
             tracks = TestClient(make_app(package_path)).get("/api/tracks").json()
             self.assertEqual(tracks["tracks"]["vocalization.markers"][0]["label"], "laugh")
+
+    def test_compose_disfluency_with_vad_records_provenance(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            artifacts = _make_artifacts(Path(tmp))
+            run, tracks, events = compose_disfluency_from_artifacts(
+                disfluency_artifact=artifacts["disfluency"],
+                vad_artifact=artifacts["vad"],
+            )
+
+            self.assertIn("vad", run.outputs["inference_artifacts"])
+            self.assertTrue(run.outputs["composition"]["vad_applied"])
+            self.assertGreater(len(events), 0)
+            self.assertTrue(run.outputs["vad"]["provided"])
+
+    def test_compose_disfluency_without_vad_is_tracks_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            artifacts = _make_artifacts(Path(tmp))
+            run, tracks, events = compose_disfluency_from_artifacts(
+                disfluency_artifact=artifacts["disfluency"],
+            )
+
+            self.assertEqual(events, [])
+            self.assertGreater(len(tracks), 0)
+            self.assertFalse(run.outputs["composition"]["vad_applied"])
+            self.assertFalse(run.outputs["vad"]["provided"])
+            self.assertEqual(run.outputs["vad"]["no_event_reason"], "vad_required_but_missing")
 
     def test_legacy_session_json_is_not_review_entrypoint(self):
         with tempfile.TemporaryDirectory() as tmp:

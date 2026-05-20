@@ -95,6 +95,7 @@ class DisfluencyProducerTest(unittest.TestCase):
             types,
             hop_sec=0.25,
             window_sec=3.0,
+            require_vad_for_events=False,
             config=DisfluencyConfig(
                 seed_threshold=0.70,
                 shoulder_threshold=0.50,
@@ -129,6 +130,7 @@ class DisfluencyProducerTest(unittest.TestCase):
             type_logits([{}, {"Block": 0.9}, {"Block": 0.9}, {}]),
             hop_sec=0.25,
             window_sec=3.0,
+            require_vad_for_events=False,
             config=cfg,
         )
         one_frame = extract_events(
@@ -136,6 +138,7 @@ class DisfluencyProducerTest(unittest.TestCase):
             type_logits([{}, {"Block": 0.9}, {}]),
             hop_sec=0.25,
             window_sec=3.0,
+            require_vad_for_events=False,
             config=cfg,
         )
         coarse_hop = extract_events(
@@ -143,6 +146,7 @@ class DisfluencyProducerTest(unittest.TestCase):
             type_logits([{}, {"Block": 0.9}, {}]),
             hop_sec=1.0,
             window_sec=3.0,
+            require_vad_for_events=False,
             config=cfg,
         )
 
@@ -164,6 +168,7 @@ class DisfluencyProducerTest(unittest.TestCase):
             type_logits([{"Block": 0.9}, {}, {"Block": 0.9}]),
             hop_sec=0.25,
             window_sec=3.0,
+            require_vad_for_events=False,
             config=cfg,
         )
         separated = extract_events(
@@ -171,6 +176,7 @@ class DisfluencyProducerTest(unittest.TestCase):
             type_logits([{"Block": 0.9}, {}, {}, {"Block": 0.9}]),
             hop_sec=0.25,
             window_sec=3.0,
+            require_vad_for_events=False,
             config=cfg,
         )
 
@@ -195,6 +201,7 @@ class DisfluencyProducerTest(unittest.TestCase):
             ]),
             hop_sec=0.25,
             window_sec=3.0,
+            require_vad_for_events=False,
             config=cfg,
         )
 
@@ -219,6 +226,7 @@ class DisfluencyProducerTest(unittest.TestCase):
             ]),
             hop_sec=0.25,
             window_sec=3.0,
+            require_vad_for_events=False,
             config=cfg,
         )
         tied_run, _, tied_events = produce_disfluency_events(
@@ -229,6 +237,7 @@ class DisfluencyProducerTest(unittest.TestCase):
             ]),
             hop_sec=0.25,
             window_sec=3.0,
+            require_vad_for_events=False,
             config=cfg,
         )
 
@@ -247,6 +256,7 @@ class DisfluencyProducerTest(unittest.TestCase):
             ]),
             hop_sec=0.25,
             window_sec=3.0,
+            require_vad_for_events=False,
             config=DisfluencyConfig(
                 seed_threshold=0.70,
                 shoulder_threshold=0.50,
@@ -275,12 +285,14 @@ class DisfluencyProducerTest(unittest.TestCase):
             disfluency_type_logits=types,
             hop_sec=0.25,
             window_sec=3.0,
+            require_vad_for_events=False,
         )
         unspecified_run, _, unspecified_events = produce_disfluency_events(
             fluency_logits=fluency,
             disfluency_type_logits=types,
             hop_sec=0.25,
             window_sec=3.0,
+            require_vad_for_events=False,
             config=DisfluencyConfig(emit_unspecified=True),
         )
 
@@ -298,6 +310,7 @@ class DisfluencyProducerTest(unittest.TestCase):
             disfluency_type_logits=type_logits([{}, {}]),
             hop_sec=0.25,
             window_sec=3.0,
+            require_vad_for_events=False,
             config=DisfluencyConfig(emit_unspecified=True),
         )
 
@@ -317,6 +330,7 @@ class DisfluencyProducerTest(unittest.TestCase):
             ]),
             hop_sec=0.25,
             window_sec=3.0,
+            require_vad_for_events=False,
             config=DisfluencyConfig(suppressed_types=()),
         )
 
@@ -334,6 +348,7 @@ class DisfluencyProducerTest(unittest.TestCase):
             ]),
             hop_sec=0.25,
             window_sec=3.0,
+            require_vad_for_events=False,
             config=DisfluencyConfig(type_threshold=0.70),
         )
 
@@ -346,16 +361,17 @@ class DisfluencyProducerTest(unittest.TestCase):
             audio = root / "sample.wav"
             sf.write(str(audio), np.zeros(80000, dtype=np.float32), 16000)
             run, tracks, events = produce_disfluency_events(
-                fluency_logits=binary_logits([0.1, 0.8, 0.85, 0.1]),
+                fluency_logits=binary_logits([0.1, 0.90, 0.95, 0.1]),
                 disfluency_type_logits=type_logits([
                     {},
-                    {"Interjection": 0.8},
-                    {"Interjection": 0.9},
+                    {"Interjection": 0.92},
+                    {"Interjection": 0.95},
                     {},
                 ]),
                 hop_sec=0.25,
                 window_sec=3.0,
                 audio_duration_sec=5.0,
+                require_vad_for_events=False,
             )
 
             self.assertEqual(len(events), 1)
@@ -381,6 +397,198 @@ class DisfluencyProducerTest(unittest.TestCase):
             self.assertIn(FLUENCY_TRACK_ID, data["tracks_meta"])
             self.assertEqual(data["tracks_meta"][TYPE_TRACK_ID]["channels"], list(DISFLUENCY_TYPE_LABELS))
             self.assertEqual(data["events"][0]["label"], "interjection")
+
+
+class DisfluencyVadGatingTest(unittest.TestCase):
+    """VAD-based speech gating for disfluency event extraction."""
+
+    CFG = DisfluencyConfig(
+        seed_threshold=0.70,
+        shoulder_threshold=0.50,
+        min_support_sec=0.50,
+        merge_gap_sec=0.0,
+        type_threshold=0.70,
+    )
+    HOP = 0.25
+    WINDOW = 3.0
+
+    def _two_frame_disfluent(self):
+        """Two adjacent high-confidence disfluent frames (min_support_frames=2)."""
+        return (
+            binary_logits([0.1, 0.8, 0.9, 0.1]),
+            type_logits([{}, {"Block": 0.9}, {"Block": 0.9}, {}]),
+        )
+
+    def test_vad_required_but_missing_emits_no_events(self):
+        fluency, types = self._two_frame_disfluent()
+        run, tracks, events = produce_disfluency_events(
+            fluency_logits=fluency,
+            disfluency_type_logits=types,
+            hop_sec=self.HOP,
+            window_sec=self.WINDOW,
+            config=self.CFG,
+        )
+
+        self.assertEqual(events, [])
+        self.assertEqual(len(tracks), 2)
+        vad = run.outputs["vad"]
+        self.assertFalse(vad["provided"])
+        self.assertTrue(vad["required_for_events"])
+        self.assertEqual(vad["no_event_reason"], "vad_required_but_missing")
+
+    def test_vad_found_no_speech_emits_no_events(self):
+        fluency, types = self._two_frame_disfluent()
+        run, tracks, events = produce_disfluency_events(
+            fluency_logits=fluency,
+            disfluency_type_logits=types,
+            hop_sec=self.HOP,
+            window_sec=self.WINDOW,
+            vad_intervals=(),
+            config=self.CFG,
+        )
+
+        self.assertEqual(events, [])
+        self.assertEqual(len(tracks), 2)
+        vad = run.outputs["vad"]
+        self.assertTrue(vad["provided"])
+        self.assertEqual(vad["speech_frame_count"], 0)
+        self.assertEqual(vad["no_event_reason"], "vad_found_no_speech")
+
+    def test_require_vad_false_skips_speech_filter(self):
+        fluency, types = self._two_frame_disfluent()
+        run, _, events = produce_disfluency_events(
+            fluency_logits=fluency,
+            disfluency_type_logits=types,
+            hop_sec=self.HOP,
+            window_sec=self.WINDOW,
+            require_vad_for_events=False,
+            config=self.CFG,
+        )
+
+        self.assertEqual(len(events), 1)
+        vad = run.outputs["vad"]
+        self.assertFalse(vad["provided"])
+        self.assertFalse(vad["required_for_events"])
+        self.assertIsNone(vad["no_event_reason"])
+        self.assertNotIn("speech_support_frames", events[0].extra)
+
+    def test_region_in_speech_passes(self):
+        fluency, types = self._two_frame_disfluent()
+        run, _, events = produce_disfluency_events(
+            fluency_logits=fluency,
+            disfluency_type_logits=types,
+            hop_sec=self.HOP,
+            window_sec=self.WINDOW,
+            vad_intervals=((0.0, 10.0),),
+            config=self.CFG,
+        )
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].extra["speech_support_frames"], 2)
+        self.assertAlmostEqual(events[0].extra["speech_ratio"], 1.0)
+        self.assertEqual(run.outputs["suppressed_insufficient_speech_count"], 0)
+
+    def test_region_with_insufficient_speech_support_suppressed(self):
+        fluency, types = self._two_frame_disfluent()
+        # Frame centers: [1.5, 1.75, 2.0, 2.25] (i*0.25 + 1.5)
+        # Region is frames [1,3), centers [1.75, 2.0]
+        # Frame bins: [1.625..1.875, 1.875..2.125]
+        # VAD (1.6, 1.87): overlaps frame 1 (1.625<1.87, 1.6<1.875) but
+        #   not frame 2 (1.875<2.125 yes, but 1.87>1.875 no → False)
+        run, _, events = produce_disfluency_events(
+            fluency_logits=fluency,
+            disfluency_type_logits=types,
+            hop_sec=self.HOP,
+            window_sec=self.WINDOW,
+            vad_intervals=((1.6, 1.87),),
+            config=self.CFG,
+        )
+
+        self.assertEqual(events, [])
+        self.assertEqual(run.outputs["suppressed_insufficient_speech_count"], 1)
+        self.assertEqual(run.outputs["candidate_region_count"], 1)
+
+    def test_region_at_speech_boundary_with_enough_support_passes(self):
+        fluency = binary_logits([0.1, 0.8, 0.9, 0.8, 0.1])
+        types = type_logits([
+            {},
+            {"Block": 0.9},
+            {"Block": 0.9},
+            {"Block": 0.9},
+            {},
+        ])
+        # 3-frame region [1,4), centers [1.75, 2.0, 2.25]
+        # Frame bins: [1.625..1.875, 1.875..2.125, 2.125..2.375]
+        # VAD (0.0, 2.1): overlaps frames 1 and 2, not frame 3 (2.1 < 2.125)
+        run, _, events = produce_disfluency_events(
+            fluency_logits=fluency,
+            disfluency_type_logits=types,
+            hop_sec=self.HOP,
+            window_sec=self.WINDOW,
+            vad_intervals=((0.0, 2.1),),
+            config=self.CFG,
+        )
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].extra["speech_support_frames"], 2)
+        self.assertAlmostEqual(events[0].extra["speech_ratio"], 2.0 / 3.0, places=5)
+
+    def test_empty_vad_suppresses_even_when_not_required(self):
+        fluency, types = self._two_frame_disfluent()
+        run, _, events = produce_disfluency_events(
+            fluency_logits=fluency,
+            disfluency_type_logits=types,
+            hop_sec=self.HOP,
+            window_sec=self.WINDOW,
+            vad_intervals=(),
+            require_vad_for_events=False,
+            config=self.CFG,
+        )
+
+        self.assertEqual(events, [])
+        self.assertEqual(run.outputs["vad"]["no_event_reason"], "vad_found_no_speech")
+
+    def test_invalid_vad_interval_rejected(self):
+        fluency, types = self._two_frame_disfluent()
+        with self.assertRaisesRegex(ValueError, "non-positive duration"):
+            extract_events(
+                fluency, types,
+                hop_sec=self.HOP,
+                window_sec=self.WINDOW,
+                vad_intervals=((3.0, 2.0),),
+                config=self.CFG,
+            )
+        with self.assertRaisesRegex(ValueError, "non-finite"):
+            extract_events(
+                fluency, types,
+                hop_sec=self.HOP,
+                window_sec=self.WINDOW,
+                vad_intervals=((float("nan"), 1.0),),
+                config=self.CFG,
+            )
+
+    def test_config_hash_reflects_require_vad_for_events(self):
+        fluency, types = self._two_frame_disfluent()
+        with_vad, _, _ = produce_disfluency_events(
+            fluency_logits=fluency,
+            disfluency_type_logits=types,
+            hop_sec=self.HOP,
+            window_sec=self.WINDOW,
+            require_vad_for_events=True,
+            config=self.CFG,
+        )
+        without_vad, _, _ = produce_disfluency_events(
+            fluency_logits=fluency,
+            disfluency_type_logits=types,
+            hop_sec=self.HOP,
+            window_sec=self.WINDOW,
+            require_vad_for_events=False,
+            config=self.CFG,
+        )
+
+        self.assertNotEqual(with_vad.config_hash, without_vad.config_hash)
+        self.assertTrue(with_vad.config["require_vad_for_events"])
+        self.assertFalse(without_vad.config["require_vad_for_events"])
 
 
 if __name__ == "__main__":

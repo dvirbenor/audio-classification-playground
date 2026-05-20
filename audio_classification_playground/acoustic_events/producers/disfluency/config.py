@@ -1,5 +1,12 @@
 """Configuration for Vox-Profile disfluency event extraction.
 
+Default thresholds are calibrated for the WavLM backbone
+(``tiantiaf/wavlm-large-speech-flow``).  The WavLM fluency head produces
+elevated P(disfluent) in silence regions, so the seed / shoulder / type
+thresholds are set higher than the legacy Whisper-era values (0.70 / 0.50 /
+0.70) to maintain precision.  Pair these thresholds with VAD-based speech
+gating (the default in the pipeline) for best results.
+
 The default suppression of ``Sound Repetition``-dominant regions is based on a
 listening audit of conversational/podcast-like audio, where those high-score
 regions were mostly laughter, background, or otherwise non-target audio. For
@@ -34,6 +41,12 @@ LABEL_TO_EVENT_LABEL = {
 class DisfluencyConfig:
     """Thresholds and support policy for disfluency event extraction.
 
+    The defaults are tuned for the WavLM speech-flow backbone where the
+    fluency head fires at a higher baseline than Whisper.  Use
+    ``exploratory()`` (which restores the legacy Whisper-era defaults) when
+    running the Whisper backbone or when recall is more important than
+    precision.
+
     ``min_support_sec`` is converted to frames at runtime from the caller's
     hop size using ``max(1, ceil(min_support_sec / hop_sec))``. At coarse hops
     where one hop is already longer than ``min_support_sec``, this resolves to
@@ -41,8 +54,8 @@ class DisfluencyConfig:
     itself provides the temporal context in that case.
     """
 
-    seed_threshold: float = 0.70
-    shoulder_threshold: float = 0.50
+    seed_threshold: float = 0.80
+    shoulder_threshold: float = 0.65
     min_support_sec: float = 0.50
     merge_gap_sec: float = 0.50
     type_threshold: float = 0.70
@@ -74,11 +87,21 @@ class DisfluencyConfig:
 
     @classmethod
     def exploratory(cls) -> "DisfluencyConfig":
-        return replace(cls(), seed_threshold=0.50, shoulder_threshold=0.40)
+        return replace(
+            cls(),
+            seed_threshold=0.70,
+            shoulder_threshold=0.50,
+            type_threshold=0.70,
+        )
 
     @classmethod
     def conservative(cls) -> "DisfluencyConfig":
-        return replace(cls(), seed_threshold=0.85, shoulder_threshold=0.65)
+        return replace(
+            cls(),
+            seed_threshold=0.90,
+            shoulder_threshold=0.70,
+            type_threshold=0.95,
+        )
 
 
 __all__ = [
