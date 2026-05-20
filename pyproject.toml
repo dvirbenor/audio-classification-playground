@@ -39,6 +39,7 @@ dependencies = [
     "pyarrow>=21.0.0",
     "onnx>=1.21.0",
     "onnxruntime-gpu==1.23.2",
+    "onnxscript>=0.7.0",
 ]
 
 [tool.hatch.build.targets.wheel]
