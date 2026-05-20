@@ -5,6 +5,7 @@ import numpy as np
 import torch
 
 from audio_classification_playground.acoustic_events.inference.emotion2vec import (
+    _pad_tensor_batch,
     _validate_compile_mode_for_device,
     predict_emotion2vec_scores,
     predict_emotion2vec_scores_from_audio,
@@ -151,6 +152,15 @@ class Emotion2vecFastPathTest(unittest.TestCase):
 
         _validate_compile_mode_for_device("default", torch.device("cuda"))
         _validate_compile_mode_for_device("reduce-overhead", torch.device("cpu"))
+
+    def test_pad_tensor_batch_preserves_real_rows(self):
+        batch = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+
+        padded = _pad_tensor_batch(batch, 4)
+
+        self.assertEqual(tuple(padded.shape), (4, 3))
+        torch.testing.assert_close(padded[:2], batch)
+        torch.testing.assert_close(padded[2:], torch.zeros((2, 3)))
 
 
 if __name__ == "__main__":

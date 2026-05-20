@@ -249,7 +249,9 @@ class DirectEmotion2vecScorer:
             for start, batch_np in _batches(windows, batch_size, progress, "emotion"):
                 end = start + len(batch_np)
                 batch = torch.from_numpy(writable_contiguous_float32(batch_np)).to(self.device)
-                out[start:end] = self(batch, autocast_dtype=autocast_dtype)
+                actual_size = end - start
+                batch = _pad_tensor_batch(batch, batch_size)
+                out[start:end] = self(batch, autocast_dtype=autocast_dtype)[:actual_size]
         return out.detach().cpu().numpy(), self.selected_labels
 
     def predict_audio(
@@ -309,8 +311,10 @@ class DirectEmotion2vecScorer:
                 end = min(start + batch_size, n_frames)
                 if progress is not None:
                     progress(f"emotion batch {start}:{end} / {n_frames}")
+                actual_size = end - start
                 batch = windows[start:end].contiguous()
-                out[start:end] = self(batch, autocast_dtype=autocast_dtype)
+                batch = _pad_tensor_batch(batch, batch_size)
+                out[start:end] = self(batch, autocast_dtype=autocast_dtype)[:actual_size]
         return out.detach().cpu().numpy(), self.selected_labels
 
 
@@ -473,6 +477,16 @@ def _mark_cudagraph_step_begin(torch, device) -> None:
     mark = getattr(compiler, "cudagraph_mark_step_begin", None)
     if mark is not None:
         mark()
+
+
+def _pad_tensor_batch(batch, target_size: int):
+    import torch
+
+    current_size = int(batch.shape[0])
+    if current_size >= int(target_size):
+        return batch
+    pad_shape = (int(target_size) - current_size, *batch.shape[1:])
+    return torch.cat([batch, batch.new_zeros(pad_shape)], dim=0)
 
 
 def _validate_compile_mode_for_device(mode: str, device) -> None:
