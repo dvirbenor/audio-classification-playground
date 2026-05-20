@@ -177,6 +177,11 @@ def make_session(onnx_path: Path, provider: str, *, cache_dir: Path | None, fall
     return ort.InferenceSession(str(onnx_path), sess_options=session_options, providers=providers)
 
 
+def requested_provider_active(session, provider_name: str) -> bool:
+    """Return whether ONNX Runtime actually kept the requested provider active."""
+    return provider_name in session.get_providers()
+
+
 def resolve_provider_alias(provider: str) -> str:
     normalized = provider.strip().lower()
     aliases = {
@@ -337,7 +342,7 @@ def main() -> None:
     parser.add_argument("--duration-sec", type=float, default=10.0)
     parser.add_argument("--onnx-path", type=Path)
     parser.add_argument("--reuse-onnx", action="store_true")
-    parser.add_argument("--opset", type=int, default=17)
+    parser.add_argument("--opset", type=int, default=18)
     parser.add_argument(
         "--provider",
         action="append",
@@ -437,6 +442,12 @@ def main() -> None:
 
         print(f"\nprovider_requested: {provider_name}")
         print(f"provider_session_chain: {session.get_providers()}")
+        if not requested_provider_active(session, provider_name):
+            print(
+                "SKIP_PROVIDER_FALLBACK: requested provider is not active; "
+                "ONNX Runtime fell back to another provider."
+            )
+            continue
         candidate_scores, ort_timings = benchmark(
             lambda: run_ort_batches(session, windows, batch_size=args.batch_size),
             warmup_runs=args.warmup_runs,

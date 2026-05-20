@@ -249,6 +249,7 @@ uv run python scripts/benchmark_emotion2vec_onnx_tensorrt.py \
     --device cuda \
     --batch-size 64 \
     --max-windows-per-file 10000 \
+    --opset 18 \
     --provider cuda \
     --provider tensorrt \
     --trt-cache-dir /workspace/tmp_data/e2v-trt-cache \
