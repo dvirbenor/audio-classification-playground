@@ -235,8 +235,14 @@ it uses CUDA Graph replay and can fail with overwritten internal tensors across
 repeated batch calls. Use BF16/FP16 only after separate event-level validation.
 
 To explore ONNX Runtime / TensorRT without changing production inference, use
-the sidecar benchmark harness. Install `onnx` plus `onnxruntime-gpu` in the GPU
-environment, then run:
+the sidecar benchmark harness. In the current Python 3.10 GPU image, pin
+ONNX Runtime GPU below 1.24 because newer wheels are Python 3.11+ only:
+
+```bash
+uv pip install onnx 'onnxruntime-gpu==1.23.2'
+```
+
+Then run:
 
 ```bash
 uv run python scripts/benchmark_emotion2vec_onnx_tensorrt.py \
