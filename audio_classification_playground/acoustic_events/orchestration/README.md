@@ -14,7 +14,7 @@ python -m audio_classification_playground.acoustic_events.orchestration run \
     --disfluency-backbone wavlm \
     --device cuda
 
-# Task-fleet mode: run these as separate GPU worker fleets.
+# Task-fleet mode: run these as separate worker fleets.
 # Do not mix task-fleet workers with all-in-one workers on the same output tree.
 python -m audio_classification_playground.acoustic_events.orchestration run \
     --parquet /efs/dvir/data/magic-clips-research/dataset-reference/all_archives.parquet \
@@ -37,11 +37,24 @@ python -m audio_classification_playground.acoustic_events.orchestration run \
 python -m audio_classification_playground.acoustic_events.orchestration run \
     --parquet /efs/dvir/data/magic-clips-research/dataset-reference/all_archives.parquet \
     --output  /efs/dvir/data/magic-clips-research/acoustic-understanding/models-inference \
-    --task-group emotion-vad \
+    --task-group emotion \
     --affect-backbone wavlm \
     --disfluency-backbone wavlm \
     --emotion-batch-size 128 \
+    --prefetch-workers 14 \
+    --prefetch-lookahead 28 \
     --device cuda
+
+python -m audio_classification_playground.acoustic_events.orchestration run \
+    --parquet /efs/dvir/data/magic-clips-research/dataset-reference/all_archives.parquet \
+    --output  /efs/dvir/data/magic-clips-research/acoustic-understanding/models-inference \
+    --task-group vad \
+    --affect-backbone wavlm \
+    --disfluency-backbone wavlm \
+    --prefetch-workers 12 \
+    --prefetch-lookahead 24 \
+    --vad-prefetch-workers 1 \
+    --device cpu
 
 # Quick pulse check — no parquet needed, finishes in seconds
 python -m audio_classification_playground.acoustic_events.orchestration progress \
@@ -145,7 +158,9 @@ python -m audio_classification_playground.acoustic_events.orchestration reclaim-
         <session_id>__<archive_id>.lock
       disfluency/
         <session_id>__<archive_id>.lock
-      emotion-vad/
+      emotion/
+        <session_id>__<archive_id>.lock
+      vad/
         <session_id>__<archive_id>.lock
     audio_errors/
       <session_id>__<archive_id>__<error_type>.json
@@ -154,6 +169,10 @@ python -m audio_classification_playground.acoustic_events.orchestration reclaim-
       affect/
         <uuid>.json
       disfluency/
+        <uuid>.json
+      emotion/
+        <uuid>.json
+      vad/
         <uuid>.json
       emotion-vad/
         <uuid>.json
@@ -181,8 +200,10 @@ python -m audio_classification_playground.acoustic_events.orchestration reclaim-
 ### Coordination
 
 - **Locks**: Atomic `O_CREAT | O_EXCL` files on EFS. All-in-one workers use
-  flat archive locks. Task fleets use nested locks under
-  `_meta/locks/<task-group>/`. Stale locks are reclaimed recursively via the
+  flat archive locks. Task fleets use per-task locks under
+  `_meta/locks/<task>/`. Multi-task groups such as `emotion-vad` claim every
+  missing task lock they may write, so they cannot race with split `emotion`
+  or `vad` workers. Stale locks are reclaimed recursively via the
   `reclaim-stale` CLI.
 - **Mixed-mode safety**: Workers refuse to start when all-in-one locks and
   task-fleet locks coexist on the same output tree. Use separate output trees
@@ -227,15 +248,17 @@ Keep `--prefetch-lookahead` conservative unless stale reclaim runs frequently.
 ### Task Groups and Completion Policy
 
 `--task-group all` is the default and preserves the original all-in-one
-worker behavior. Task-fleet mode lets you run one resident model per GPU worker
-fleet:
+worker behavior. Task-fleet mode lets you run one resident model per GPU
+worker fleet, and move VAD extraction onto CPU-only workers when desired:
 
 | Task group | Tasks written | Models loaded | Lock path | Prefetch defaults |
 |---|---|---|---|---|
 | `all` | `vad`, `affect`, `disfluency`, `emotion` | affect, disfluency, emotion | `_meta/locks/*.lock` | `4/4/1` |
 | `affect` | `affect` | affect | `_meta/locks/affect/*.lock` | `lookahead=8, workers=8, vad=0` |
 | `disfluency` | `disfluency` | disfluency | `_meta/locks/disfluency/*.lock` | `lookahead=8, workers=8, vad=0` |
-| `emotion-vad` | `vad`, `emotion` | emotion + CPU VAD | `_meta/locks/emotion-vad/*.lock` | `lookahead=12, workers=8, vad=1` |
+| `emotion` | `emotion` | emotion | `_meta/locks/emotion/*.lock` | `lookahead=28, workers=14, vad=0` |
+| `vad` | `vad` | none; CPU VAD is owned by prefetch | `_meta/locks/vad/*.lock` | `lookahead=24, workers=12, vad=1` |
+| `emotion-vad` | `vad`, `emotion` | emotion + CPU VAD | `_meta/locks/vad/*.lock` and `_meta/locks/emotion/*.lock` for missing tasks | `lookahead=12, workers=8, vad=1` |
 
 The default completion policy is `--completion-policy exists`. This protects
 already-generated production work: if a task artifact is complete on disk, it
@@ -250,8 +273,8 @@ Use strict config-aware reuse only for controlled experiments:
 
 Use `--force-recompute` only when you intentionally want to ignore existing
 task artifacts for the selected task group. In task-fleet mode, partial
-archives are natural: for example, `emotion-vad` claims an archive when either
-VAD or emotion is missing and reuses whichever one is already complete.
+archives are natural: for example, `emotion-vad` claims only the missing
+`vad`/`emotion` task locks and reuses whichever artifact is already complete.
 
 Do not run `--task-group all` workers and task-fleet workers on the same
 output tree at the same time. The worker has a startup guard for active mixed
@@ -283,7 +306,7 @@ the task-relevant flags on each fleet command. For example:
 # disfluency fleet
 --disfluency-batch-size 384
 
-# emotion-vad fleet
+# emotion fleet
 --emotion-batch-size 128
 ```
 
@@ -782,8 +805,8 @@ python -m audio_classification_playground.acoustic_events.orchestration progress
     --output  /efs/pilot-test
 ```
 
-For task-fleet smoke, use a separate output tree and launch the three task
-groups (`affect`, `disfluency`, `emotion-vad`) with the same pilot parquet.
+For task-fleet smoke, use a separate output tree and launch the four task
+groups (`affect`, `disfluency`, `emotion`, `vad`) with the same pilot parquet.
 Then verify progress, status, errors, timings, and stale-lock reclaim against
 that output tree before reusing the production output.
 
@@ -798,16 +821,18 @@ For all-in-one mode, simply launch N pods with the same arguments. Each pod:
 
 For task-fleet mode, launch separate deployments/jobs with different
 `--task-group` values. Task-scoped locks allow affect, disfluency, and
-emotion-vad fleets to work on the same archive concurrently without duplicate
-writes within a task. Do not run all-in-one and task-fleet workers on the
-same output tree at the same time.
+emotion/VAD fleets to work on the same archive concurrently without duplicate
+writes within a task. The legacy combined `emotion-vad` group now uses the
+same per-task `emotion` and `vad` locks, so it is safe with split fleets after
+old `emotion-vad` pods have stopped. Do not run all-in-one and task-fleet
+workers on the same output tree at the same time.
 
 ### Async VAD Prefetch
 
 In all-in-one mode, `--vad-prefetch-workers` defaults to `1`, making CPU VAD
-the default prefetch path. In affect/disfluency task fleets, the default is
-`0` because those workers do not write or consume VAD. In `emotion-vad`, the
-default is `1`.
+the default prefetch path. In affect/disfluency/emotion task fleets, the
+default is `0` because those workers do not write or consume VAD. In `vad`
+and `emotion-vad`, the default is `1`.
 
 All-in-one starting settings:
 
@@ -821,6 +846,8 @@ consumes prefetched audio faster:
 ```text
 affect:       --prefetch-lookahead 8  --prefetch-workers 8  --vad-prefetch-workers 0
 disfluency:   --prefetch-lookahead 8  --prefetch-workers 8  --vad-prefetch-workers 0
+emotion:      --prefetch-lookahead 28 --prefetch-workers 14 --vad-prefetch-workers 0
+vad:          --prefetch-lookahead 24 --prefetch-workers 12 --vad-prefetch-workers 1
 emotion-vad:  --prefetch-lookahead 12 --prefetch-workers 8  --vad-prefetch-workers 1
 ```
 

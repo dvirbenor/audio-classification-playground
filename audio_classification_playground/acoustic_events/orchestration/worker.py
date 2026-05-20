@@ -79,6 +79,9 @@ from .task_groups import (
     COMPLETION_POLICY_CONFIG,
     COMPLETION_POLICY_EXISTS,
     TASK_GROUP_ALL,
+    TASK_GROUP_EMOTION,
+    TASK_GROUP_EMOTION_VAD,
+    TASK_GROUP_VAD,
     resolve_task_group,
 )
 
@@ -358,6 +361,18 @@ def _guard_against_mixed_lock_modes(output_base: Path, *, task_group: str) -> No
             "Refusing to start task-fleet worker: archive-level all-mode locks are "
             f"active under {output_base / '_meta' / 'locks'}"
         )
+    if task_group in (TASK_GROUP_VAD, TASK_GROUP_EMOTION, TASK_GROUP_EMOTION_VAD):
+        legacy_emotion_vad_locks = (
+            output_base / "_meta" / "locks" / TASK_GROUP_EMOTION_VAD
+        )
+        if legacy_emotion_vad_locks.is_dir() and any(
+            legacy_emotion_vad_locks.glob("*.lock")
+        ):
+            raise RuntimeError(
+                "Refusing to start split VAD/emotion worker while legacy "
+                f"{TASK_GROUP_EMOTION_VAD!r} locks are active under "
+                f"{legacy_emotion_vad_locks}"
+            )
 
 
 def run_worker(
@@ -616,16 +631,40 @@ def run_worker(
     next_entity_idx = 0
     queued: deque[ArchiveEntity] = deque()
 
-    def _try_claim(entity: ArchiveEntity) -> bool:
-        if group.lock_namespace is None:
+    def _try_claim(
+        entity: ArchiveEntity,
+        *,
+        task_names: tuple[str, ...],
+    ) -> bool:
+        if group.lock_namespaces is None:
             return try_claim(output_base, entity)
-        return try_claim(output_base, entity, namespace=group.lock_namespace)
+        acquired: list[str] = []
+        namespaces_to_claim = tuple(
+            namespace for namespace in group.lock_namespaces
+            if namespace in task_names
+        )
+        if not namespaces_to_claim:
+            return False
+        for namespace in namespaces_to_claim:
+            if try_claim(
+                output_base,
+                entity,
+                namespace=namespace,
+                task_group=group.name,
+            ):
+                acquired.append(namespace)
+                continue
+            for acquired_namespace in reversed(acquired):
+                release_claim(output_base, entity, namespace=acquired_namespace)
+            return False
+        return True
 
     def _release(entity: ArchiveEntity) -> None:
-        if group.lock_namespace is None:
+        if group.lock_namespaces is None:
             release_claim(output_base, entity)
         else:
-            release_claim(output_base, entity, namespace=group.lock_namespace)
+            for namespace in group.lock_namespaces:
+                release_claim(output_base, entity, namespace=namespace)
         prefetcher.discard(entity)
 
     def _task_complete(sid: str, aid: str, task: str) -> bool:
@@ -686,7 +725,12 @@ def run_worker(
                 skipped += 1
                 continue
 
-            if not _try_claim(entity):
+            tasks_to_claim = _missing_tasks(sid, aid)
+            if not tasks_to_claim:
+                skipped += 1
+                continue
+
+            if not _try_claim(entity, task_names=tasks_to_claim):
                 skipped += 1
                 continue
 

@@ -65,6 +65,7 @@ def try_claim(
     entity: ArchiveEntity,
     *,
     namespace: str | None = None,
+    task_group: str | None = None,
 ) -> bool:
     """Attempt to atomically create a lock file for *entity*.
 
@@ -80,7 +81,7 @@ def try_claim(
                 f"worker={os.environ.get('HOSTNAME', 'unknown')}\n"
                 f"pid={os.getpid()}\n"
                 f"time={time.time()}\n"
-                f"task_group={namespace or 'all'}\n"
+                f"task_group={task_group or namespace or 'all'}\n"
             )
         return True
     except FileExistsError:
