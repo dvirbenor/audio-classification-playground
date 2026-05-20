@@ -17,6 +17,7 @@ import shutil
 import subprocess
 import time
 import traceback
+import warnings
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -238,13 +239,70 @@ def export_onnx(
         dynamic_axes = {"input_values": {0: "batch"}}
         for name in CURRENT_OUTPUT_NAMES:
             dynamic_axes[name] = {0: "batch"}
+    attempts = []
+    exporters = ("dynamo", "legacy") if exporter == "auto" else (exporter,)
+    started = time.perf_counter()
+    chosen_exporter = None
+    last_error = None
+    for candidate_exporter in exporters:
+        try:
+            _torch_onnx_export(
+                model,
+                dummy,
+                onnx_path,
+                output_names=CURRENT_OUTPUT_NAMES,
+                dynamic_axes=dynamic_axes,
+                opset=opset,
+                exporter=candidate_exporter,
+                external_data=external_data,
+            )
+        except Exception as exc:
+            last_error = exc
+            attempts.append({
+                "exporter": candidate_exporter,
+                "status": "error",
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            })
+        else:
+            chosen_exporter = candidate_exporter
+            attempts.append({"exporter": candidate_exporter, "status": "ok"})
+            break
+    if chosen_exporter is None:
+        raise RuntimeError(f"ONNX export failed: {attempts}") from last_error
+    return {
+        "path": str(onnx_path),
+        "elapsed_sec": time.perf_counter() - started,
+        "size_mb": onnx_path.stat().st_size / 1_000_000,
+        "artifact_size_mb": onnx_artifact_size_mb(onnx_path),
+        "opset": opset,
+        "dynamic_batch": dynamic_batch,
+        "requested_exporter": exporter,
+        "exporter": chosen_exporter,
+        "attempts": attempts,
+        "external_data": external_data,
+    }
+
+
+def _torch_onnx_export(
+    model: nn.Module,
+    dummy: torch.Tensor,
+    onnx_path: Path,
+    *,
+    output_names: tuple[str, ...],
+    dynamic_axes: dict | None,
+    opset: int,
+    exporter: str,
+    external_data: bool,
+) -> None:
     export_kwargs = {
         "input_names": ["input_values"],
-        "output_names": list(CURRENT_OUTPUT_NAMES),
-        "dynamic_axes": dynamic_axes,
+        "output_names": list(output_names),
         "opset_version": opset,
         "do_constant_folding": True,
     }
+    if dynamic_axes is not None:
+        export_kwargs["dynamic_axes"] = dynamic_axes
     signature = inspect.signature(torch.onnx.export)
     if "dynamo" in signature.parameters:
         export_kwargs["dynamo"] = exporter == "dynamo"
@@ -255,23 +313,16 @@ def export_onnx(
     if "external_data" in signature.parameters:
         export_kwargs["external_data"] = external_data
 
-    started = time.perf_counter()
-    torch.onnx.export(
-        model,
-        dummy,
-        str(onnx_path),
-        **export_kwargs,
-    )
-    return {
-        "path": str(onnx_path),
-        "elapsed_sec": time.perf_counter() - started,
-        "size_mb": onnx_path.stat().st_size / 1_000_000,
-        "artifact_size_mb": onnx_artifact_size_mb(onnx_path),
-        "opset": opset,
-        "dynamic_batch": dynamic_batch,
-        "exporter": exporter,
-        "external_data": external_data,
-    }
+    if exporter == "legacy":
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message="You are using the legacy TorchScript-based ONNX export.*",
+                category=DeprecationWarning,
+            )
+            torch.onnx.export(model, dummy, str(onnx_path), **export_kwargs)
+    else:
+        torch.onnx.export(model, dummy, str(onnx_path), **export_kwargs)
 
 
 def onnx_artifact_size_mb(onnx_path: Path) -> float:
@@ -289,6 +340,8 @@ def run_onnxruntime(
     device: str,
     warmup_batches: int,
     provider_mode: str,
+    gpu_mem_limit_mb: int | None,
+    arena_extend_strategy: str,
 ) -> dict:
     try:
         import onnxruntime as ort
@@ -296,7 +349,13 @@ def run_onnxruntime(
         return {"status": "unavailable", "error": f"{type(exc).__name__}: {exc}"}
 
     providers = ort.get_available_providers()
-    requested = choose_ort_providers(providers, device=device, provider_mode=provider_mode)
+    requested = choose_ort_providers(
+        providers,
+        device=device,
+        provider_mode=provider_mode,
+        gpu_mem_limit_mb=gpu_mem_limit_mb,
+        arena_extend_strategy=arena_extend_strategy,
+    )
     if requested is None:
         return {
             "status": "unavailable",
@@ -304,21 +363,32 @@ def run_onnxruntime(
             "available_providers": providers,
         }
 
-    started = time.perf_counter()
-    session = ort.InferenceSession(str(onnx_path), providers=requested)
-    session_create_sec = time.perf_counter() - started
-    actual_providers = session.get_providers()
-    output_names = [output.name for output in session.get_outputs()]
+    try:
+        started = time.perf_counter()
+        session = ort.InferenceSession(str(onnx_path), providers=requested)
+        session_create_sec = time.perf_counter() - started
+        actual_providers = session.get_providers()
+        output_names = [output.name for output in session.get_outputs()]
 
-    rows: list[list[np.ndarray]] = [[] for _ in output_names]
-    for batch_np in inputs[:warmup_batches]:
-        session.run(output_names, {"input_values": batch_np})
-    started = time.perf_counter()
-    for batch_np in inputs:
-        outputs = session.run(output_names, {"input_values": batch_np})
-        for idx, output in enumerate(outputs):
-            rows[idx].append(np.asarray(output, dtype=np.float32))
-    elapsed = time.perf_counter() - started
+        rows: list[list[np.ndarray]] = [[] for _ in output_names]
+        for batch_np in inputs[:warmup_batches]:
+            session.run(output_names, {"input_values": batch_np})
+        started = time.perf_counter()
+        for batch_np in inputs:
+            outputs = session.run(output_names, {"input_values": batch_np})
+            for idx, output in enumerate(outputs):
+                rows[idx].append(np.asarray(output, dtype=np.float32))
+        elapsed = time.perf_counter() - started
+    except Exception as exc:
+        return {
+            "status": "error",
+            "provider_mode": provider_mode,
+            "available_providers": providers,
+            "requested_providers": serialize_ort_providers(requested),
+            "error_type": type(exc).__name__,
+            "error": str(exc),
+            "traceback": traceback.format_exc(limit=8),
+        }
 
     arrays = {
         name: np.concatenate(parts, axis=0)
@@ -330,6 +400,7 @@ def run_onnxruntime(
         "session_create_sec": session_create_sec,
         "provider_mode": provider_mode,
         "providers": actual_providers,
+        "requested_providers": serialize_ort_providers(requested),
         "outputs": arrays,
     }
 
@@ -339,27 +410,64 @@ def choose_ort_providers(
     *,
     device: str,
     provider_mode: str,
-) -> list[str] | None:
+    gpu_mem_limit_mb: int | None,
+    arena_extend_strategy: str,
+) -> list[str | tuple[str, dict[str, str]]] | None:
     has_cuda = torch.device(device).type == "cuda"
+    cuda_options = ort_cuda_provider_options(
+        gpu_mem_limit_mb=gpu_mem_limit_mb,
+        arena_extend_strategy=arena_extend_strategy,
+    )
+    cuda_provider = (
+        ("CUDAExecutionProvider", cuda_options)
+        if cuda_options
+        else "CUDAExecutionProvider"
+    )
     if provider_mode == "cpu":
         return ["CPUExecutionProvider"]
     if provider_mode == "cuda":
         if has_cuda and "CUDAExecutionProvider" in providers:
-            return ["CUDAExecutionProvider", "CPUExecutionProvider"]
+            return [cuda_provider, "CPUExecutionProvider"]
         return None
     if provider_mode == "tensorrt":
         if has_cuda and "TensorrtExecutionProvider" in providers:
             requested = ["TensorrtExecutionProvider"]
             if "CUDAExecutionProvider" in providers:
-                requested.append("CUDAExecutionProvider")
+                requested.append(cuda_provider)
             requested.append("CPUExecutionProvider")
             return requested
         return None
     if provider_mode == "auto":
         if has_cuda and "CUDAExecutionProvider" in providers:
-            return ["CUDAExecutionProvider", "CPUExecutionProvider"]
+            return [cuda_provider, "CPUExecutionProvider"]
         return ["CPUExecutionProvider"]
     raise ValueError(f"Unsupported ONNX Runtime provider mode {provider_mode!r}")
+
+
+def ort_cuda_provider_options(
+    *,
+    gpu_mem_limit_mb: int | None,
+    arena_extend_strategy: str,
+) -> dict[str, str]:
+    options = {}
+    if gpu_mem_limit_mb is not None:
+        options["gpu_mem_limit"] = str(int(gpu_mem_limit_mb) * 1024 * 1024)
+    if arena_extend_strategy == "same-as-requested":
+        options["arena_extend_strategy"] = "kSameAsRequested"
+    elif arena_extend_strategy == "next-power-of-two":
+        options["arena_extend_strategy"] = "kNextPowerOfTwo"
+    elif arena_extend_strategy != "default":
+        raise ValueError(f"Unsupported ORT arena strategy {arena_extend_strategy!r}")
+    return options
+
+
+def serialize_ort_providers(providers: list[str | tuple[str, dict[str, str]]]) -> list:
+    return [
+        {"name": provider[0], "options": provider[1]}
+        if isinstance(provider, tuple)
+        else provider
+        for provider in providers
+    ]
 
 
 def run_trtexec(
@@ -534,12 +642,21 @@ def add_summary(report: dict) -> None:
     report["summary"] = summary
 
 
+def release_cuda_modules(*modules: nn.Module) -> None:
+    for module in modules:
+        module.to("cpu")
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--task", choices=("affect", "disfluency"), required=True)
     parser.add_argument("--audio", required=True)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--candidate-batch-size", type=int)
     parser.add_argument("--num-batches", type=int, default=4)
     parser.add_argument("--warmup-batches", type=int, default=1)
     parser.add_argument("--output-dir", default="/tmp/wavlm_onnx_trt")
@@ -547,7 +664,11 @@ def main() -> None:
     parser.add_argument("--skip-export", action="store_true")
     parser.add_argument("--dynamic-batch", action="store_true")
     parser.add_argument("--opset", type=int, default=17)
-    parser.add_argument("--onnx-exporter", choices=("legacy", "dynamo"), default="legacy")
+    parser.add_argument(
+        "--onnx-exporter",
+        choices=("auto", "legacy", "dynamo"),
+        default="auto",
+    )
     parser.add_argument(
         "--onnx-external-data",
         action=argparse.BooleanOptionalAction,
@@ -560,6 +681,17 @@ def main() -> None:
         "--onnxruntime-provider",
         choices=("auto", "cuda", "tensorrt", "cpu"),
         default="auto",
+    )
+    parser.add_argument("--onnxruntime-gpu-mem-limit-mb", type=int)
+    parser.add_argument(
+        "--onnxruntime-arena-extend-strategy",
+        choices=("default", "same-as-requested", "next-power-of-two"),
+        default="same-as-requested",
+    )
+    parser.add_argument(
+        "--release-pytorch-before-candidates",
+        action=argparse.BooleanOptionalAction,
+        default=True,
     )
     parser.add_argument("--run-trtexec", action="store_true")
     parser.add_argument("--trtexec-path")
@@ -583,12 +715,14 @@ def main() -> None:
 
     global CURRENT_OUTPUT_NAMES
     CURRENT_OUTPUT_NAMES = OUTPUT_NAMES[args.task]
+    candidate_batch_size = args.candidate_batch_size or args.batch_size
 
     report = {
         "task": args.task,
         "audio": args.audio,
         "device": args.device,
         "batch_size": args.batch_size,
+        "candidate_batch_size": candidate_batch_size,
         "num_batches": args.num_batches,
         "warmup_batches": args.warmup_batches,
         "torch": {
@@ -612,6 +746,11 @@ def main() -> None:
         )
         report["duration_sec"] = audio.duration_sec
         report["window_count"] = int(len(windows))
+        if len(windows) % candidate_batch_size and not args.dynamic_batch:
+            raise ValueError(
+                "candidate batch size must divide window_count for static ONNX; "
+                "pass --dynamic-batch to allow a smaller final candidate batch"
+            )
 
         load_started = time.perf_counter()
         model_id, wrapper = load_wavlm_wrapper(args.task, args.device)
@@ -619,7 +758,11 @@ def main() -> None:
         report["model_load_sec"] = time.perf_counter() - load_started
 
         prepared_model = PreparedWavLMWrapper(wrapper, args.task).to(args.device).eval()
-        prepared_inputs, preprocess = prepare_input_batches(wrapper, windows, args.batch_size)
+        prepared_inputs, preprocess = prepare_input_batches(
+            wrapper,
+            windows,
+            candidate_batch_size,
+        )
         report["preprocess"] = preprocess
 
         original = run_pytorch_original(
@@ -648,7 +791,7 @@ def main() -> None:
 
         output_dir = Path(args.output_dir)
         onnx_path = Path(args.onnx_path) if args.onnx_path else (
-            output_dir / f"{args.task}_wavlm_bs{args.batch_size}.onnx"
+            output_dir / f"{args.task}_wavlm_bs{candidate_batch_size}.onnx"
         )
         if args.skip_export:
             report["onnx_export"] = {"status": "skipped", "path": str(onnx_path)}
@@ -668,12 +811,17 @@ def main() -> None:
             }
 
         if not args.skip_onnxruntime:
+            if args.release_pytorch_before_candidates:
+                release_cuda_modules(prepared_model, wrapper)
+                report["released_pytorch_before_candidates"] = True
             ort_result = run_onnxruntime(
                 onnx_path,
                 prepared_inputs,
                 device=args.device,
                 warmup_batches=args.warmup_batches,
                 provider_mode=args.onnxruntime_provider,
+                gpu_mem_limit_mb=args.onnxruntime_gpu_mem_limit_mb,
+                arena_extend_strategy=args.onnxruntime_arena_extend_strategy,
             )
             if ort_result.get("status") == "ok":
                 add_rate(ort_result, len(windows))
@@ -688,10 +836,15 @@ def main() -> None:
                 report["onnxruntime"] = ort_result
 
         if args.run_trtexec:
+            if args.release_pytorch_before_candidates and not report.get(
+                "released_pytorch_before_candidates"
+            ):
+                release_cuda_modules(prepared_model, wrapper)
+                report["released_pytorch_before_candidates"] = True
             report["trtexec"] = run_trtexec(
                 onnx_path,
                 trtexec_path=args.trtexec_path,
-                batch_size=args.batch_size,
+                batch_size=candidate_batch_size,
                 input_samples=prepared_inputs[0].shape[1],
                 precision=args.trt_precision,
                 workspace_mb=args.trt_workspace_mb,
