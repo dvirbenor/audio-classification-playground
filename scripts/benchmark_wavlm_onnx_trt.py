@@ -356,6 +356,9 @@ def run_onnxruntime(
     provider_mode: str,
     gpu_mem_limit_mb: int | None,
     arena_extend_strategy: str,
+    trt_cache_path: str | None,
+    trt_workspace_mb: int | None,
+    trt_fp16: bool,
 ) -> dict:
     try:
         import onnxruntime as ort
@@ -369,6 +372,9 @@ def run_onnxruntime(
         provider_mode=provider_mode,
         gpu_mem_limit_mb=gpu_mem_limit_mb,
         arena_extend_strategy=arena_extend_strategy,
+        trt_cache_path=trt_cache_path,
+        trt_workspace_mb=trt_workspace_mb,
+        trt_fp16=trt_fp16,
     )
     if requested is None:
         return {
@@ -426,7 +432,10 @@ def choose_ort_providers(
     provider_mode: str,
     gpu_mem_limit_mb: int | None,
     arena_extend_strategy: str,
-) -> list[str | tuple[str, dict[str, str]]] | None:
+    trt_cache_path: str | None,
+    trt_workspace_mb: int | None,
+    trt_fp16: bool,
+) -> list[str | tuple[str, dict]] | None:
     has_cuda = torch.device(device).type == "cuda"
     cuda_options = ort_cuda_provider_options(
         gpu_mem_limit_mb=gpu_mem_limit_mb,
@@ -445,7 +454,17 @@ def choose_ort_providers(
         return None
     if provider_mode == "tensorrt":
         if has_cuda and "TensorrtExecutionProvider" in providers:
-            requested = ["TensorrtExecutionProvider"]
+            trt_options = ort_trt_provider_options(
+                cache_path=trt_cache_path,
+                workspace_mb=trt_workspace_mb,
+                fp16=trt_fp16,
+            )
+            trt_provider = (
+                ("TensorrtExecutionProvider", trt_options)
+                if trt_options
+                else "TensorrtExecutionProvider"
+            )
+            requested = [trt_provider]
             if "CUDAExecutionProvider" in providers:
                 requested.append(cuda_provider)
             requested.append("CPUExecutionProvider")
@@ -456,6 +475,26 @@ def choose_ort_providers(
             return [cuda_provider, "CPUExecutionProvider"]
         return ["CPUExecutionProvider"]
     raise ValueError(f"Unsupported ONNX Runtime provider mode {provider_mode!r}")
+
+
+def ort_trt_provider_options(
+    *,
+    cache_path: str | None,
+    workspace_mb: int | None,
+    fp16: bool,
+) -> dict:
+    options = {}
+    if fp16:
+        options["trt_fp16_enable"] = True
+    if workspace_mb is not None:
+        options["trt_max_workspace_size"] = int(workspace_mb) * 1024 * 1024
+    if cache_path:
+        Path(cache_path).mkdir(parents=True, exist_ok=True)
+        options["trt_engine_cache_enable"] = True
+        options["trt_engine_cache_path"] = cache_path
+        options["trt_timing_cache_enable"] = True
+        options["trt_timing_cache_path"] = cache_path
+    return options
 
 
 def ort_cuda_provider_options(
@@ -475,7 +514,7 @@ def ort_cuda_provider_options(
     return options
 
 
-def serialize_ort_providers(providers: list[str | tuple[str, dict[str, str]]]) -> list:
+def serialize_ort_providers(providers: list[str | tuple[str, dict]]) -> list:
     return [
         {"name": provider[0], "options": provider[1]}
         if isinstance(provider, tuple)
@@ -697,6 +736,9 @@ def main() -> None:
         default="auto",
     )
     parser.add_argument("--onnxruntime-gpu-mem-limit-mb", type=int)
+    parser.add_argument("--onnxruntime-trt-cache-path")
+    parser.add_argument("--onnxruntime-trt-workspace-mb", type=int)
+    parser.add_argument("--onnxruntime-trt-fp16", action="store_true")
     parser.add_argument(
         "--onnxruntime-arena-extend-strategy",
         choices=("default", "same-as-requested", "next-power-of-two"),
@@ -836,6 +878,9 @@ def main() -> None:
                 provider_mode=args.onnxruntime_provider,
                 gpu_mem_limit_mb=args.onnxruntime_gpu_mem_limit_mb,
                 arena_extend_strategy=args.onnxruntime_arena_extend_strategy,
+                trt_cache_path=args.onnxruntime_trt_cache_path,
+                trt_workspace_mb=args.onnxruntime_trt_workspace_mb,
+                trt_fp16=args.onnxruntime_trt_fp16,
             )
             if ort_result.get("status") == "ok":
                 add_rate(ort_result, len(windows))

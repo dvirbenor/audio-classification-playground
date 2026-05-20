@@ -201,9 +201,9 @@ def provider_chain(provider_name: str, *, cache_dir: Path | None, fallback: bool
             cache_dir.mkdir(parents=True, exist_ok=True)
             options.update(
                 {
-                    "trt_engine_cache_enable": "1",
+                    "trt_engine_cache_enable": "True",
                     "trt_engine_cache_path": str(cache_dir),
-                    "trt_timing_cache_enable": "1",
+                    "trt_timing_cache_enable": "True",
                     "trt_timing_cache_path": str(cache_dir / "trt_timing.cache"),
                 }
             )
