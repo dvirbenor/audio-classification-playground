@@ -111,6 +111,12 @@ def make_predictor(task: str, args: argparse.Namespace, *, candidate: bool):
             allow_tf32=args.candidate_allow_tf32,
         )
     if args.resident_companions == "all":
+        emotion_kwargs = {}
+        if candidate and args.candidate_allow_tf32:
+            # This benchmark toggles TF32 as a candidate experiment. ModelSuite
+            # also applies the process-wide flag to emotion2vec, whose preset
+            # resolver rejects granular TF32 unless the run is explicitly custom.
+            emotion_kwargs["emotion_runtime_mode"] = "custom"
         suite = ModelSuite(
             affect_backbone="wavlm",
             disfluency_backbone="wavlm",
@@ -118,6 +124,7 @@ def make_predictor(task: str, args: argparse.Namespace, *, candidate: bool):
             emotion_batch_size=args.emotion_batch_size,
             device=args.device,
             load_vad=False,
+            **emotion_kwargs,
             **runtime_kwargs,
         )
         predictor = suite.affect if task == "affect" else suite.disfluency
