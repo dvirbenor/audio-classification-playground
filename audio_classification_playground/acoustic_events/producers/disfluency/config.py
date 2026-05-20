@@ -7,11 +7,11 @@ thresholds are set higher than the legacy Whisper-era values (0.70 / 0.50 /
 0.70) to maintain precision.  Pair these thresholds with VAD-based speech
 gating (the default in the pipeline) for best results.
 
-The default suppression of ``Sound Repetition``-dominant regions is based on a
-listening audit of conversational/podcast-like audio, where those high-score
-regions were mostly laughter, background, or otherwise non-target audio. For
-clinical or stuttering-focused work where sound repetitions are themselves a
-target event, set ``suppressed_types=()``.
+The default suppression of ``Sound Repetition`` means that type is excluded
+from label selection, but a region is still emitted when another non-suppressed
+type is active — even if the suppressed type has a higher probability at the
+peak frame.  Only regions where *every* active type is suppressed are dropped.
+Set ``suppressed_types=()`` to allow all types as event labels.
 """
 from __future__ import annotations
 

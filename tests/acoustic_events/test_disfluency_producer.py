@@ -210,7 +210,7 @@ class DisfluencyProducerTest(unittest.TestCase):
         self.assertEqual(events[0].evidence["active_types"][0]["name"], "Word Repetition")
         self.assertEqual(events[0].evidence["suppressed_active_types"][0]["name"], "Sound Repetition")
 
-    def test_sound_repetition_dominant_or_tied_at_peak_vetoes_region(self):
+    def test_sound_repetition_dominant_at_peak_still_emits_non_suppressed_label(self):
         cfg = DisfluencyConfig(
             seed_threshold=0.70,
             shoulder_threshold=0.50,
@@ -218,7 +218,7 @@ class DisfluencyProducerTest(unittest.TestCase):
             merge_gap_sec=0.0,
             type_threshold=0.70,
         )
-        dominant_run, _, dominant_events = produce_disfluency_events(
+        run, _, events = produce_disfluency_events(
             fluency_logits=binary_logits([0.8, 0.9]),
             disfluency_type_logits=type_logits([
                 {"Sound Repetition": 0.8, "Word Repetition": 0.9},
@@ -229,25 +229,14 @@ class DisfluencyProducerTest(unittest.TestCase):
             require_vad_for_events=False,
             config=cfg,
         )
-        tied_run, _, tied_events = produce_disfluency_events(
-            fluency_logits=binary_logits([0.8, 0.9]),
-            disfluency_type_logits=type_logits([
-                {"Sound Repetition": 0.8, "Word Repetition": 0.9},
-                {"Sound Repetition": 0.85, "Word Repetition": 0.85},
-            ]),
-            hop_sec=0.25,
-            window_sec=3.0,
-            require_vad_for_events=False,
-            config=cfg,
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].label, "word_repetition")
+        self.assertTrue(
+            any(t["name"] == "Sound Repetition" for t in events[0].evidence["suppressed_active_types"]),
         )
 
-        self.assertEqual(dominant_events, [])
-        self.assertEqual(tied_events, [])
-        self.assertEqual(dominant_run.outputs["suppressed_dominant_type_region_count"], 1)
-        self.assertEqual(tied_run.outputs["suppressed_dominant_type_region_count"], 1)
-        self.assertEqual(dominant_run.outputs["unspecified_region_count"], 0)
-
-    def test_sound_repetition_max_outside_peak_does_not_veto(self):
+    def test_sound_repetition_high_overall_still_labels_non_suppressed(self):
         events = extract_events(
             binary_logits([0.8, 0.9]),
             type_logits([
@@ -297,10 +286,10 @@ class DisfluencyProducerTest(unittest.TestCase):
         )
 
         self.assertEqual(default_events, [])
-        self.assertEqual(default_run.outputs["suppressed_pure_sound_repetition_count"], 1)
+        self.assertEqual(default_run.outputs["suppressed_pure_count"], 1)
         self.assertEqual(default_run.outputs["unspecified_region_count"], 1)
         self.assertEqual(unspecified_events, [])
-        self.assertEqual(unspecified_run.outputs["suppressed_pure_sound_repetition_count"], 1)
+        self.assertEqual(unspecified_run.outputs["suppressed_pure_count"], 1)
         self.assertEqual(unspecified_run.outputs["unspecified_region_count"], 1)
         self.assertEqual(unspecified_run.outputs["emitted_unspecified_event_count"], 0)
 
