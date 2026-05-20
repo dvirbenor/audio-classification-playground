@@ -8,16 +8,16 @@ stateful Silero model is never shared across concurrent calls.
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 import threading
 import time
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from pathlib import Path
 
 import numpy as np
 
 from ..inference.audio import AudioData, load_audio
-from .audio_resolver import AudioResolutionError, resolve_and_download
+from .audio_resolver import AudioDownloadResult, AudioResolutionError, resolve_and_download
 from .manifest import ArchiveEntity
 
 VadDetectorFn = Callable[[np.ndarray, int], Sequence[tuple[float, float]]]
@@ -27,8 +27,11 @@ VadDetectorFn = Callable[[np.ndarray, int], Sequence[tuple[float, float]]]
 class PrefetchTimings:
     """Wall-clock timings measured inside the prefetch pipeline."""
 
+    decode_queue_wait_sec: float = 0.0
     download_decode_sec: float = 0.0
+    vad_queue_wait_sec: float = 0.0
     vad_sec: float = 0.0
+    prefetch_submit_to_ready_sec: float = 0.0
     total_sec: float = 0.0
 
 
@@ -38,16 +41,26 @@ class PrefetchResult:
 
     audio: AudioData
     s3_key: str
+    audio_source_extension: str = ""
+    audio_object_size_bytes: int | None = None
+    audio_storage_class: str | None = None
     vad_intervals: list[tuple[float, float]] | None = None
     timings: PrefetchTimings = PrefetchTimings()
+    ready_time: float = 0.0
+    _submitted_at: float = field(default=0.0, repr=False, compare=False)
 
 
 @dataclass(frozen=True)
 class _DecodedResult:
     audio: AudioData
     s3_key: str
+    audio_source_extension: str
+    audio_object_size_bytes: int | None
+    audio_storage_class: str | None
+    submitted_at: float
+    decode_submitted_at: float
+    decode_started_at: float
     download_decode_sec: float
-    started_at: float
 
 
 class Prefetcher:
@@ -105,6 +118,7 @@ class Prefetcher:
     def submit(self, entity: ArchiveEntity, *, precompute_vad: bool = False) -> None:
         """Queue *entity* for background download/decode and optional VAD."""
         key = (entity.session_id, entity.archive_id)
+        submitted_at = time.perf_counter()
         with self._lock:
             if key in self._futures:
                 return
@@ -112,7 +126,13 @@ class Prefetcher:
             final_future: Future = Future()
             self._futures[key] = final_future
 
-        decode_future = self._pool.submit(self._fetch_and_decode, entity)
+        decode_submitted_at = time.perf_counter()
+        decode_future = self._pool.submit(
+            self._fetch_and_decode,
+            entity,
+            submitted_at,
+            decode_submitted_at,
+        )
         with self._lock:
             self._decode_futures[key] = decode_future
 
@@ -120,20 +140,28 @@ class Prefetcher:
             try:
                 decoded = done.result()
                 if isinstance(decoded, AudioResolutionError):
-                    final_future.set_result(decoded)
+                    self._set_final_result(final_future, decoded)
                     return
                 if not precompute_vad:
-                    final_future.set_result(self._prefetch_result(decoded, None, 0.0))
+                    self._set_final_result(
+                        final_future,
+                        self._prefetch_result(decoded, None, 0.0, 0.0),
+                    )
                     return
                 if self._vad_pool is None:
                     raise RuntimeError("precompute_vad=True requires vad_workers > 0")
-                vad_future = self._vad_pool.submit(self._add_vad, decoded)
+                vad_submitted_at = time.perf_counter()
+                vad_future = self._vad_pool.submit(
+                    self._add_vad,
+                    decoded,
+                    vad_submitted_at,
+                )
                 with self._lock:
                     self._vad_futures[key] = vad_future
 
                 def _after_vad(vad_done: Future) -> None:
                     try:
-                        final_future.set_result(vad_done.result())
+                        self._set_final_result(final_future, vad_done.result())
                     except BaseException as exc:
                         final_future.set_exception(exc)
 
@@ -142,6 +170,33 @@ class Prefetcher:
                 final_future.set_exception(exc)
 
         decode_future.add_done_callback(_after_decode)
+
+    def is_ready(self, entity: ArchiveEntity) -> bool:
+        """Return whether a submitted prefetch has completed."""
+        key = (entity.session_id, entity.archive_id)
+        with self._lock:
+            future = self._futures.get(key)
+        return bool(future is not None and future.done())
+
+    def wait_any(
+        self,
+        entities: Sequence[ArchiveEntity],
+        timeout_sec: float | None = 0.5,
+    ) -> bool:
+        """Wait until any submitted entity is ready, returning ``False`` on timeout."""
+        if not entities:
+            return False
+        keys = {(entity.session_id, entity.archive_id) for entity in entities}
+        with self._lock:
+            futures = [
+                future
+                for key, future in self._futures.items()
+                if key in keys
+            ]
+        if not futures:
+            return False
+        done, _ = wait(futures, timeout=timeout_sec, return_when=FIRST_COMPLETED)
+        return bool(done)
 
     def get(
         self, entity: ArchiveEntity
@@ -152,12 +207,14 @@ class Prefetcher:
         audio resolution/decode failure, or raises for VAD failures.
         """
         key = (entity.session_id, entity.archive_id)
-        future = self._futures.get(key)
+        with self._lock:
+            future = self._futures.get(key)
         if future is None:
-            decoded = self._fetch_and_decode(entity)
+            submitted_at = time.perf_counter()
+            decoded = self._fetch_and_decode(entity, submitted_at, submitted_at)
             if isinstance(decoded, AudioResolutionError):
-                return decoded
-            return self._prefetch_result(decoded, None, 0.0)
+                return self._mark_ready(decoded)
+            return self._mark_ready(self._prefetch_result(decoded, None, 0.0, 0.0))
         return future.result()
 
     def discard(self, entity: ArchiveEntity) -> None:
@@ -198,9 +255,12 @@ class Prefetcher:
                 pass
 
     def _fetch_and_decode(
-        self, entity: ArchiveEntity
+        self,
+        entity: ArchiveEntity,
+        submitted_at: float,
+        decode_submitted_at: float,
     ) -> _DecodedResult | AudioResolutionError:
-        started_at = time.perf_counter()
+        decode_started_at = time.perf_counter()
         result = resolve_and_download(
             session_id=entity.session_id,
             archive_id=entity.archive_id,
@@ -212,7 +272,17 @@ class Prefetcher:
         if isinstance(result, AudioResolutionError):
             return result
 
-        local_path, s3_key = result
+        if isinstance(result, AudioDownloadResult):
+            download = result
+        else:
+            local_path, s3_key = result
+            download = AudioDownloadResult(
+                local_path=local_path,
+                s3_key=s3_key,
+                source_extension=Path(s3_key).suffix.lower(),
+            )
+        local_path = download.local_path
+        s3_key = download.s3_key
         key = (entity.session_id, entity.archive_id)
         with self._lock:
             if key in self._discarded:
@@ -246,40 +316,87 @@ class Prefetcher:
                 s3_key=s3_key,
             )
 
+        decode_finished_at = time.perf_counter()
         return _DecodedResult(
             audio=audio,
             s3_key=s3_key,
-            download_decode_sec=time.perf_counter() - started_at,
-            started_at=started_at,
+            audio_source_extension=download.source_extension,
+            audio_object_size_bytes=download.object_size_bytes,
+            audio_storage_class=download.storage_class,
+            submitted_at=submitted_at,
+            decode_submitted_at=decode_submitted_at,
+            decode_started_at=decode_started_at,
+            download_decode_sec=decode_finished_at - decode_started_at,
         )
 
-    def _add_vad(self, decoded: _DecodedResult) -> PrefetchResult:
+    def _add_vad(
+        self,
+        decoded: _DecodedResult,
+        vad_submitted_at: float,
+    ) -> PrefetchResult:
         started_at = time.perf_counter()
         detector = self._thread_vad_detector()
         intervals = detector(decoded.audio.samples, decoded.audio.sample_rate)
         vad_sec = time.perf_counter() - started_at
-        return self._prefetch_result(decoded, intervals, vad_sec)
+        return self._prefetch_result(
+            decoded,
+            intervals,
+            vad_sec,
+            started_at - vad_submitted_at,
+        )
 
     def _prefetch_result(
         self,
         decoded: _DecodedResult,
         vad_intervals: Sequence[tuple[float, float]] | None,
         vad_sec: float,
+        vad_queue_wait_sec: float,
     ) -> PrefetchResult:
         return PrefetchResult(
             audio=decoded.audio,
             s3_key=decoded.s3_key,
+            audio_source_extension=decoded.audio_source_extension,
+            audio_object_size_bytes=decoded.audio_object_size_bytes,
+            audio_storage_class=decoded.audio_storage_class,
             vad_intervals=(
                 None
                 if vad_intervals is None
                 else [(float(start), float(end)) for start, end in vad_intervals]
             ),
             timings=PrefetchTimings(
+                decode_queue_wait_sec=(
+                    decoded.decode_started_at - decoded.decode_submitted_at
+                ),
                 download_decode_sec=decoded.download_decode_sec,
+                vad_queue_wait_sec=float(vad_queue_wait_sec),
                 vad_sec=float(vad_sec),
-                total_sec=time.perf_counter() - decoded.started_at,
+                prefetch_submit_to_ready_sec=0.0,
+                total_sec=0.0,
             ),
+            _submitted_at=decoded.submitted_at,
         )
+
+    def _set_final_result(
+        self,
+        future: Future,
+        result: PrefetchResult | AudioResolutionError,
+    ) -> None:
+        future.set_result(self._mark_ready(result))
+
+    def _mark_ready(
+        self,
+        result: PrefetchResult | AudioResolutionError,
+    ) -> PrefetchResult | AudioResolutionError:
+        ready_time = time.perf_counter()
+        if isinstance(result, AudioResolutionError):
+            return replace(result, ready_time=ready_time)
+        submit_to_ready = ready_time - result._submitted_at
+        timings = replace(
+            result.timings,
+            prefetch_submit_to_ready_sec=submit_to_ready,
+            total_sec=submit_to_ready,
+        )
+        return replace(result, timings=timings, ready_time=ready_time)
 
     def _thread_vad_detector(self) -> VadDetectorFn:
         detector = getattr(self._vad_local, "detector", None)

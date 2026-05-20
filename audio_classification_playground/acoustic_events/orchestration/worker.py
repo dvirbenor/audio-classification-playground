@@ -91,6 +91,10 @@ PREFETCH_LOOKAHEAD = 4
 PREFETCH_WORKERS = 4
 VAD_PREFETCH_WORKERS = 1
 TIMINGS_DIR = "_meta/timings"
+PREFETCH_SCHEDULER_ENV = "ACP_PREFETCH_SCHEDULER"
+PREFETCH_SCHEDULER_READY_FIRST = "ready_first"
+PREFETCH_SCHEDULER_FIFO = "fifo"
+PREFETCH_WAIT_ANY_TIMEOUT_SEC = 0.5
 
 
 def _append_timing_record(jsonl_path: Path, record: dict) -> None:
@@ -409,6 +413,18 @@ def run_worker(
         raise ValueError("prefetch_lookahead must be >= 1")
     if vad_prefetch_workers < 0:
         raise ValueError("vad_prefetch_workers must be >= 0")
+    prefetch_scheduler = os.environ.get(
+        PREFETCH_SCHEDULER_ENV,
+        PREFETCH_SCHEDULER_READY_FIRST,
+    ).strip().lower()
+    if prefetch_scheduler not in (
+        PREFETCH_SCHEDULER_READY_FIRST,
+        PREFETCH_SCHEDULER_FIFO,
+    ):
+        raise ValueError(
+            f"{PREFETCH_SCHEDULER_ENV} must be one of: "
+            f"{PREFETCH_SCHEDULER_READY_FIRST}, {PREFETCH_SCHEDULER_FIFO}"
+        )
     emotion_settings = resolve_emotion_runtime_settings(
         mode=emotion_runtime_mode,
         default_mode="auto",
@@ -459,7 +475,7 @@ def run_worker(
     )
     LOGGER.info(
         "WavLM runtime: preset=%s requested=%s compile=%s mode=%s dynamic=%s "
-        "static_batch=%s batches=%s cache=%s",
+        "static_batch=%s batches=%s cache=%s prefetch_scheduler=%s",
         wavlm_settings.preset,
         wavlm_settings.requested_preset,
         wavlm_settings.compile_model,
@@ -471,6 +487,7 @@ def run_worker(
             "disfluency": batches["disfluency"],
         },
         cache,
+        prefetch_scheduler,
     )
 
     output_base = Path(output_base)
@@ -699,6 +716,34 @@ def run_worker(
             prefetcher.submit(entity, precompute_vad=precompute_vad)
             queued.append(entity)
 
+    def _pop_first_ready_entity() -> ArchiveEntity | None:
+        for entity in tuple(queued):
+            if prefetcher.is_ready(entity):
+                queued.remove(entity)
+                return entity
+        return None
+
+    def _select_next_entity() -> tuple[ArchiveEntity, float] | None:
+        if not queued:
+            return None
+        if prefetch_scheduler == PREFETCH_SCHEDULER_FIFO:
+            return queued.popleft(), 0.0
+
+        ready_entity = _pop_first_ready_entity()
+        if ready_entity is not None:
+            return ready_entity, 0.0
+
+        wait_started = time.perf_counter()
+        while queued and not shutdown_event.is_set():
+            prefetcher.wait_any(
+                tuple(queued),
+                timeout_sec=PREFETCH_WAIT_ANY_TIMEOUT_SEC,
+            )
+            ready_entity = _pop_first_ready_entity()
+            if ready_entity is not None:
+                return ready_entity, time.perf_counter() - wait_started
+        return None
+
     try:
         _fill_claimed_queue()
 
@@ -707,7 +752,11 @@ def run_worker(
                 LOGGER.info("Shutdown requested — releasing queued claims")
                 break
 
-            entity = queued.popleft()
+            selected = _select_next_entity()
+            if selected is None:
+                LOGGER.info("Shutdown requested while waiting for prefetch readiness")
+                break
+            entity, prefetch_scheduler_wait_sec = selected
             sid, aid = entity.session_id, entity.archive_id
             entity_key = (sid, aid)
 
@@ -716,7 +765,17 @@ def run_worker(
                 archive_started = time.perf_counter()
                 wait_started = time.perf_counter()
                 pf_result = prefetcher.get(entity)
-                prefetch_wait_sec = time.perf_counter() - wait_started
+                get_finished = time.perf_counter()
+                prefetch_get_wait_sec = get_finished - wait_started
+                prefetch_wait_sec = (
+                    prefetch_scheduler_wait_sec + prefetch_get_wait_sec
+                )
+                ready_time = getattr(pf_result, "ready_time", 0.0)
+                prefetch_ready_age_sec = (
+                    max(0.0, get_finished - ready_time)
+                    if ready_time
+                    else 0.0
+                )
                 if isinstance(pf_result, AudioResolutionError):
                     append_audio_error(output_base, pf_result)
                     if pf_result.is_permanent:
@@ -790,13 +849,17 @@ def run_worker(
 
                 LOGGER.info(
                     "Archive timings %s/%s: prefetch_wait=%.3fs "
-                    "download_decode=%.3fs vad=%.3fs inference=%.3fs total=%.3fs "
+                    "scheduler_wait=%.3fs get_wait=%.3fs download_decode=%.3fs "
+                    "vad=%.3fs ready_age=%.3fs inference=%.3fs total=%.3fs "
                     "precomputed_vad=%s",
                     sid,
                     aid,
                     prefetch_wait_sec,
+                    prefetch_scheduler_wait_sec,
+                    prefetch_get_wait_sec,
                     pf_result.timings.download_decode_sec,
                     pf_result.timings.vad_sec,
+                    prefetch_ready_age_sec,
                     inference_sec,
                     total_sec,
                     pf_result.vad_intervals is not None,
@@ -809,6 +872,10 @@ def run_worker(
                     "session_id": sid,
                     "archive_id": aid,
                     "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "s3_key": pf_result.s3_key,
+                    "audio_source_extension": pf_result.audio_source_extension,
+                    "audio_object_size_bytes": pf_result.audio_object_size_bytes,
+                    "audio_storage_class": pf_result.audio_storage_class,
                     "audio_duration_sec": pf_result.audio.duration_sec,
                     "wavlm_runtime_preset": wavlm_settings.preset,
                     "wavlm_static_batch": wavlm_settings.static_batch,
@@ -818,9 +885,18 @@ def run_worker(
                         else None
                     ),
                     "torchinductor_cache": cache,
+                    "prefetch_scheduler": prefetch_scheduler,
+                    "prefetch_scheduler_wait_sec": prefetch_scheduler_wait_sec,
+                    "prefetch_get_wait_sec": prefetch_get_wait_sec,
                     "prefetch_wait_sec": prefetch_wait_sec,
+                    "decode_queue_wait_sec": pf_result.timings.decode_queue_wait_sec,
                     "download_decode_sec": pf_result.timings.download_decode_sec,
+                    "vad_queue_wait_sec": pf_result.timings.vad_queue_wait_sec,
                     "vad_precompute_sec": pf_result.timings.vad_sec,
+                    "prefetch_submit_to_ready_sec": (
+                        pf_result.timings.prefetch_submit_to_ready_sec
+                    ),
+                    "prefetch_ready_age_sec": prefetch_ready_age_sec,
                     "precomputed_vad": pf_result.vad_intervals is not None,
                     "vad_reused": result.reused.get("vad", False),
                     "affect_reused": result.reused.get("affect", False),

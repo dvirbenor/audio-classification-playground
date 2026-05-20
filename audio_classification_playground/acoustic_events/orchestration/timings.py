@@ -28,9 +28,15 @@ TIMINGS_DIR = "_meta/timings"
 
 DEFAULT_TIMING_FIELDS: tuple[str, ...] = (
     "audio_duration_sec",
+    "prefetch_scheduler_wait_sec",
+    "prefetch_get_wait_sec",
     "prefetch_wait_sec",
+    "decode_queue_wait_sec",
     "download_decode_sec",
+    "vad_queue_wait_sec",
     "vad_precompute_sec",
+    "prefetch_submit_to_ready_sec",
+    "prefetch_ready_age_sec",
     "vad_sec",
     "affect_sec",
     "disfluency_sec",
@@ -230,7 +236,17 @@ def format_timing_csv(
     """Render timing records as CSV with grouping columns."""
     fields = fields or DEFAULT_TIMING_FIELDS
     columns = [
-        "worker_id", "task_group", "session_id", "archive_id", "ts", "vad_mode", *fields
+        "worker_id",
+        "task_group",
+        "session_id",
+        "archive_id",
+        "ts",
+        "vad_mode",
+        "s3_key",
+        "audio_source_extension",
+        "audio_object_size_bytes",
+        "audio_storage_class",
+        *fields,
     ]
     lines = [",".join(columns)]
     for rec in records:

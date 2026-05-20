@@ -22,10 +22,20 @@ def _sample_record(**overrides):
         "session_id": "s1",
         "archive_id": "a1",
         "ts": "2026-05-15T01:00:00Z",
+        "s3_key": "accounts/studio/takes/a1.wav",
+        "audio_source_extension": ".wav",
+        "audio_object_size_bytes": 123,
+        "audio_storage_class": "STANDARD",
         "audio_duration_sec": 10.0,
+        "prefetch_scheduler_wait_sec": 0.08,
+        "prefetch_get_wait_sec": 0.02,
         "prefetch_wait_sec": 0.1,
+        "decode_queue_wait_sec": 0.03,
         "download_decode_sec": 0.5,
+        "vad_queue_wait_sec": 0.04,
         "vad_precompute_sec": 0.3,
+        "prefetch_submit_to_ready_sec": 0.9,
+        "prefetch_ready_age_sec": 0.2,
         "precomputed_vad": True,
         "vad_reused": False,
         "affect_reused": False,
@@ -135,6 +145,26 @@ class TestSummarizeTimings(unittest.TestCase):
         summary = summarize_timings(records)
         self.assertNotIn("precomputed_vad", summary)
 
+    def test_mixed_old_and_new_records_do_not_fake_missing_new_fields(self):
+        legacy = _sample_record()
+        for field in (
+            "prefetch_scheduler_wait_sec",
+            "prefetch_get_wait_sec",
+            "decode_queue_wait_sec",
+            "vad_queue_wait_sec",
+            "prefetch_submit_to_ready_sec",
+            "prefetch_ready_age_sec",
+        ):
+            legacy.pop(field)
+        modern = _sample_record(prefetch_scheduler_wait_sec=2.5)
+        summary = summarize_timings(
+            [legacy, modern],
+            fields=("prefetch_scheduler_wait_sec", "prefetch_wait_sec"),
+        )
+        self.assertEqual(summary["prefetch_scheduler_wait_sec"].count, 1)
+        self.assertAlmostEqual(summary["prefetch_scheduler_wait_sec"].mean, 2.5)
+        self.assertEqual(summary["prefetch_wait_sec"].count, 2)
+
     def test_default_fields_all_present(self):
         records = [_sample_record()]
         summary = summarize_timings(records)
@@ -182,6 +212,9 @@ class TestFormatTimingCsv(unittest.TestCase):
         header = lines[0].split(",")
         self.assertIn("worker_id", header)
         self.assertIn("vad_mode", header)
+        self.assertIn("s3_key", header)
+        self.assertIn("audio_object_size_bytes", header)
+        self.assertIn("prefetch_scheduler_wait_sec", header)
         self.assertIn("affect_sec", header)
 
     def test_csv_includes_derived_vad_mode(self):

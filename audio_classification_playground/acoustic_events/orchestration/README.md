@@ -533,10 +533,20 @@ Disable splitting with `--no-split-by-vad-mode` for a single combined view.
     "session_id": "abc",
     "archive_id": "def",
     "ts": "2026-05-15T01:30:00Z",
+    "s3_key": "accounts/studio/takes/audio.wav",
+    "audio_source_extension": ".wav",
+    "audio_object_size_bytes": 123456789,
+    "audio_storage_class": "STANDARD",
     "audio_duration_sec": 183.4,
+    "prefetch_scheduler_wait_sec": 0.10,
+    "prefetch_get_wait_sec": 0.02,
     "prefetch_wait_sec": 0.12,
+    "decode_queue_wait_sec": 0.01,
     "download_decode_sec": 1.4,
+    "vad_queue_wait_sec": 0.05,
     "vad_precompute_sec": 0.8,
+    "prefetch_submit_to_ready_sec": 2.31,
+    "prefetch_ready_age_sec": 0.42,
     "precomputed_vad": true,
     "vad_reused": false,
     "affect_reused": false,
@@ -554,6 +564,14 @@ Disable splitting with `--no-split-by-vad-mode` for a single combined view.
 `task_group` identifies the worker mode. `tasks_run` lists the missing tasks
 that were actually executed for that archive; in a partial `emotion-vad`
 retry it may contain only `["emotion"]` or only `["vad"]`.
+`prefetch_scheduler_wait_sec` is the canonical GPU-starvation signal: it
+measures foreground time spent waiting for any queued prefetch to become
+ready. `prefetch_get_wait_sec` should be near-zero under the default
+ready-first scheduler; in `ACP_PREFETCH_SCHEDULER=fifo` rollback mode it
+carries the old head-of-queue blocking wait. `prefetch_wait_sec` is kept as
+a compatibility aggregate (`scheduler_wait + get_wait`). `decode_queue_wait_sec`
+and `vad_queue_wait_sec` expose executor queueing, while
+`prefetch_ready_age_sec` highlights over-prefetching or too-deep lookahead.
 `inference_sec` is wall-clock time around the filtered `run_all_inference`
 call. Per-task `*_sec` fields come from `InferenceRunResult.task_elapsed_sec`.
 `*_reused` booleans come from `InferenceRunResult.reused`.
@@ -806,7 +824,12 @@ disfluency:   --prefetch-lookahead 8  --prefetch-workers 8  --vad-prefetch-worke
 emotion-vad:  --prefetch-lookahead 12 --prefetch-workers 8  --vad-prefetch-workers 1
 ```
 
-Tune by watching `prefetch_wait_sec` in timing records. Larger
+Workers use ready-first scheduling by default: if the FIFO head is still
+downloading/decoding but a later queued archive is ready, the worker consumes
+the earliest ready queued archive. Set `ACP_PREFETCH_SCHEDULER=fifo` before
+starting a pod to restore legacy head-of-queue behavior for rollback.
+
+Tune by watching `prefetch_scheduler_wait_sec` in timing records. Larger
 `--prefetch-lookahead` values increase both locks held per pod and decoded
 audio memory in flight; long archives at 16 kHz float32 can make that memory
 noticeable.

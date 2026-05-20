@@ -1,5 +1,8 @@
 import json
+import os
+import signal
 import tempfile
+import time
 import unittest
 from collections import Counter
 from contextlib import ExitStack, contextmanager
@@ -375,6 +378,210 @@ class WorkerAsyncVadTest(unittest.TestCase):
         self.assertEqual(calls, ["a0", "a1", "a2"])
         self.assertEqual(errors, ["a0"])
 
+    def test_ready_first_processes_ready_later_item_before_fifo_head(self):
+        entities = [
+            ArchiveEntity("s1", "a0", "prefix/0"),
+            ArchiveEntity("s1", "a1", "prefix/1"),
+        ]
+        calls = []
+
+        class FakePrefetcher(_FakePrefetcher):
+            def submit(self, entity, *, precompute_vad=False):
+                super().submit(entity, precompute_vad=precompute_vad)
+                if entity.archive_id == "a0":
+                    self._ready[(entity.session_id, entity.archive_id)] = False
+
+            def wait_any(self, entities, timeout_sec=0.5):
+                for entity in entities:
+                    self._ready[(entity.session_id, entity.archive_id)] = True
+                    return True
+                return False
+
+        def fake_run_all(*args, **kwargs):
+            calls.append(Path(kwargs["audio_source_key"]).stem)
+            return _fake_inference_result()
+
+        with _worker_patches(
+            entities,
+            prefetcher_cls=FakePrefetcher,
+            run_all_fn=fake_run_all,
+        ):
+            worker.run_worker(
+                parquet_path="manifest.parquet",
+                output_base=tempfile.mkdtemp(),
+                affect_backbone="wavlm",
+                disfluency_backbone="whisper",
+                prefetch_lookahead=2,
+                vad_prefetch_workers=1,
+                seed=0,
+            )
+
+        self.assertEqual(calls, ["a1", "a0"])
+
+    def test_ready_first_keeps_queue_order_when_multiple_items_are_ready(self):
+        entities = [
+            ArchiveEntity("s1", "a0", "prefix/0"),
+            ArchiveEntity("s1", "a1", "prefix/1"),
+        ]
+        calls = []
+
+        def fake_run_all(*args, **kwargs):
+            calls.append(Path(kwargs["audio_source_key"]).stem)
+            return _fake_inference_result()
+
+        with _worker_patches(entities, run_all_fn=fake_run_all):
+            worker.run_worker(
+                parquet_path="manifest.parquet",
+                output_base=tempfile.mkdtemp(),
+                affect_backbone="wavlm",
+                disfluency_backbone="whisper",
+                prefetch_lookahead=2,
+                vad_prefetch_workers=1,
+                seed=0,
+            )
+
+        self.assertEqual(calls, ["a0", "a1"])
+
+    def test_ready_first_waits_for_any_completion_when_none_are_ready(self):
+        entities = [
+            ArchiveEntity("s1", "a0", "prefix/0"),
+            ArchiveEntity("s1", "a1", "prefix/1"),
+        ]
+        calls = []
+        wait_calls = []
+
+        class FakePrefetcher(_FakePrefetcher):
+            def submit(self, entity, *, precompute_vad=False):
+                super().submit(entity, precompute_vad=precompute_vad)
+                self._ready[(entity.session_id, entity.archive_id)] = False
+
+            def wait_any(self, entities, timeout_sec=0.5):
+                wait_calls.append(timeout_sec)
+                for entity in reversed(tuple(entities)):
+                    self._ready[(entity.session_id, entity.archive_id)] = True
+                    return True
+                return False
+
+        def fake_run_all(*args, **kwargs):
+            calls.append(Path(kwargs["audio_source_key"]).stem)
+            return _fake_inference_result()
+
+        with _worker_patches(
+            entities,
+            prefetcher_cls=FakePrefetcher,
+            run_all_fn=fake_run_all,
+        ):
+            worker.run_worker(
+                parquet_path="manifest.parquet",
+                output_base=tempfile.mkdtemp(),
+                affect_backbone="wavlm",
+                disfluency_backbone="whisper",
+                prefetch_lookahead=2,
+                vad_prefetch_workers=1,
+                seed=0,
+            )
+
+        self.assertGreaterEqual(len(wait_calls), 1)
+        self.assertTrue(all(call == worker.PREFETCH_WAIT_ANY_TIMEOUT_SEC for call in wait_calls))
+        self.assertEqual(calls, ["a1", "a0"])
+
+    def test_fifo_scheduler_env_restores_head_of_queue_behavior(self):
+        entities = [
+            ArchiveEntity("s1", "a0", "prefix/0"),
+            ArchiveEntity("s1", "a1", "prefix/1"),
+        ]
+        calls = []
+
+        class FakePrefetcher(_FakePrefetcher):
+            def submit(self, entity, *, precompute_vad=False):
+                super().submit(entity, precompute_vad=precompute_vad)
+                if entity.archive_id == "a0":
+                    self._ready[(entity.session_id, entity.archive_id)] = False
+
+        def fake_run_all(*args, **kwargs):
+            calls.append(Path(kwargs["audio_source_key"]).stem)
+            return _fake_inference_result()
+
+        with patch.dict(
+            os.environ,
+            {worker.PREFETCH_SCHEDULER_ENV: worker.PREFETCH_SCHEDULER_FIFO},
+        ), _worker_patches(
+            entities,
+            prefetcher_cls=FakePrefetcher,
+            run_all_fn=fake_run_all,
+        ):
+            worker.run_worker(
+                parquet_path="manifest.parquet",
+                output_base=tempfile.mkdtemp(),
+                affect_backbone="wavlm",
+                disfluency_backbone="whisper",
+                prefetch_lookahead=2,
+                vad_prefetch_workers=1,
+                seed=0,
+            )
+
+        self.assertEqual(calls, ["a0", "a1"])
+
+    def test_shutdown_while_waiting_for_ready_prefetch_releases_claims(self):
+        entities = [
+            ArchiveEntity("s1", "a0", "prefix/0"),
+            ArchiveEntity("s1", "a1", "prefix/1"),
+        ]
+        released = []
+        calls = []
+
+        class FakePrefetcher(_FakePrefetcher):
+            def submit(self, entity, *, precompute_vad=False):
+                super().submit(entity, precompute_vad=precompute_vad)
+                self._ready[(entity.session_id, entity.archive_id)] = False
+
+            def wait_any(self, entities, timeout_sec=0.5):
+                signal.raise_signal(signal.SIGTERM)
+                return False
+
+        def fake_run_all(*args, **kwargs):
+            calls.append(Path(kwargs["audio_source_key"]).stem)
+            return _fake_inference_result()
+
+        with _worker_patches(
+            entities,
+            prefetcher_cls=FakePrefetcher,
+            release_claim_fn=lambda output_base, entity: released.append(entity.archive_id),
+            run_all_fn=fake_run_all,
+        ):
+            worker.run_worker(
+                parquet_path="manifest.parquet",
+                output_base=tempfile.mkdtemp(),
+                affect_backbone="wavlm",
+                disfluency_backbone="whisper",
+                prefetch_lookahead=2,
+                vad_prefetch_workers=1,
+                seed=0,
+            )
+
+        self.assertEqual(calls, [])
+        self.assertEqual(Counter(released), Counter({"a0": 1, "a1": 1}))
+
+    def test_timing_jsonl_is_success_path_only(self):
+        entity = ArchiveEntity("s1", "a1", "prefix")
+
+        def fake_run_all(*args, **kwargs):
+            raise RuntimeError("boom")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with _worker_patches([entity], run_all_fn=fake_run_all):
+                worker.run_worker(
+                    parquet_path="manifest.parquet",
+                    output_base=tmpdir,
+                    affect_backbone="wavlm",
+                    disfluency_backbone="whisper",
+                    prefetch_lookahead=1,
+                    vad_prefetch_workers=1,
+                )
+
+            timings_dir = Path(tmpdir) / "_meta" / "timings"
+            self.assertFalse(list(timings_dir.glob("*.jsonl")))
+
     def test_sync_vad_fallback_passes_model_vad(self):
         entity = ArchiveEntity("s1", "a1", "prefix")
         vad_detectors = []
@@ -421,25 +628,45 @@ class WorkerAsyncVadTest(unittest.TestCase):
             self.assertEqual(record["archive_id"], "a1")
             expected_fields = {
                 "worker_id", "session_id", "archive_id", "ts",
-                "audio_duration_sec", "prefetch_wait_sec",
-                "download_decode_sec", "vad_precompute_sec",
+                "s3_key", "audio_source_extension", "audio_object_size_bytes",
+                "audio_storage_class", "audio_duration_sec",
+                "prefetch_scheduler_wait_sec", "prefetch_get_wait_sec",
+                "prefetch_wait_sec", "decode_queue_wait_sec",
+                "download_decode_sec", "vad_queue_wait_sec",
+                "vad_precompute_sec", "prefetch_submit_to_ready_sec",
+                "prefetch_ready_age_sec",
                 "precomputed_vad", "vad_reused", "affect_reused",
                 "disfluency_reused", "emotion_reused",
                 "vad_sec", "affect_sec", "disfluency_sec", "emotion_sec",
                 "inference_sec", "total_sec",
             }
             self.assertTrue(expected_fields <= set(record.keys()))
-            for f in ("vad_sec", "affect_sec", "disfluency_sec", "emotion_sec",
-                       "inference_sec", "total_sec"):
+            for f in (
+                "prefetch_scheduler_wait_sec", "prefetch_get_wait_sec",
+                "prefetch_wait_sec", "decode_queue_wait_sec",
+                "download_decode_sec", "vad_queue_wait_sec",
+                "vad_precompute_sec", "prefetch_submit_to_ready_sec",
+                "prefetch_ready_age_sec", "vad_sec", "affect_sec",
+                "disfluency_sec", "emotion_sec", "inference_sec", "total_sec",
+            ):
                 self.assertIsInstance(record[f], (int, float))
 
 
 class _FakePrefetcher:
     def __init__(self, *args, **kwargs):
         self._precompute: dict[tuple[str, str], bool] = {}
+        self._ready: dict[tuple[str, str], bool] = {}
 
     def submit(self, entity, *, precompute_vad=False):
-        self._precompute[(entity.session_id, entity.archive_id)] = precompute_vad
+        key = (entity.session_id, entity.archive_id)
+        self._precompute[key] = precompute_vad
+        self._ready[key] = True
+
+    def is_ready(self, entity):
+        return self._ready.get((entity.session_id, entity.archive_id), False)
+
+    def wait_any(self, entities, timeout_sec=0.5):
+        return any(self.is_ready(entity) for entity in entities)
 
     def get(self, entity):
         precompute_vad = self._precompute[(entity.session_id, entity.archive_id)]
@@ -447,6 +674,7 @@ class _FakePrefetcher:
             audio=_fake_audio(entity.archive_id),
             s3_key=f"{entity.archive_id}.wav",
             vad_intervals=[(0.0, 0.5)] if precompute_vad else None,
+            ready_time=time.perf_counter(),
         )
 
     def discard(self, entity):
