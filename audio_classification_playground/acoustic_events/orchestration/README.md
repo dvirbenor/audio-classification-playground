@@ -234,6 +234,27 @@ For emotion2vec, `--emotion-compile` defaults to PyTorch compile mode
 it uses CUDA Graph replay and can fail with overwritten internal tensors across
 repeated batch calls. Use BF16/FP16 only after separate event-level validation.
 
+To explore ONNX Runtime / TensorRT without changing production inference, use
+the sidecar benchmark harness. Install `onnx` plus `onnxruntime-gpu` in the GPU
+environment, then run:
+
+```bash
+uv run python scripts/benchmark_emotion2vec_onnx_tensorrt.py \
+    --device cuda \
+    --batch-size 64 \
+    --max-windows-per-file 10000 \
+    --provider cuda \
+    --provider tensorrt \
+    --trt-cache-dir /workspace/tmp_data/e2v-trt-cache \
+    /path/to/audio.wav
+```
+
+The harness exports the exact direct scorer as a static
+`[batch_size, 48000]` ONNX graph, benchmarks each provider, and prints the same
+probability drift / top-1 diagnostics against the PyTorch direct scorer. Keep
+using the normal artifact comparison scripts before promoting any exported
+runtime into production.
+
 ### Config-Aware Completion
 
 With the flat output layout (`session/archive/task/`), the config hash is
