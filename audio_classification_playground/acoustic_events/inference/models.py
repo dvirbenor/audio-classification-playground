@@ -37,11 +37,18 @@ from .emotion2vec import (
     predict_emotion2vec_scores,
     predict_emotion2vec_scores_from_audio,
 )
+from .emotion_runtime import (
+    DEFAULT_EMOTION_COMPILE_MODE,
+    OPTIMIZED_EMOTION_BATCH_SIZE,
+    resolve_emotion_runtime_settings,
+    torch_matmul_precision,
+)
 from .log import get_logger
 from .runners import (
     DEFAULT_AFFECT_MODELS,
     DEFAULT_DISFLUENCY_MODELS,
     DEFAULT_EMOTION_MODEL,
+    EMOTION_WINDOW_SEC,
     DEFAULT_VAD_MIN_SILENCE_SEC,
     DEFAULT_VAD_MIN_SPEECH_SEC,
     DEFAULT_VAD_SPEECH_THRESHOLD,
@@ -230,7 +237,9 @@ class EmotionPredictor:
         device: str | None = None,
         autocast_dtype: str | None = None,
         compile_model: bool = False,
-        compile_mode: str = "default",
+        compile_mode: str = DEFAULT_EMOTION_COMPILE_MODE,
+        allow_tf32: bool = False,
+        warmup: bool = False,
     ) -> None:
         from funasr import AutoModel
 
@@ -241,6 +250,7 @@ class EmotionPredictor:
         self.autocast_dtype = autocast_dtype
         self.compile_model = bool(compile_model)
         self.compile_mode = compile_mode
+        self.allow_tf32 = bool(allow_tf32)
         auto_kwargs = {
             "model": model_id,
             "batch_size": batch_size,
@@ -249,36 +259,57 @@ class EmotionPredictor:
         }
         if device is not None:
             auto_kwargs["device"] = device
-        self._model = AutoModel(**auto_kwargs)
-        self._direct_scorer = make_direct_emotion2vec_scorer(
-            self._model,
-            sample_rate=self.sample_rate,
-            compile_model=self.compile_model,
-            compile_mode=self.compile_mode,
-        )
+        with torch_matmul_precision(allow_tf32=self.allow_tf32):
+            self._model = AutoModel(**auto_kwargs)
+            self._direct_scorer = make_direct_emotion2vec_scorer(
+                self._model,
+                sample_rate=self.sample_rate,
+                compile_model=self.compile_model,
+                compile_mode=self.compile_mode,
+            )
+            if warmup:
+                self.warmup()
         LOGGER.info(
-            "EmotionPredictor loaded: %s autocast=%s compile=%s",
+            "EmotionPredictor loaded: %s autocast=%s compile=%s tf32=%s warmup=%s",
             model_id,
             autocast_dtype,
             self.compile_model,
+            self.allow_tf32,
+            bool(warmup),
         )
 
+    def warmup(self) -> None:
+        """Run one fixed-shape dummy batch through the direct scorer."""
+        if self._direct_scorer is None:
+            return
+        import torch
+
+        window_samples = int(round(EMOTION_WINDOW_SEC * self.sample_rate))
+        batch = torch.zeros(
+            (int(self.batch_size), window_samples),
+            dtype=torch.float32,
+            device=self._direct_scorer.device,
+        )
+        with torch.inference_mode(), torch_matmul_precision(allow_tf32=self.allow_tf32):
+            self._direct_scorer(batch, autocast_dtype=self.autocast_dtype)
+
     def __call__(self, windows: np.ndarray) -> tuple[np.ndarray, Sequence[str]]:
-        if self._direct_scorer is not None:
-            return self._direct_scorer.predict_windows(
+        with torch_matmul_precision(allow_tf32=self.allow_tf32):
+            if self._direct_scorer is not None:
+                return self._direct_scorer.predict_windows(
+                    windows,
+                    batch_size=self.batch_size,
+                    autocast_dtype=self.autocast_dtype,
+                )
+            return predict_emotion2vec_scores(
+                self._model,
                 windows,
+                sample_rate=self.sample_rate,
                 batch_size=self.batch_size,
                 autocast_dtype=self.autocast_dtype,
+                compile_model=self.compile_model,
+                compile_mode=self.compile_mode,
             )
-        return predict_emotion2vec_scores(
-            self._model,
-            windows,
-            sample_rate=self.sample_rate,
-            batch_size=self.batch_size,
-            autocast_dtype=self.autocast_dtype,
-            compile_model=self.compile_model,
-            compile_mode=self.compile_mode,
-        )
 
     def predict_audio(
         self,
@@ -293,28 +324,29 @@ class EmotionPredictor:
             raise ValueError(
                 f"EmotionPredictor loaded for {self.sample_rate} Hz, got {sample_rate} Hz"
             )
-        if self._direct_scorer is not None:
-            return self._direct_scorer.predict_audio(
+        with torch_matmul_precision(allow_tf32=self.allow_tf32):
+            if self._direct_scorer is not None:
+                return self._direct_scorer.predict_audio(
+                    samples,
+                    sample_rate=self.sample_rate,
+                    window_sec=window_sec,
+                    hop_sec=hop_sec,
+                    batch_size=self.batch_size,
+                    autocast_dtype=self.autocast_dtype,
+                    progress=progress,
+                )
+            return predict_emotion2vec_scores_from_audio(
+                self._model,
                 samples,
                 sample_rate=self.sample_rate,
                 window_sec=window_sec,
                 hop_sec=hop_sec,
                 batch_size=self.batch_size,
                 autocast_dtype=self.autocast_dtype,
+                compile_model=self.compile_model,
+                compile_mode=self.compile_mode,
                 progress=progress,
             )
-        return predict_emotion2vec_scores_from_audio(
-            self._model,
-            samples,
-            sample_rate=self.sample_rate,
-            window_sec=window_sec,
-            hop_sec=hop_sec,
-            batch_size=self.batch_size,
-            autocast_dtype=self.autocast_dtype,
-            compile_model=self.compile_model,
-            compile_mode=self.compile_mode,
-            progress=progress,
-        )
 
 
 class VadDetector:
@@ -401,15 +433,29 @@ class ModelSuite:
         wavlm_stream_layer_sum: bool = False,
         emotion_autocast_dtype: str | None = None,
         emotion_compile: bool = False,
-        emotion_compile_mode: str = "default",
+        emotion_compile_mode: str = DEFAULT_EMOTION_COMPILE_MODE,
+        emotion_runtime_mode: str | None = "auto",
         allow_tf32: bool = False,
     ) -> None:
         configure_torch_matmul(allow_tf32=allow_tf32)
+        emotion_settings = resolve_emotion_runtime_settings(
+            mode=emotion_runtime_mode,
+            default_mode="auto",
+            device=device,
+            autocast_dtype=emotion_autocast_dtype,
+            compile_model=emotion_compile,
+            compile_mode=emotion_compile_mode,
+            allow_tf32=allow_tf32,
+        )
         batches = resolve_task_batch_sizes(
             batch_size=batch_size,
             affect_batch_size=affect_batch_size,
             disfluency_batch_size=disfluency_batch_size,
-            emotion_batch_size=emotion_batch_size,
+            emotion_batch_size=(
+                OPTIMIZED_EMOTION_BATCH_SIZE
+                if emotion_batch_size is None and emotion_settings.mode == "optimized"
+                else emotion_batch_size
+            ),
         )
         self.affect = AffectPredictor(
             backbone=affect_backbone,
@@ -433,10 +479,12 @@ class ModelSuite:
         )
         self.emotion = EmotionPredictor(
             batch_size=batches["emotion"],
-            device=device,
-            autocast_dtype=emotion_autocast_dtype,
-            compile_model=emotion_compile,
-            compile_mode=emotion_compile_mode,
+            device=emotion_settings.device,
+            autocast_dtype=emotion_settings.autocast_dtype,
+            compile_model=emotion_settings.compile_model,
+            compile_mode=emotion_settings.compile_mode,
+            allow_tf32=emotion_settings.allow_tf32,
+            warmup=emotion_settings.warmup,
         )
         self._vad_config = dict(
             threshold=vad_threshold,

@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 import soundfile as sf
@@ -417,6 +418,7 @@ class InferenceArtifactTest(unittest.TestCase):
                 predictor=_fake_emotion,
                 autocast_dtype="bf16",
                 compile_model=True,
+                emotion_runtime_mode="custom",
                 allow_tf32=True,
                 progress=_quiet,
             )
@@ -425,6 +427,83 @@ class InferenceArtifactTest(unittest.TestCase):
             self.assertEqual(config["torch_autocast_dtype"], "bf16")
             self.assertTrue(config["torch_compile"])
             self.assertEqual(config["torch_compile_mode"], "default")
+            self.assertTrue(config["torch_allow_tf32"])
+
+    def test_emotion_auto_runtime_uses_optimized_preset_on_cuda(self):
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "torch.cuda.is_available", return_value=True
+        ):
+            audio_path = _write_audio(Path(tmp) / "clip.wav")
+            result = run_emotion_inference(
+                audio_path,
+                out_dir=Path(tmp) / "artifacts",
+                predictor=_fake_emotion,
+                device="cuda",
+                progress=_quiet,
+            )
+
+            config = result.artifact.manifest["inference_config"]
+            self.assertEqual(config["batch_size"], 64)
+            self.assertTrue(config["torch_compile"])
+            self.assertEqual(config["torch_compile_mode"], "default")
+            self.assertTrue(config["torch_allow_tf32"])
+            self.assertEqual(result.artifact.manifest["runtime"]["device"], "cuda")
+
+    def test_emotion_fp32_eager_runtime_preserves_empty_runtime_extras(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audio_path = _write_audio(Path(tmp) / "clip.wav")
+            result = run_emotion_inference(
+                audio_path,
+                out_dir=Path(tmp) / "artifacts",
+                predictor=_fake_emotion,
+                emotion_runtime_mode="fp32-eager",
+                device="cpu",
+                progress=_quiet,
+            )
+
+            config = result.artifact.manifest["inference_config"]
+            self.assertEqual(config["batch_size"], 128)
+            self.assertNotIn("torch_autocast_dtype", config)
+            self.assertNotIn("torch_compile", config)
+            self.assertNotIn("torch_allow_tf32", config)
+
+    def test_emotion_runtime_presets_reject_granular_knobs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audio_path = _write_audio(Path(tmp) / "clip.wav")
+            with self.assertRaisesRegex(ValueError, "presets cannot be combined"):
+                run_emotion_inference(
+                    audio_path,
+                    out_dir=Path(tmp) / "artifacts",
+                    predictor=_fake_emotion,
+                    emotion_runtime_mode="optimized",
+                    compile_model=True,
+                    device="cuda",
+                    progress=_quiet,
+                )
+
+    def test_run_all_auto_runtime_uses_optimized_emotion_batch_on_cuda(self):
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "torch.cuda.is_available", return_value=True
+        ):
+            audio_path = _write_audio(Path(tmp) / "clip.wav")
+            result = run_all_inference(
+                audio_path,
+                out_dir=Path(tmp) / "artifacts",
+                affect_backbone="wavlm",
+                disfluency_backbone="wavlm",
+                device="cuda",
+                predictors={
+                    "affect": _fake_affect,
+                    "disfluency": _fake_disfluency,
+                    "emotion": _fake_emotion,
+                },
+                vad_detector=_fake_vad,
+                progress=_quiet,
+            )
+
+            config = result.artifacts["emotion"].manifest["inference_config"]
+            self.assertEqual(config["batch_size"], 64)
+            self.assertTrue(config["torch_compile"])
             self.assertTrue(config["torch_allow_tf32"])
 
     def test_wavlm_runtime_knobs_are_recorded_in_affect_config(self):

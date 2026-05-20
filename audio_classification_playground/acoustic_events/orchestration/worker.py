@@ -27,6 +27,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from ..inference.artifacts import SAMPLE_RATE, inference_config_hash
+from ..inference.emotion_runtime import (
+    DEFAULT_EMOTION_COMPILE_MODE,
+    OPTIMIZED_EMOTION_BATCH_SIZE,
+    resolve_emotion_runtime_settings,
+)
 from ..inference.runners import (
     DEFAULT_AFFECT_MODELS,
     DEFAULT_DISFLUENCY_MODELS,
@@ -63,7 +68,7 @@ from .progress import is_archive_complete_for_config, is_task_complete_for_confi
 LOGGER = logging.getLogger(__name__)
 
 DEFAULT_BATCH_SIZE = 512
-DEFAULT_EMOTION_BATCH_SIZE = 64
+DEFAULT_EMOTION_BATCH_SIZE = OPTIMIZED_EMOTION_BATCH_SIZE
 DEFAULT_MAX_INFERENCE_ATTEMPTS = 3
 PREFETCH_LOOKAHEAD = 4
 PREFETCH_WORKERS = 4
@@ -148,14 +153,25 @@ def build_expected_configs(
     wavlm_stream_layer_sum: bool = False,
     emotion_autocast_dtype: str | None = None,
     emotion_compile: bool = False,
-    emotion_compile_mode: str = "default",
+    emotion_compile_mode: str = DEFAULT_EMOTION_COMPILE_MODE,
+    emotion_runtime_mode: str | None = "auto",
     allow_tf32: bool = False,
+    device: str | None = None,
 ) -> dict[str, dict]:
     """Compute expected inference configs for each task.
 
     Uses the same ``compute_inference_config`` helper as the runners so
     worker stale-artifact detection cannot drift.
     """
+    emotion_settings = resolve_emotion_runtime_settings(
+        mode=emotion_runtime_mode,
+        default_mode="auto",
+        device=device,
+        autocast_dtype=emotion_autocast_dtype,
+        compile_model=emotion_compile,
+        compile_mode=emotion_compile_mode,
+        allow_tf32=allow_tf32,
+    )
     batches = resolve_task_batch_sizes(
         batch_size=batch_size,
         affect_batch_size=affect_batch_size,
@@ -215,10 +231,10 @@ def build_expected_configs(
         batch_size=batches["emotion"],
         transform_policy="emotion2vec_fold_row_normalize_v1",
         extra=_emotion_runtime_config_extra(
-            emotion_autocast_dtype=emotion_autocast_dtype,
-            emotion_compile=emotion_compile,
-            emotion_compile_mode=emotion_compile_mode,
-            allow_tf32=allow_tf32,
+            emotion_autocast_dtype=emotion_settings.autocast_dtype,
+            emotion_compile=emotion_settings.compile_model,
+            emotion_compile_mode=emotion_settings.compile_mode,
+            allow_tf32=emotion_settings.allow_tf32,
         ),
     )
     configs["vad"] = compute_inference_config(
@@ -272,7 +288,8 @@ def run_worker(
     wavlm_stream_layer_sum: bool = False,
     emotion_autocast_dtype: str | None = None,
     emotion_compile: bool = False,
-    emotion_compile_mode: str = "default",
+    emotion_compile_mode: str = DEFAULT_EMOTION_COMPILE_MODE,
+    emotion_runtime_mode: str | None = "auto",
     allow_tf32: bool = False,
     prefetch_workers: int = PREFETCH_WORKERS,
     prefetch_lookahead: int = PREFETCH_LOOKAHEAD,
@@ -288,6 +305,15 @@ def run_worker(
         raise ValueError("prefetch_lookahead must be >= 1")
     if vad_prefetch_workers < 0:
         raise ValueError("vad_prefetch_workers must be >= 0")
+    emotion_settings = resolve_emotion_runtime_settings(
+        mode=emotion_runtime_mode,
+        default_mode="auto",
+        device=device,
+        autocast_dtype=emotion_autocast_dtype,
+        compile_model=emotion_compile,
+        compile_mode=emotion_compile_mode,
+        allow_tf32=allow_tf32,
+    )
     batches = resolve_task_batch_sizes(
         batch_size=batch_size,
         affect_batch_size=affect_batch_size,
@@ -338,7 +364,9 @@ def run_worker(
         emotion_autocast_dtype=emotion_autocast_dtype,
         emotion_compile=emotion_compile,
         emotion_compile_mode=emotion_compile_mode,
+        emotion_runtime_mode=emotion_runtime_mode,
         allow_tf32=allow_tf32,
+        device=emotion_settings.device,
     )
     expected_hashes = {
         task: inference_config_hash(cfg)
@@ -372,6 +400,7 @@ def run_worker(
         emotion_autocast_dtype=emotion_autocast_dtype,
         emotion_compile=emotion_compile,
         emotion_compile_mode=emotion_compile_mode,
+        emotion_runtime_mode=emotion_runtime_mode,
         allow_tf32=allow_tf32,
     )
 
@@ -542,6 +571,7 @@ def run_worker(
                     emotion_autocast_dtype=emotion_autocast_dtype,
                     emotion_compile=emotion_compile,
                     emotion_compile_mode=emotion_compile_mode,
+                    emotion_runtime_mode=emotion_runtime_mode,
                     allow_tf32=allow_tf32,
                     predictors={
                         "affect": models.affect,

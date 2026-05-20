@@ -168,6 +168,24 @@ result = run_all_inference(
 )
 ```
 
+Emotion2vec defaults to `emotion_runtime_mode="auto"`: on CUDA this selects
+the optimized resident scorer (`batch_size=64`, `torch.compile(mode="default")`,
+and scoped TF32); on CPU it falls back to FP32 eager. Use
+`emotion_runtime_mode="fp32-eager"` when you need old FP32 outputs exactly, or
+`emotion_runtime_mode="custom"` with `emotion_compile`, `allow_tf32`, or
+`emotion_autocast_dtype` for experiments.
+
+The standalone CLI uses the same default. To reproduce production optimized
+artifacts locally on a GPU:
+
+```bash
+uv run python -m audio_classification_playground.acoustic_events.inference run emotion \
+    --audio input.mp3 \
+    --out artifacts/ \
+    --device cuda \
+    --emotion-runtime-mode optimized
+```
+
 ### Custom Artifact Paths
 
 Override the default deep layout with `artifact_path_fn`:

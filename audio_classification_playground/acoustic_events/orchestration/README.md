@@ -13,7 +13,6 @@ python -m audio_classification_playground.acoustic_events.orchestration run \
     --affect-backbone wavlm \
     --disfluency-backbone whisper \
     --batch-size 512 \
-    --emotion-batch-size 64 \
     --prefetch-lookahead 4 \
     --prefetch-workers 4 \
     --vad-prefetch-workers 1
@@ -185,9 +184,8 @@ Keep `--prefetch-lookahead` conservative unless stale reclaim runs frequently.
 ### Batch Sizes
 
 `--batch-size` remains the legacy default for affect and disfluency.
-Emotion2vec uses `--emotion-batch-size 64` by default in the worker because
-the fast batched path has much higher VRAM pressure than the old FunASR
-generate path. Explicit task flags always win:
+Emotion2vec uses `--emotion-batch-size 64` by default in the worker. Explicit
+task flags always win:
 
 ```bash
 --batch-size 512 \
@@ -202,7 +200,33 @@ increase emotion back to 512 without a target-GPU VRAM check.
 The persistent worker uses an audio-fed emotion2vec path: decoded audio is
 copied to the model device once, and the same overlapping 3s / 0.25s windows
 are formed there before the normal `extract_features -> mean -> proj -> softmax`
-classification path. To verify equivalence and speed on a target GPU:
+classification path.
+
+### Emotion2vec Runtime
+
+`--emotion-runtime-mode auto` is the default. On CUDA it resolves to the
+optimized preset:
+
+- resident direct scorer, loaded once per worker
+- fixed `[64, 48000]` batches, including padded tail/short-audio batches
+- `torch.compile(mode="default")`, warmed once with a zero batch
+- TF32 enabled only while constructing/warming/running emotion2vec, then
+  restored so affect/disfluency do not inherit it
+- no BF16/FP16 autocast by default
+
+On non-CUDA devices, `auto` resolves to `fp32-eager`. Use
+`--emotion-runtime-mode fp32-eager` to reproduce old FP32 artifacts, or
+`--emotion-runtime-mode custom` with `--emotion-compile`,
+`--emotion-compile-mode`, `--emotion-autocast-dtype`, or `--allow-tf32` for
+experiments. Presets intentionally reject those granular knobs so the recorded
+`inference_config` cannot disagree with the runtime.
+
+The optimized preset is a new emotion config identity (`torch_compile=True`,
+`torch_compile_mode=default`, `torch_allow_tf32=True`), so existing FP32-eager
+emotion artifacts are intentionally reprocessed when the worker default is
+deployed. Flat-layout completion still ignores batch-size-only differences.
+
+To verify equivalence and speed on a target GPU:
 
 ```bash
 uv run python scripts/compare_emotion2vec_feed_path.py \
@@ -221,16 +245,22 @@ uv run python scripts/compare_emotion2vec_feed_path.py \
     /path/to/audio.wav
 ```
 
-Only enable these knobs for artifact production after the A/B output shows an
-acceptable `max_abs_diff` and `top1_agreement` on representative audio. When
-enabled in the worker, they are recorded in the emotion inference config:
+The reference optimized operating point measured about `2.2x-2.4x` faster than
+FP32 eager on the 6039-window reference archive, with event-core parity. Typical
+probability drift was around `mean_abs_diff ~7e-05` and `p99_abs_diff ~0.001`;
+top-1 flips, when present, were marginal frames with tiny reference margins.
+Rollout should gate on same-job relative speedup and event parity, and treat
+probability drift thresholds as review alerts rather than hard failures.
 
 ```bash
---emotion-compile --allow-tf32
+uv run python -m audio_classification_playground.acoustic_events.inference run emotion \
+    --audio /path/to/audio.wav \
+    --out /tmp/e2v-optimized \
+    --device cuda \
+    --emotion-runtime-mode optimized
 ```
 
-For emotion2vec, `--emotion-compile` defaults to PyTorch compile mode
-`default`. Avoid `--emotion-compile-mode reduce-overhead` for this FunASR model:
+Avoid `--emotion-compile-mode reduce-overhead` for this FunASR model:
 it uses CUDA Graph replay and can fail with overwritten internal tensors across
 repeated batch calls. Use BF16/FP16 only after separate event-level validation.
 

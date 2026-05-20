@@ -6,6 +6,11 @@ from pathlib import Path
 
 from .artifacts import list_cached_artifacts
 from .audio import load_audio
+from .emotion_runtime import (
+    DEFAULT_EMOTION_COMPILE_MODE,
+    EMOTION_RUNTIME_MODE_CHOICES,
+    has_custom_emotion_runtime_knobs,
+)
 from .log import configure_stdout_logging
 from .runners import (
     DEFAULT_VAD_MIN_SILENCE_SEC,
@@ -24,6 +29,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     logger = configure_stdout_logging(verbose=getattr(args, "verbose", False))
     progress = logger.info
+    _validate_emotion_runtime_args(parser, args)
 
     if args.command == "run":
         result = _run_single(args, progress)
@@ -50,6 +56,7 @@ def main(argv: list[str] | None = None) -> int:
             emotion_autocast_dtype=args.emotion_autocast_dtype,
             emotion_compile=args.emotion_compile,
             emotion_compile_mode=args.emotion_compile_mode,
+            emotion_runtime_mode=args.emotion_runtime_mode,
             allow_tf32=args.allow_tf32,
             vad_threshold=args.vad_threshold,
             vad_min_speech_sec=args.vad_min_speech_sec,
@@ -157,6 +164,17 @@ def _add_vad_options(parser: argparse.ArgumentParser) -> None:
 
 def _add_emotion_runtime_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
+        "--emotion-runtime-mode",
+        choices=EMOTION_RUNTIME_MODE_CHOICES,
+        default="auto",
+        help=(
+            "Emotion2vec runtime preset. Default 'auto' uses optimized "
+            "compile+scoped-TF32 on CUDA and FP32 eager elsewhere. Use "
+            "'fp32-eager' to reproduce old FP32 artifacts exactly; use "
+            "'custom' with the granular experiment flags below."
+        ),
+    )
+    parser.add_argument(
         "--emotion-autocast-dtype",
         choices=("fp16", "bf16"),
         default=None,
@@ -167,7 +185,7 @@ def _add_emotion_runtime_options(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="Compile the emotion2vec inner torch model before inference.",
     )
-    parser.add_argument("--emotion-compile-mode", default="default")
+    parser.add_argument("--emotion-compile-mode", default=DEFAULT_EMOTION_COMPILE_MODE)
     _add_allow_tf32_option(parser)
 
 
@@ -247,6 +265,7 @@ def _run_single(args, progress):
             autocast_dtype=args.emotion_autocast_dtype,
             compile_model=args.emotion_compile,
             compile_mode=args.emotion_compile_mode,
+            emotion_runtime_mode=args.emotion_runtime_mode,
             allow_tf32=args.allow_tf32,
             **common,
             **batch_kwargs,
@@ -260,6 +279,26 @@ def _run_single(args, progress):
             **common,
         )
     raise ValueError(f"Unknown task {args.task!r}")
+
+
+def _validate_emotion_runtime_args(
+    parser: argparse.ArgumentParser,
+    args: argparse.Namespace,
+) -> None:
+    if not hasattr(args, "emotion_runtime_mode"):
+        return
+    if args.emotion_runtime_mode == "custom":
+        return
+    if has_custom_emotion_runtime_knobs(
+        autocast_dtype=args.emotion_autocast_dtype,
+        compile_model=args.emotion_compile,
+        compile_mode=args.emotion_compile_mode,
+        allow_tf32=args.allow_tf32,
+    ):
+        parser.error(
+            "--emotion-runtime-mode presets cannot be mixed with granular "
+            "emotion runtime flags; use --emotion-runtime-mode custom."
+        )
 
 
 def _log_artifact(logger, task: str, path: Path, reused: bool) -> None:

@@ -43,6 +43,12 @@ from .artifacts import (
     semantic_inference_config,
 )
 from .audio import AudioData
+from .emotion_runtime import (
+    EMOTION_RUNTIME_MODE_CHOICES,
+    OPTIMIZED_EMOTION_BATCH_SIZE,
+    EmotionRuntimeSettings,
+    resolve_emotion_runtime_settings,
+)
 from .models import (
     AffectPredictor,
     DisfluencyPredictor,
@@ -79,6 +85,9 @@ __all__ = [
     "DEFAULT_VAD_MIN_SILENCE_SEC",
     "DEFAULT_VAD_MIN_SPEECH_SEC",
     "DEFAULT_VAD_SPEECH_THRESHOLD",
+    "EMOTION_RUNTIME_MODE_CHOICES",
+    "EmotionRuntimeSettings",
+    "OPTIMIZED_EMOTION_BATCH_SIZE",
     "artifact_to_affect_signals",
     "artifact_to_disfluency_logits",
     "artifact_to_emotion_probabilities",
@@ -89,6 +98,7 @@ __all__ = [
     "inference_configs_match",
     "list_cached_artifacts",
     "load_prediction_artifact",
+    "resolve_emotion_runtime_settings",
     "resolve_task_batch_sizes",
     "semantic_inference_config",
     "run_affect_inference",

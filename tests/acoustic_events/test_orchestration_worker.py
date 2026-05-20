@@ -66,6 +66,7 @@ class WorkerAsyncVadTest(unittest.TestCase):
                 wavlm_stream_layer_sum=True,
                 emotion_autocast_dtype="bf16",
                 emotion_compile=True,
+                emotion_runtime_mode="custom",
                 allow_tf32=True,
                 prefetch_lookahead=1,
                 vad_prefetch_workers=1,
@@ -80,6 +81,7 @@ class WorkerAsyncVadTest(unittest.TestCase):
         self.assertTrue(model_kwargs[0]["wavlm_stream_layer_sum"])
         self.assertEqual(model_kwargs[0]["emotion_autocast_dtype"], "bf16")
         self.assertTrue(model_kwargs[0]["emotion_compile"])
+        self.assertEqual(model_kwargs[0]["emotion_runtime_mode"], "custom")
         self.assertTrue(model_kwargs[0]["allow_tf32"])
         self.assertEqual(run_kwargs[0]["affect_batch_size"], 384)
         self.assertEqual(run_kwargs[0]["disfluency_batch_size"], 512)
@@ -90,6 +92,7 @@ class WorkerAsyncVadTest(unittest.TestCase):
         self.assertTrue(run_kwargs[0]["wavlm_stream_layer_sum"])
         self.assertEqual(run_kwargs[0]["emotion_autocast_dtype"], "bf16")
         self.assertTrue(run_kwargs[0]["emotion_compile"])
+        self.assertEqual(run_kwargs[0]["emotion_runtime_mode"], "custom")
         self.assertTrue(run_kwargs[0]["allow_tf32"])
 
     def test_orchestration_emotion_batch_defaults_to_64(self):
@@ -114,6 +117,37 @@ class WorkerAsyncVadTest(unittest.TestCase):
         self.assertEqual(model_kwargs[0]["affect_batch_size"], 512)
         self.assertEqual(model_kwargs[0]["disfluency_batch_size"], 512)
         self.assertEqual(model_kwargs[0]["emotion_batch_size"], 64)
+
+    def test_expected_configs_auto_runtime_records_optimized_emotion_on_cuda(self):
+        with patch("torch.cuda.is_available", return_value=True):
+            configs = worker.build_expected_configs(
+                affect_backbone="wavlm",
+                disfluency_backbone="whisper",
+                batch_size=512,
+                device="cuda",
+            )
+
+        emotion = configs["emotion"]
+        self.assertEqual(emotion["batch_size"], 64)
+        self.assertTrue(emotion["torch_compile"])
+        self.assertEqual(emotion["torch_compile_mode"], "default")
+        self.assertTrue(emotion["torch_allow_tf32"])
+        self.assertNotIn("torch_allow_tf32", configs["affect"])
+        self.assertNotIn("torch_allow_tf32", configs["disfluency"])
+
+    def test_expected_configs_fp32_eager_runtime_has_empty_emotion_extras(self):
+        configs = worker.build_expected_configs(
+            affect_backbone="wavlm",
+            disfluency_backbone="whisper",
+            batch_size=512,
+            emotion_runtime_mode="fp32-eager",
+            device="cpu",
+        )
+
+        emotion = configs["emotion"]
+        self.assertEqual(emotion["batch_size"], 64)
+        self.assertNotIn("torch_compile", emotion)
+        self.assertNotIn("torch_allow_tf32", emotion)
 
     def test_claim_happens_before_prefetch_and_intervals_are_passed(self):
         entity = ArchiveEntity("s1", "a1", "prefix")

@@ -95,6 +95,7 @@ def _cmd_run(args: argparse.Namespace) -> None:
         emotion_autocast_dtype=args.emotion_autocast_dtype,
         emotion_compile=args.emotion_compile,
         emotion_compile_mode=args.emotion_compile_mode,
+        emotion_runtime_mode=args.emotion_runtime_mode,
         allow_tf32=args.allow_tf32,
         prefetch_workers=args.prefetch_workers,
         prefetch_lookahead=args.prefetch_lookahead,
@@ -411,6 +412,17 @@ def main(argv: list[str] | None = None) -> None:
         help="Accumulate WavLM learned layer mixtures without materializing every hidden state.",
     )
     p_run.add_argument(
+        "--emotion-runtime-mode",
+        choices=["auto", "optimized", "fp32-eager", "custom"],
+        default="auto",
+        help=(
+            "Emotion2vec runtime preset. Default 'auto' uses optimized "
+            "compile+scoped-TF32 on CUDA and FP32 eager elsewhere. Use "
+            "'fp32-eager' for old FP32 behavior, or 'custom' with granular "
+            "experiment flags."
+        ),
+    )
+    p_run.add_argument(
         "--emotion-autocast-dtype",
         choices=("fp16", "bf16"),
         default=None,
@@ -489,6 +501,7 @@ def main(argv: list[str] | None = None) -> None:
                            help="Minutes since lock creation (default: 60)")
 
     args = parser.parse_args(argv)
+    _validate_emotion_runtime_args(parser, args)
 
     log_dir = args.log_dir
     if log_dir is None and args.command == "run":
@@ -509,6 +522,28 @@ def main(argv: list[str] | None = None) -> None:
         "reclaim-stale": _cmd_reclaim_stale,
     }
     handlers[args.command](args)
+
+
+def _validate_emotion_runtime_args(
+    parser: argparse.ArgumentParser,
+    args: argparse.Namespace,
+) -> None:
+    if getattr(args, "command", None) != "run":
+        return
+    if args.emotion_runtime_mode == "custom":
+        return
+    from ..inference.emotion_runtime import has_custom_emotion_runtime_knobs
+
+    if has_custom_emotion_runtime_knobs(
+        autocast_dtype=args.emotion_autocast_dtype,
+        compile_model=args.emotion_compile,
+        compile_mode=args.emotion_compile_mode,
+        allow_tf32=args.allow_tf32,
+    ):
+        parser.error(
+            "--emotion-runtime-mode presets cannot be mixed with granular "
+            "emotion runtime flags; use --emotion-runtime-mode custom."
+        )
 
 
 if __name__ == "__main__":

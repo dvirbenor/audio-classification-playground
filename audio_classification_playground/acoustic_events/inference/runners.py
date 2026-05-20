@@ -36,6 +36,13 @@ from .audio import (
     writable_contiguous_float32,
 )
 from .emotion2vec import predict_emotion2vec_scores, predict_emotion2vec_scores_from_audio
+from .emotion_runtime import (
+    DEFAULT_EMOTION_COMPILE_MODE,
+    OPTIMIZED_EMOTION_BATCH_SIZE,
+    STANDALONE_EMOTION_BATCH_SIZE,
+    resolve_emotion_runtime_settings,
+    torch_matmul_precision,
+)
 from .log import get_logger
 
 
@@ -296,11 +303,12 @@ def run_emotion_inference(
     window_sec: float = EMOTION_WINDOW_SEC,
     hop_sec: float = DEFAULT_HOP_SEC,
     sample_rate: int = SAMPLE_RATE,
-    batch_size: int = 128,
+    batch_size: int | None = None,
     device: str | None = None,
     autocast_dtype: str | None = None,
     compile_model: bool = False,
-    compile_mode: str = "default",
+    compile_mode: str = DEFAULT_EMOTION_COMPILE_MODE,
+    emotion_runtime_mode: str | None = "auto",
     allow_tf32: bool = False,
     predictor: Callable[[np.ndarray], tuple[np.ndarray, Sequence[str]]] | None = None,
     progress: ProgressFn | None = None,
@@ -310,6 +318,20 @@ def run_emotion_inference(
     audio_source_key: str | None = None,
 ) -> TaskRun:
     """Run emotion2vec inference and persist canonical probabilities."""
+    runtime_settings = resolve_emotion_runtime_settings(
+        mode=emotion_runtime_mode,
+        default_mode="auto",
+        device=device,
+        autocast_dtype=autocast_dtype,
+        compile_model=compile_model,
+        compile_mode=compile_mode,
+        allow_tf32=allow_tf32,
+    )
+    resolved_batch_size = _resolve_emotion_batch_size(
+        batch_size,
+        settings=runtime_settings,
+        fallback_batch_size=STANDALONE_EMOTION_BATCH_SIZE,
+    )
     audio = _coerce_audio(audio_path, sample_rate=sample_rate, recording_id=recording_id)
     config = _inference_config(
         task="emotion",
@@ -318,13 +340,13 @@ def run_emotion_inference(
         sample_rate=sample_rate,
         window_sec=window_sec,
         hop_sec=hop_sec,
-        batch_size=batch_size,
+        batch_size=resolved_batch_size,
         transform_policy="emotion2vec_fold_row_normalize_v1",
         extra=_emotion_runtime_config_extra(
-            autocast_dtype=autocast_dtype,
-            compile_model=compile_model,
-            compile_mode=compile_mode,
-            allow_tf32=allow_tf32,
+            autocast_dtype=runtime_settings.autocast_dtype,
+            compile_model=runtime_settings.compile_model,
+            compile_mode=runtime_settings.compile_mode,
+            allow_tf32=runtime_settings.allow_tf32,
         ),
     )
     cached = _maybe_cached(out_dir, audio, "emotion", config, reuse_cache, artifact_path)
@@ -365,12 +387,12 @@ def run_emotion_inference(
                 sample_rate=sample_rate,
                 window_sec=window_sec,
                 hop_sec=hop_sec,
-                batch_size=batch_size,
-                device=device,
-                autocast_dtype=autocast_dtype,
-                compile_model=compile_model,
-                compile_mode=compile_mode,
-                allow_tf32=allow_tf32,
+                batch_size=resolved_batch_size,
+                device=runtime_settings.device,
+                autocast_dtype=runtime_settings.autocast_dtype,
+                compile_model=runtime_settings.compile_model,
+                compile_mode=runtime_settings.compile_mode,
+                allow_tf32=runtime_settings.allow_tf32,
                 progress=progress,
             )
         probabilities, labels = emotion2vec_scores_to_probabilities(raw_scores, raw_labels)
@@ -385,7 +407,7 @@ def run_emotion_inference(
                 "id": model_id,
             },
             timing=_timing(sample_rate, window_sec, hop_sec, n_windows),
-            runtime=_runtime(device=device, batch_size=batch_size),
+            runtime=_runtime(device=runtime_settings.device, batch_size=resolved_batch_size),
             labels=labels,
             artifact_path=artifact_path,
             audio_path_override=audio_path_override,
@@ -513,7 +535,8 @@ def run_all_inference(
     wavlm_stream_layer_sum: bool = False,
     emotion_autocast_dtype: str | None = None,
     emotion_compile: bool = False,
-    emotion_compile_mode: str = "default",
+    emotion_compile_mode: str = DEFAULT_EMOTION_COMPILE_MODE,
+    emotion_runtime_mode: str | None = "auto",
     allow_tf32: bool = False,
     progress: ProgressFn | None = None,
     predictors: Mapping[str, Callable] | None = None,
@@ -564,11 +587,24 @@ def run_all_inference(
     and ``emotion``. This function writes inference artifacts only; it does
     not run producers or save review sessions.
     """
+    emotion_settings = resolve_emotion_runtime_settings(
+        mode=emotion_runtime_mode,
+        default_mode="auto",
+        device=device,
+        autocast_dtype=emotion_autocast_dtype,
+        compile_model=emotion_compile,
+        compile_mode=emotion_compile_mode,
+        allow_tf32=allow_tf32,
+    )
     resolved_batches = resolve_task_batch_sizes(
         batch_size=batch_size,
         affect_batch_size=affect_batch_size,
         disfluency_batch_size=disfluency_batch_size,
-        emotion_batch_size=emotion_batch_size,
+        emotion_batch_size=(
+            OPTIMIZED_EMOTION_BATCH_SIZE
+            if emotion_batch_size is None and emotion_settings.mode == "optimized"
+            else emotion_batch_size
+        ),
     )
     predictors = dict(predictors or {})
     if isinstance(audio_path, AudioData):
@@ -654,10 +690,11 @@ def run_all_inference(
                 out_dir=out_dir,
                 reuse_cache=reuse_cache,
                 batch_size=resolved_batches["emotion"],
-                device=device,
+                device=emotion_settings.device,
                 autocast_dtype=emotion_autocast_dtype,
                 compile_model=emotion_compile,
                 compile_mode=emotion_compile_mode,
+                emotion_runtime_mode=emotion_runtime_mode,
                 allow_tf32=allow_tf32,
                 predictor=predictors.get("emotion"),
                 progress=progress,
@@ -759,6 +796,22 @@ def resolve_task_batch_sizes(
         if value <= 0:
             raise ValueError(f"{task} batch size must be positive")
     return batches
+
+
+def _resolve_emotion_batch_size(
+    batch_size: int | None,
+    *,
+    settings,
+    fallback_batch_size: int,
+) -> int:
+    value = (
+        OPTIMIZED_EMOTION_BATCH_SIZE
+        if batch_size is None and settings.mode == "optimized"
+        else fallback_batch_size if batch_size is None else int(batch_size)
+    )
+    if value <= 0:
+        raise ValueError("emotion batch size must be positive")
+    return value
 
 
 def _emotion_runtime_config_extra(
@@ -1195,9 +1248,6 @@ def _predict_emotion2vec(
     progress: ProgressFn | None,
 ) -> tuple[np.ndarray, Sequence[str]]:
     from funasr import AutoModel
-    from .models import configure_torch_matmul
-
-    configure_torch_matmul(allow_tf32=allow_tf32)
 
     auto_kwargs = {
         "model": model_id,
@@ -1207,19 +1257,20 @@ def _predict_emotion2vec(
     }
     if device is not None:
         auto_kwargs["device"] = device
-    model = AutoModel(**auto_kwargs)
-    return predict_emotion2vec_scores_from_audio(
-        model,
-        samples,
-        sample_rate=sample_rate,
-        window_sec=window_sec,
-        hop_sec=hop_sec,
-        batch_size=batch_size,
-        autocast_dtype=autocast_dtype,
-        compile_model=compile_model,
-        compile_mode=compile_mode,
-        progress=progress,
-    )
+    with torch_matmul_precision(allow_tf32=allow_tf32):
+        model = AutoModel(**auto_kwargs)
+        return predict_emotion2vec_scores_from_audio(
+            model,
+            samples,
+            sample_rate=sample_rate,
+            window_sec=window_sec,
+            hop_sec=hop_sec,
+            batch_size=batch_size,
+            autocast_dtype=autocast_dtype,
+            compile_model=compile_model,
+            compile_mode=compile_mode,
+            progress=progress,
+        )
 
 
 def _detect_silero_vad(

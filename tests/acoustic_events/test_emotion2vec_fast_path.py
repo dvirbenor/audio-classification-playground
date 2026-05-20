@@ -10,6 +10,13 @@ from audio_classification_playground.acoustic_events.inference.emotion2vec impor
     predict_emotion2vec_scores,
     predict_emotion2vec_scores_from_audio,
 )
+from audio_classification_playground.acoustic_events.inference.audio import (
+    frame_audio,
+    frame_audio_geometry,
+)
+from audio_classification_playground.acoustic_events.inference.emotion_runtime import (
+    torch_matmul_precision,
+)
 
 
 class FakeAutoModel:
@@ -125,6 +132,36 @@ class Emotion2vecFastPathTest(unittest.TestCase):
         self.assertEqual(audio_labels, framed_labels)
         np.testing.assert_allclose(audio_scores, framed_scores, rtol=0.0, atol=0.0)
 
+    def test_audio_feed_framing_is_bit_equal_to_numpy_framing(self):
+        import torch.nn.functional as F
+
+        sample_rate = 16_000
+        samples = np.arange(9, dtype=np.float32)
+        expected = np.asarray(
+            frame_audio(
+                samples,
+                sample_rate=sample_rate,
+                window_sec=4 / sample_rate,
+                hop_sec=2 / sample_rate,
+            )
+        )
+        n_frames, window_samples, hop_samples, pad_needed = frame_audio_geometry(
+            len(samples),
+            sample_rate=sample_rate,
+            window_sec=4 / sample_rate,
+            hop_sec=2 / sample_rate,
+        )
+
+        audio = torch.from_numpy(samples.copy())
+        if pad_needed:
+            audio = F.pad(audio, (0, pad_needed))
+        actual = audio.as_strided(
+            size=(n_frames, window_samples),
+            stride=(hop_samples, 1),
+        ).contiguous()
+
+        np.testing.assert_array_equal(actual.numpy(), expected)
+
     def test_generate_fallback_sets_funasr_batch_size(self):
         auto_model = GenerateOnlyAutoModel()
         windows = np.ones((3, 4), dtype=np.float32)
@@ -161,6 +198,27 @@ class Emotion2vecFastPathTest(unittest.TestCase):
         self.assertEqual(tuple(padded.shape), (4, 3))
         torch.testing.assert_close(padded[:2], batch)
         torch.testing.assert_close(padded[2:], torch.zeros((2, 3)))
+
+    def test_torch_matmul_precision_context_restores_global_state(self):
+        old_matmul = torch.backends.cuda.matmul.allow_tf32
+        old_cudnn = torch.backends.cudnn.allow_tf32
+        old_precision = torch.get_float32_matmul_precision()
+
+        with torch_matmul_precision(allow_tf32=True):
+            self.assertTrue(torch.backends.cuda.matmul.allow_tf32)
+            self.assertTrue(torch.backends.cudnn.allow_tf32)
+            self.assertEqual(torch.get_float32_matmul_precision(), "high")
+            with torch_matmul_precision(allow_tf32=True):
+                self.assertTrue(torch.backends.cuda.matmul.allow_tf32)
+                self.assertTrue(torch.backends.cudnn.allow_tf32)
+                self.assertEqual(torch.get_float32_matmul_precision(), "high")
+            self.assertTrue(torch.backends.cuda.matmul.allow_tf32)
+            self.assertTrue(torch.backends.cudnn.allow_tf32)
+            self.assertEqual(torch.get_float32_matmul_precision(), "high")
+
+        self.assertEqual(torch.backends.cuda.matmul.allow_tf32, old_matmul)
+        self.assertEqual(torch.backends.cudnn.allow_tf32, old_cudnn)
+        self.assertEqual(torch.get_float32_matmul_precision(), old_precision)
 
 
 if __name__ == "__main__":
