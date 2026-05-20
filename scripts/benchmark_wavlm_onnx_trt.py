@@ -275,7 +275,8 @@ def export_onnx(
         "elapsed_sec": time.perf_counter() - started,
         "size_mb": onnx_path.stat().st_size / 1_000_000,
         "artifact_size_mb": onnx_artifact_size_mb(onnx_path),
-        "opset": opset,
+        "requested_opset": opset,
+        "actual_opsets": read_onnx_opsets(onnx_path),
         "dynamic_batch": dynamic_batch,
         "requested_exporter": exporter,
         "exporter": chosen_exporter,
@@ -331,6 +332,19 @@ def onnx_artifact_size_mb(onnx_path: Path) -> float:
     if external_data_path.exists():
         total += external_data_path.stat().st_size
     return total / 1_000_000
+
+
+def read_onnx_opsets(onnx_path: Path) -> list[dict[str, str | int]]:
+    try:
+        import onnx
+    except Exception as exc:
+        return [{"status": "unavailable", "error": f"{type(exc).__name__}: {exc}"}]
+
+    model = onnx.load(str(onnx_path), load_external_data=False)
+    return [
+        {"domain": opset.domain or "ai.onnx", "version": int(opset.version)}
+        for opset in model.opset_import
+    ]
 
 
 def run_onnxruntime(
@@ -663,7 +677,7 @@ def main() -> None:
     parser.add_argument("--onnx-path")
     parser.add_argument("--skip-export", action="store_true")
     parser.add_argument("--dynamic-batch", action="store_true")
-    parser.add_argument("--opset", type=int, default=17)
+    parser.add_argument("--opset", type=int, default=18)
     parser.add_argument(
         "--onnx-exporter",
         choices=("auto", "legacy", "dynamo"),
