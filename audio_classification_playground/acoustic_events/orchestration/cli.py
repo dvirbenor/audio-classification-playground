@@ -92,6 +92,7 @@ def _cmd_run(args: argparse.Namespace) -> None:
         wavlm_compile_mode=args.wavlm_compile_mode,
         wavlm_compile_dynamic=args.wavlm_compile_dynamic,
         wavlm_stream_layer_sum=args.wavlm_stream_layer_sum,
+        wavlm_runtime_preset=args.wavlm_runtime_preset,
         emotion_autocast_dtype=args.emotion_autocast_dtype,
         emotion_compile=args.emotion_compile,
         emotion_compile_mode=args.emotion_compile_mode,
@@ -412,6 +413,16 @@ def main(argv: list[str] | None = None) -> None:
         help="Accumulate WavLM learned layer mixtures without materializing every hidden state.",
     )
     p_run.add_argument(
+        "--wavlm-runtime-preset",
+        choices=("fast_exact", "compiled_static"),
+        default=None,
+        help=(
+            "Worker-level WavLM preset. If unset, workers choose "
+            "compiled_static when CUDA/compiler prerequisites are available "
+            "and fast_exact otherwise."
+        ),
+    )
+    p_run.add_argument(
         "--emotion-runtime-mode",
         choices=["auto", "optimized", "fp32-eager", "custom"],
         default="auto",
@@ -502,6 +513,7 @@ def main(argv: list[str] | None = None) -> None:
 
     args = parser.parse_args(argv)
     _validate_emotion_runtime_args(parser, args)
+    _validate_wavlm_runtime_args(parser, args)
 
     log_dir = args.log_dir
     if log_dir is None and args.command == "run":
@@ -543,6 +555,30 @@ def _validate_emotion_runtime_args(
         parser.error(
             "--emotion-runtime-mode presets cannot be mixed with granular "
             "emotion runtime flags; use --emotion-runtime-mode custom."
+        )
+
+
+def _validate_wavlm_runtime_args(
+    parser: argparse.ArgumentParser,
+    args: argparse.Namespace,
+) -> None:
+    if getattr(args, "command", None) != "run":
+        return
+    if args.wavlm_runtime_preset is None:
+        return
+    from ..inference.wavlm_runtime import has_custom_wavlm_runtime_knobs
+
+    if has_custom_wavlm_runtime_knobs(
+        autocast_dtype=args.wavlm_autocast_dtype,
+        compile_model=args.wavlm_compile,
+        compile_mode=args.wavlm_compile_mode,
+        compile_dynamic=args.wavlm_compile_dynamic,
+        stream_layer_sum=args.wavlm_stream_layer_sum,
+        allow_tf32=args.allow_tf32,
+    ):
+        parser.error(
+            "--wavlm-runtime-preset cannot be mixed with granular WavLM "
+            "runtime flags; omit the preset for custom experiments."
         )
 
 

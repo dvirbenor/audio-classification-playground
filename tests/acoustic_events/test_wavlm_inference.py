@@ -74,6 +74,16 @@ def test_prepare_wavlm_large_inputs_preserves_length_masks_when_provided():
     ]
 
 
+def test_prepare_wavlm_large_inputs_zero_windows_are_finite_zeros():
+    x = torch.zeros((2, 16), dtype=torch.float32)
+
+    signal, attention_mask = prepare_wavlm_large_inputs(_FakeFeatureExtractor(), x)
+
+    assert attention_mask is None
+    assert torch.isfinite(signal).all()
+    assert torch.equal(signal, torch.zeros_like(signal))
+
+
 def test_writable_contiguous_float32_copies_readonly_framed_views():
     samples = np.arange(16_000, dtype=np.float32)
     windows = frame_audio(

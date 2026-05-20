@@ -19,6 +19,10 @@ from audio_classification_playground.acoustic_events.orchestration.manifest impo
 from audio_classification_playground.acoustic_events.orchestration.prefetch import (
     PrefetchResult,
 )
+from audio_classification_playground.acoustic_events.inference.wavlm_runtime import (
+    WAVLM_COMPILED_STATIC_BATCH_SIZE,
+    WavLMRuntimeSettings,
+)
 
 _TASKS = ("vad", "affect", "disfluency", "emotion")
 
@@ -119,7 +123,11 @@ class WorkerAsyncVadTest(unittest.TestCase):
         self.assertEqual(model_kwargs[0]["emotion_batch_size"], 64)
 
     def test_expected_configs_auto_runtime_records_optimized_emotion_on_cuda(self):
-        with patch("torch.cuda.is_available", return_value=True):
+        with patch("torch.cuda.is_available", return_value=True), patch.object(
+            worker,
+            "resolve_wavlm_runtime_settings",
+            return_value=_fast_exact_settings(device="cuda"),
+        ):
             configs = worker.build_expected_configs(
                 affect_backbone="wavlm",
                 disfluency_backbone="whisper",
@@ -132,8 +140,68 @@ class WorkerAsyncVadTest(unittest.TestCase):
         self.assertTrue(emotion["torch_compile"])
         self.assertEqual(emotion["torch_compile_mode"], "default")
         self.assertTrue(emotion["torch_allow_tf32"])
-        self.assertNotIn("torch_allow_tf32", configs["affect"])
+        self.assertFalse(configs["affect"]["torch_allow_tf32"])
         self.assertNotIn("torch_allow_tf32", configs["disfluency"])
+
+    def test_compiled_static_wavlm_preset_uses_256_batches_and_warmup(self):
+        entity = ArchiveEntity("s1", "a1", "prefix")
+        model_kwargs = []
+        run_kwargs = []
+
+        class FakeModels(_FakeModels):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                model_kwargs.append(kwargs)
+
+        def fake_run_all(*args, **kwargs):
+            run_kwargs.append(kwargs)
+            return _fake_inference_result()
+
+        with _worker_patches(
+            [entity],
+            model_suite_cls=FakeModels,
+            run_all_fn=fake_run_all,
+        ), patch.object(
+            worker,
+            "resolve_wavlm_runtime_settings",
+            return_value=_compiled_static_settings(),
+        ), patch.object(
+            worker,
+            "configure_inductor_cache_namespace",
+            return_value={"configured": True, "writable": True, "path": "/tmp/cache"},
+        ):
+            worker.run_worker(
+                parquet_path="manifest.parquet",
+                output_base=tempfile.mkdtemp(),
+                affect_backbone="wavlm",
+                disfluency_backbone="wavlm",
+                prefetch_lookahead=1,
+                vad_prefetch_workers=1,
+            )
+
+        self.assertEqual(
+            model_kwargs[0]["affect_batch_size"],
+            WAVLM_COMPILED_STATIC_BATCH_SIZE,
+        )
+        self.assertEqual(
+            model_kwargs[0]["disfluency_batch_size"],
+            WAVLM_COMPILED_STATIC_BATCH_SIZE,
+        )
+        self.assertTrue(model_kwargs[0]["wavlm_compile"])
+        self.assertEqual(model_kwargs[0]["wavlm_compile_mode"], "default")
+        self.assertTrue(model_kwargs[0]["wavlm_static_batch"])
+        self.assertTrue(model_kwargs[0]["wavlm_warmup"])
+        self.assertEqual(model_kwargs[0]["wavlm_runtime_preset"], "compiled_static")
+        self.assertEqual(
+            run_kwargs[0]["affect_batch_size"],
+            WAVLM_COMPILED_STATIC_BATCH_SIZE,
+        )
+        self.assertEqual(
+            run_kwargs[0]["disfluency_batch_size"],
+            WAVLM_COMPILED_STATIC_BATCH_SIZE,
+        )
+        self.assertTrue(run_kwargs[0]["wavlm_static_batch"])
+        self.assertEqual(run_kwargs[0]["wavlm_runtime_preset"], "compiled_static")
 
     def test_expected_configs_fp32_eager_runtime_has_empty_emotion_extras(self):
         configs = worker.build_expected_configs(
@@ -394,6 +462,40 @@ class _FakeModels:
 
     def __init__(self, *args, **kwargs):
         self.load_vad = kwargs.get("load_vad")
+
+
+def _fast_exact_settings(*, device: str = "cpu") -> WavLMRuntimeSettings:
+    return WavLMRuntimeSettings(
+        requested_preset=None,
+        preset="fast_exact",
+        device=device,
+        task_batch_size=None,
+        autocast_dtype=None,
+        compile_model=False,
+        compile_mode="reduce-overhead",
+        compile_dynamic=False,
+        stream_layer_sum=False,
+        allow_tf32=False,
+        static_batch=False,
+        warmup=False,
+    )
+
+
+def _compiled_static_settings() -> WavLMRuntimeSettings:
+    return WavLMRuntimeSettings(
+        requested_preset=None,
+        preset="compiled_static",
+        device="cuda",
+        task_batch_size=WAVLM_COMPILED_STATIC_BATCH_SIZE,
+        autocast_dtype=None,
+        compile_model=True,
+        compile_mode="default",
+        compile_dynamic=False,
+        stream_layer_sum=False,
+        allow_tf32=False,
+        static_batch=True,
+        warmup=True,
+    )
 
 
 @contextmanager

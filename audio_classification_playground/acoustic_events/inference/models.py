@@ -45,9 +45,11 @@ from .emotion_runtime import (
 )
 from .log import get_logger
 from .runners import (
+    AFFECT_WINDOW_SEC,
     DEFAULT_AFFECT_MODELS,
     DEFAULT_DISFLUENCY_MODELS,
     DEFAULT_EMOTION_MODEL,
+    DISFLUENCY_WINDOW_SEC,
     EMOTION_WINDOW_SEC,
     DEFAULT_VAD_MIN_SILENCE_SEC,
     DEFAULT_VAD_MIN_SPEECH_SEC,
@@ -55,6 +57,12 @@ from .runners import (
     _load_affect_wrapper,
     _load_disfluency_wrapper,
     resolve_task_batch_sizes,
+)
+from .wavlm_runtime import (
+    WAVLM_PREPROCESSING_POLICY,
+    WAVLM_STATIC_BATCH_PADDING_POLICY,
+    WAVLM_WARMUP_WARNING_SEC,
+    pad_windows_to_static_batch,
 )
 
 LOGGER = get_logger()
@@ -98,6 +106,9 @@ class AffectPredictor:
         wavlm_compile_mode: str = "reduce-overhead",
         wavlm_compile_dynamic: bool = False,
         wavlm_stream_layer_sum: bool = False,
+        wavlm_static_batch: bool = False,
+        wavlm_warmup: bool = False,
+        wavlm_runtime_preset: str | None = None,
     ) -> None:
         import torch
 
@@ -109,7 +120,20 @@ class AffectPredictor:
             else None
         )
         self.wavlm_compile = bool(wavlm_compile and backbone == "wavlm")
+        self.wavlm_compile_mode = str(wavlm_compile_mode) if backbone == "wavlm" else None
+        self.wavlm_compile_dynamic = (
+            bool(wavlm_compile_dynamic) if backbone == "wavlm" else False
+        )
         self.wavlm_stream_layer_sum = bool(wavlm_stream_layer_sum and backbone == "wavlm")
+        self.wavlm_static_batch = bool(wavlm_static_batch and backbone == "wavlm")
+        self.wavlm_runtime_preset = wavlm_runtime_preset if backbone == "wavlm" else None
+        self.wavlm_preprocessing_policy = (
+            WAVLM_PREPROCESSING_POLICY if backbone == "wavlm" else None
+        )
+        self.wavlm_static_batch_padding_policy = (
+            WAVLM_STATIC_BATCH_PADDING_POLICY if self.wavlm_static_batch else None
+        )
+        self.wavlm_warmup_sec: float | None = None
         resolved_id = model_id or DEFAULT_AFFECT_MODELS[backbone]
         self.model_id = resolved_id
         self._device = device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -117,24 +141,55 @@ class AffectPredictor:
         self._model = wrapper.from_pretrained(resolved_id).to(self._device).eval()
         if self.wavlm_stream_layer_sum:
             self._model.wavlm_stream_layer_sum = True
+        original_backbone_model = getattr(self._model, "backbone_model", None)
         if self.wavlm_compile:
-            compile_wavlm_backbone(
-                self._model,
-                mode=wavlm_compile_mode,
-                dynamic=wavlm_compile_dynamic,
-            )
+            try:
+                compile_wavlm_backbone(
+                    self._model,
+                    mode=wavlm_compile_mode,
+                    dynamic=wavlm_compile_dynamic,
+                )
+                if wavlm_warmup and backbone == "wavlm":
+                    self.wavlm_warmup_sec = self._warmup_wavlm()
+            except Exception:
+                if self.wavlm_runtime_preset != "compiled_static":
+                    raise
+                LOGGER.warning(
+                    "Affect WavLM compiled_static warmup failed; falling back to fast_exact",
+                    exc_info=True,
+                )
+                if original_backbone_model is not None:
+                    self._model.backbone_model = original_backbone_model
+                self.wavlm_compile = False
+                self.wavlm_static_batch = False
+                self.wavlm_runtime_preset = "fast_exact"
+                self.wavlm_static_batch_padding_policy = None
+                self.wavlm_warmup_sec = None
         LOGGER.info(
-            "AffectPredictor loaded: %s on %s autocast=%s compile=%s stream_layer_sum=%s",
+            "AffectPredictor loaded: %s on %s autocast=%s compile=%s "
+            "stream_layer_sum=%s static_batch=%s preset=%s warmup_sec=%s",
             resolved_id,
             self._device,
             self.wavlm_autocast_dtype,
             self.wavlm_compile,
             self.wavlm_stream_layer_sum,
+            self.wavlm_static_batch,
+            self.wavlm_runtime_preset,
+            self.wavlm_warmup_sec,
         )
 
     def __call__(self, windows: np.ndarray) -> dict[str, np.ndarray]:
         import torch
 
+        if len(windows) == 0:
+            empty = np.zeros((0,), dtype=np.float32)
+            return {"arousal": empty.copy(), "valence": empty.copy(), "dominance": empty.copy()}
+
+        windows, valid_count = pad_windows_to_static_batch(
+            windows,
+            batch_size=self.batch_size,
+            enabled=self.wavlm_static_batch,
+        )
         arousal, valence, dominance = [], [], []
         with torch.inference_mode():
             for batch_np in _batches(windows, self.batch_size, "affect"):
@@ -147,10 +202,23 @@ class AffectPredictor:
                 valence.append(v.detach().float().reshape(-1))
                 dominance.append(d.detach().float().reshape(-1))
         return {
-            "arousal": torch.cat(arousal).cpu().numpy(),
-            "valence": torch.cat(valence).cpu().numpy(),
-            "dominance": torch.cat(dominance).cpu().numpy(),
+            "arousal": torch.cat(arousal)[:valid_count].cpu().numpy(),
+            "valence": torch.cat(valence)[:valid_count].cpu().numpy(),
+            "dominance": torch.cat(dominance)[:valid_count].cpu().numpy(),
         }
+
+    def _warmup_wavlm(self) -> float:
+        """Warm the full WavLM predictor path with the production static shape."""
+        import time
+
+        window_samples = int(round(AFFECT_WINDOW_SEC * SAMPLE_RATE))
+        warmup = np.zeros((int(self.batch_size), window_samples), dtype=np.float32)
+        started = time.perf_counter()
+        self(warmup)
+        elapsed = time.perf_counter() - started
+        log_fn = LOGGER.warning if elapsed > WAVLM_WARMUP_WARNING_SEC else LOGGER.info
+        log_fn("Affect WavLM warmup complete in %.3fs", elapsed)
+        return float(elapsed)
 
 
 class DisfluencyPredictor:
@@ -170,6 +238,9 @@ class DisfluencyPredictor:
         wavlm_compile_mode: str = "reduce-overhead",
         wavlm_compile_dynamic: bool = False,
         wavlm_stream_layer_sum: bool = False,
+        wavlm_static_batch: bool = False,
+        wavlm_warmup: bool = False,
+        wavlm_runtime_preset: str | None = None,
     ) -> None:
         import torch
 
@@ -181,7 +252,20 @@ class DisfluencyPredictor:
             else None
         )
         self.wavlm_compile = bool(wavlm_compile and backbone == "wavlm")
+        self.wavlm_compile_mode = str(wavlm_compile_mode) if backbone == "wavlm" else None
+        self.wavlm_compile_dynamic = (
+            bool(wavlm_compile_dynamic) if backbone == "wavlm" else False
+        )
         self.wavlm_stream_layer_sum = bool(wavlm_stream_layer_sum and backbone == "wavlm")
+        self.wavlm_static_batch = bool(wavlm_static_batch and backbone == "wavlm")
+        self.wavlm_runtime_preset = wavlm_runtime_preset if backbone == "wavlm" else None
+        self.wavlm_preprocessing_policy = (
+            WAVLM_PREPROCESSING_POLICY if backbone == "wavlm" else None
+        )
+        self.wavlm_static_batch_padding_policy = (
+            WAVLM_STATIC_BATCH_PADDING_POLICY if self.wavlm_static_batch else None
+        )
+        self.wavlm_warmup_sec: float | None = None
         resolved_id = model_id or DEFAULT_DISFLUENCY_MODELS[backbone]
         self.model_id = resolved_id
         self._device = device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -189,24 +273,57 @@ class DisfluencyPredictor:
         self._model = wrapper.from_pretrained(resolved_id).to(self._device).eval()
         if self.wavlm_stream_layer_sum:
             self._model.wavlm_stream_layer_sum = True
+        original_backbone_model = getattr(self._model, "backbone_model", None)
         if self.wavlm_compile:
-            compile_wavlm_backbone(
-                self._model,
-                mode=wavlm_compile_mode,
-                dynamic=wavlm_compile_dynamic,
-            )
+            try:
+                compile_wavlm_backbone(
+                    self._model,
+                    mode=wavlm_compile_mode,
+                    dynamic=wavlm_compile_dynamic,
+                )
+                if wavlm_warmup and backbone == "wavlm":
+                    self.wavlm_warmup_sec = self._warmup_wavlm()
+            except Exception:
+                if self.wavlm_runtime_preset != "compiled_static":
+                    raise
+                LOGGER.warning(
+                    "Disfluency WavLM compiled_static warmup failed; falling back to fast_exact",
+                    exc_info=True,
+                )
+                if original_backbone_model is not None:
+                    self._model.backbone_model = original_backbone_model
+                self.wavlm_compile = False
+                self.wavlm_static_batch = False
+                self.wavlm_runtime_preset = "fast_exact"
+                self.wavlm_static_batch_padding_policy = None
+                self.wavlm_warmup_sec = None
         LOGGER.info(
-            "DisfluencyPredictor loaded: %s on %s autocast=%s compile=%s stream_layer_sum=%s",
+            "DisfluencyPredictor loaded: %s on %s autocast=%s compile=%s "
+            "stream_layer_sum=%s static_batch=%s preset=%s warmup_sec=%s",
             resolved_id,
             self._device,
             self.wavlm_autocast_dtype,
             self.wavlm_compile,
             self.wavlm_stream_layer_sum,
+            self.wavlm_static_batch,
+            self.wavlm_runtime_preset,
+            self.wavlm_warmup_sec,
         )
 
     def __call__(self, windows: np.ndarray) -> dict[str, np.ndarray]:
         import torch
 
+        if len(windows) == 0:
+            return {
+                "fluency_logits": np.zeros((0, 2), dtype=np.float32),
+                "disfluency_type_logits": np.zeros((0, 5), dtype=np.float32),
+            }
+
+        windows, valid_count = pad_windows_to_static_batch(
+            windows,
+            batch_size=self.batch_size,
+            enabled=self.wavlm_static_batch,
+        )
         fluency, dysfluency = [], []
         with torch.inference_mode():
             for batch_np in _batches(windows, self.batch_size, "disfluency"):
@@ -218,9 +335,22 @@ class DisfluencyPredictor:
                 fluency.append(f.detach().float())
                 dysfluency.append(d.detach().float())
         return {
-            "fluency_logits": torch.cat(fluency, dim=0).cpu().numpy(),
-            "disfluency_type_logits": torch.cat(dysfluency, dim=0).cpu().numpy(),
+            "fluency_logits": torch.cat(fluency, dim=0)[:valid_count].cpu().numpy(),
+            "disfluency_type_logits": torch.cat(dysfluency, dim=0)[:valid_count].cpu().numpy(),
         }
+
+    def _warmup_wavlm(self) -> float:
+        """Warm the full WavLM predictor path with the production static shape."""
+        import time
+
+        window_samples = int(round(DISFLUENCY_WINDOW_SEC * SAMPLE_RATE))
+        warmup = np.zeros((int(self.batch_size), window_samples), dtype=np.float32)
+        started = time.perf_counter()
+        self(warmup)
+        elapsed = time.perf_counter() - started
+        log_fn = LOGGER.warning if elapsed > WAVLM_WARMUP_WARNING_SEC else LOGGER.info
+        log_fn("Disfluency WavLM warmup complete in %.3fs", elapsed)
+        return float(elapsed)
 
 
 class EmotionPredictor:
@@ -431,6 +561,9 @@ class ModelSuite:
         wavlm_compile_mode: str = "reduce-overhead",
         wavlm_compile_dynamic: bool = False,
         wavlm_stream_layer_sum: bool = False,
+        wavlm_static_batch: bool = False,
+        wavlm_warmup: bool = False,
+        wavlm_runtime_preset: str | None = None,
         emotion_autocast_dtype: str | None = None,
         emotion_compile: bool = False,
         emotion_compile_mode: str = DEFAULT_EMOTION_COMPILE_MODE,
@@ -466,6 +599,9 @@ class ModelSuite:
             wavlm_compile_mode=wavlm_compile_mode,
             wavlm_compile_dynamic=wavlm_compile_dynamic,
             wavlm_stream_layer_sum=wavlm_stream_layer_sum,
+            wavlm_static_batch=wavlm_static_batch,
+            wavlm_warmup=wavlm_warmup,
+            wavlm_runtime_preset=wavlm_runtime_preset,
         )
         self.disfluency = DisfluencyPredictor(
             backbone=disfluency_backbone,
@@ -476,6 +612,9 @@ class ModelSuite:
             wavlm_compile_mode=wavlm_compile_mode,
             wavlm_compile_dynamic=wavlm_compile_dynamic,
             wavlm_stream_layer_sum=wavlm_stream_layer_sum,
+            wavlm_static_batch=wavlm_static_batch,
+            wavlm_warmup=wavlm_warmup,
+            wavlm_runtime_preset=wavlm_runtime_preset,
         )
         self.emotion = EmotionPredictor(
             batch_size=batches["emotion"],

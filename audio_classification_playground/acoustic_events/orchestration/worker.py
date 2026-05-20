@@ -51,6 +51,12 @@ from ..inference.runners import (
     resolve_task_batch_sizes,
     run_all_inference,
 )
+from ..inference.wavlm_runtime import (
+    WAVLM_COMPILED_STATIC_BATCH_SIZE,
+    configure_inductor_cache_namespace,
+    inductor_cache_status,
+    resolve_wavlm_runtime_settings,
+)
 from .audio_resolver import AudioResolutionError, BUCKET
 from .errors import (
     append_audio_error,
@@ -119,19 +125,65 @@ def _wavlm_runtime_config_extra(
 ) -> dict[str, object]:
     if backbone != "wavlm":
         return {}
-    extra: dict[str, object] = {}
-    if wavlm_autocast_dtype is not None:
-        extra["torch_autocast_dtype"] = wavlm_autocast_dtype
-    if wavlm_compile:
-        extra["torch_compile"] = True
-        extra["torch_compile_target"] = "wavlm_backbone"
-        extra["torch_compile_mode"] = wavlm_compile_mode
-        extra["torch_compile_dynamic"] = bool(wavlm_compile_dynamic)
-    if wavlm_stream_layer_sum:
-        extra["wavlm_stream_layer_sum"] = True
-    if allow_tf32:
-        extra["torch_allow_tf32"] = True
-    return extra
+    return {
+        "torch_autocast_dtype": wavlm_autocast_dtype,
+        "torch_compile": bool(wavlm_compile),
+        "torch_compile_target": "wavlm_backbone",
+        "torch_compile_mode": str(wavlm_compile_mode),
+        "torch_compile_dynamic": bool(wavlm_compile_dynamic),
+        "wavlm_stream_layer_sum": bool(wavlm_stream_layer_sum),
+        "torch_allow_tf32": bool(allow_tf32),
+    }
+
+
+def _resolve_worker_batch_sizes(
+    *,
+    batch_size: int,
+    affect_batch_size: int | None,
+    disfluency_batch_size: int | None,
+    emotion_batch_size: int | None,
+    affect_backbone: str,
+    disfluency_backbone: str,
+    wavlm_task_batch_size: int | None,
+) -> dict[str, int]:
+    """Resolve per-task batches, applying WavLM preset defaults last."""
+    if wavlm_task_batch_size is not None:
+        if (
+            affect_backbone == "wavlm"
+            and affect_batch_size is not None
+            and int(affect_batch_size) != int(wavlm_task_batch_size)
+        ):
+            raise ValueError(
+                "compiled_static WavLM preset requires affect_batch_size="
+                f"{wavlm_task_batch_size}"
+            )
+        if (
+            disfluency_backbone == "wavlm"
+            and disfluency_batch_size is not None
+            and int(disfluency_batch_size) != int(wavlm_task_batch_size)
+        ):
+            raise ValueError(
+                "compiled_static WavLM preset requires disfluency_batch_size="
+                f"{wavlm_task_batch_size}"
+            )
+    return resolve_task_batch_sizes(
+        batch_size=batch_size,
+        affect_batch_size=(
+            wavlm_task_batch_size
+            if affect_backbone == "wavlm" and wavlm_task_batch_size is not None
+            else affect_batch_size
+        ),
+        disfluency_batch_size=(
+            wavlm_task_batch_size
+            if disfluency_backbone == "wavlm" and wavlm_task_batch_size is not None
+            else disfluency_batch_size
+        ),
+        emotion_batch_size=(
+            DEFAULT_EMOTION_BATCH_SIZE
+            if emotion_batch_size is None
+            else emotion_batch_size
+        ),
+    )
 
 
 def build_expected_configs(
@@ -151,6 +203,7 @@ def build_expected_configs(
     wavlm_compile_mode: str = "reduce-overhead",
     wavlm_compile_dynamic: bool = False,
     wavlm_stream_layer_sum: bool = False,
+    wavlm_runtime_preset: str | None = None,
     emotion_autocast_dtype: str | None = None,
     emotion_compile: bool = False,
     emotion_compile_mode: str = DEFAULT_EMOTION_COMPILE_MODE,
@@ -172,15 +225,24 @@ def build_expected_configs(
         compile_mode=emotion_compile_mode,
         allow_tf32=allow_tf32,
     )
-    batches = resolve_task_batch_sizes(
+    wavlm_settings = resolve_wavlm_runtime_settings(
+        preset=wavlm_runtime_preset,
+        device=device,
+        autocast_dtype=wavlm_autocast_dtype,
+        compile_model=wavlm_compile,
+        compile_mode=wavlm_compile_mode,
+        compile_dynamic=wavlm_compile_dynamic,
+        stream_layer_sum=wavlm_stream_layer_sum,
+        allow_tf32=allow_tf32,
+    )
+    batches = _resolve_worker_batch_sizes(
         batch_size=batch_size,
         affect_batch_size=affect_batch_size,
         disfluency_batch_size=disfluency_batch_size,
-        emotion_batch_size=(
-            DEFAULT_EMOTION_BATCH_SIZE
-            if emotion_batch_size is None
-            else emotion_batch_size
-        ),
+        emotion_batch_size=emotion_batch_size,
+        affect_backbone=affect_backbone,
+        disfluency_backbone=disfluency_backbone,
+        wavlm_task_batch_size=wavlm_settings.task_batch_size,
     )
     configs: dict[str, dict] = {}
     configs["affect"] = compute_inference_config(
@@ -194,12 +256,12 @@ def build_expected_configs(
         transform_policy="vox_profile_affect_sigmoid_heads_v1",
         extra=_wavlm_runtime_config_extra(
             backbone=affect_backbone,
-            wavlm_autocast_dtype=wavlm_autocast_dtype,
-            wavlm_compile=wavlm_compile,
-            wavlm_compile_mode=wavlm_compile_mode,
-            wavlm_compile_dynamic=wavlm_compile_dynamic,
-            wavlm_stream_layer_sum=wavlm_stream_layer_sum,
-            allow_tf32=allow_tf32,
+            wavlm_autocast_dtype=wavlm_settings.autocast_dtype,
+            wavlm_compile=wavlm_settings.compile_model,
+            wavlm_compile_mode=wavlm_settings.compile_mode,
+            wavlm_compile_dynamic=wavlm_settings.compile_dynamic,
+            wavlm_stream_layer_sum=wavlm_settings.stream_layer_sum,
+            allow_tf32=wavlm_settings.allow_tf32,
         ),
     )
     configs["disfluency"] = compute_inference_config(
@@ -213,12 +275,12 @@ def build_expected_configs(
         transform_policy="vox_profile_disfluency_raw_logits_v1",
         extra=_wavlm_runtime_config_extra(
             backbone=disfluency_backbone,
-            wavlm_autocast_dtype=wavlm_autocast_dtype,
-            wavlm_compile=wavlm_compile,
-            wavlm_compile_mode=wavlm_compile_mode,
-            wavlm_compile_dynamic=wavlm_compile_dynamic,
-            wavlm_stream_layer_sum=wavlm_stream_layer_sum,
-            allow_tf32=allow_tf32,
+            wavlm_autocast_dtype=wavlm_settings.autocast_dtype,
+            wavlm_compile=wavlm_settings.compile_model,
+            wavlm_compile_mode=wavlm_settings.compile_mode,
+            wavlm_compile_dynamic=wavlm_settings.compile_dynamic,
+            wavlm_stream_layer_sum=wavlm_settings.stream_layer_sum,
+            allow_tf32=wavlm_settings.allow_tf32,
         ),
     )
     configs["emotion"] = compute_inference_config(
@@ -286,6 +348,7 @@ def run_worker(
     wavlm_compile_mode: str = "reduce-overhead",
     wavlm_compile_dynamic: bool = False,
     wavlm_stream_layer_sum: bool = False,
+    wavlm_runtime_preset: str | None = None,
     emotion_autocast_dtype: str | None = None,
     emotion_compile: bool = False,
     emotion_compile_mode: str = DEFAULT_EMOTION_COMPILE_MODE,
@@ -314,15 +377,59 @@ def run_worker(
         compile_mode=emotion_compile_mode,
         allow_tf32=allow_tf32,
     )
-    batches = resolve_task_batch_sizes(
+    wavlm_settings = resolve_wavlm_runtime_settings(
+        preset=wavlm_runtime_preset,
+        device=device,
+        autocast_dtype=wavlm_autocast_dtype,
+        compile_model=wavlm_compile,
+        compile_mode=wavlm_compile_mode,
+        compile_dynamic=wavlm_compile_dynamic,
+        stream_layer_sum=wavlm_stream_layer_sum,
+        allow_tf32=allow_tf32,
+    )
+    if wavlm_runtime_preset is not None and wavlm_settings.preset != wavlm_runtime_preset:
+        LOGGER.warning(
+            "Requested WavLM runtime preset %s is unavailable on this worker; "
+            "using %s",
+            wavlm_runtime_preset,
+            wavlm_settings.preset,
+        )
+    if wavlm_settings.compile_model:
+        cache = configure_inductor_cache_namespace(preset=wavlm_settings.preset)
+        if not cache.get("configured"):
+            LOGGER.warning(
+                "TORCHINDUCTOR_CACHE_DIR is not configured; WavLM compile warmup "
+                "will be paid after each worker restart"
+            )
+        elif not cache.get("writable"):
+            LOGGER.warning("TORCHINDUCTOR_CACHE_DIR is not writable: %s", cache)
+        else:
+            LOGGER.info("Using WavLM Inductor cache: %s", cache)
+    else:
+        cache = inductor_cache_status()
+    batches = _resolve_worker_batch_sizes(
         batch_size=batch_size,
         affect_batch_size=affect_batch_size,
         disfluency_batch_size=disfluency_batch_size,
-        emotion_batch_size=(
-            DEFAULT_EMOTION_BATCH_SIZE
-            if emotion_batch_size is None
-            else emotion_batch_size
-        ),
+        emotion_batch_size=emotion_batch_size,
+        affect_backbone=affect_backbone,
+        disfluency_backbone=disfluency_backbone,
+        wavlm_task_batch_size=wavlm_settings.task_batch_size,
+    )
+    LOGGER.info(
+        "WavLM runtime: preset=%s requested=%s compile=%s mode=%s dynamic=%s "
+        "static_batch=%s batches=%s cache=%s",
+        wavlm_settings.preset,
+        wavlm_settings.requested_preset,
+        wavlm_settings.compile_model,
+        wavlm_settings.compile_mode,
+        wavlm_settings.compile_dynamic,
+        wavlm_settings.static_batch,
+        {
+            "affect": batches["affect"],
+            "disfluency": batches["disfluency"],
+        },
+        cache,
     )
 
     output_base = Path(output_base)
@@ -345,6 +452,9 @@ def run_worker(
     permanent_errors = load_permanent_error_set(output_base)
     inference_attempts = load_inference_attempt_counts(output_base)
 
+    expected_wavlm_preset = (
+        None if wavlm_settings.preset == "custom" else wavlm_settings.preset
+    )
     expected_configs = build_expected_configs(
         affect_backbone=affect_backbone,
         disfluency_backbone=disfluency_backbone,
@@ -361,6 +471,7 @@ def run_worker(
         wavlm_compile_mode=wavlm_compile_mode,
         wavlm_compile_dynamic=wavlm_compile_dynamic,
         wavlm_stream_layer_sum=wavlm_stream_layer_sum,
+        wavlm_runtime_preset=expected_wavlm_preset,
         emotion_autocast_dtype=emotion_autocast_dtype,
         emotion_compile=emotion_compile,
         emotion_compile_mode=emotion_compile_mode,
@@ -392,11 +503,14 @@ def run_worker(
         vad_min_speech_sec=vad_min_speech_sec,
         vad_min_silence_sec=vad_min_silence_sec,
         load_vad=vad_prefetch_workers == 0,
-        wavlm_autocast_dtype=wavlm_autocast_dtype,
-        wavlm_compile=wavlm_compile,
-        wavlm_compile_mode=wavlm_compile_mode,
-        wavlm_compile_dynamic=wavlm_compile_dynamic,
-        wavlm_stream_layer_sum=wavlm_stream_layer_sum,
+        wavlm_autocast_dtype=wavlm_settings.autocast_dtype,
+        wavlm_compile=wavlm_settings.compile_model,
+        wavlm_compile_mode=wavlm_settings.compile_mode,
+        wavlm_compile_dynamic=wavlm_settings.compile_dynamic,
+        wavlm_stream_layer_sum=wavlm_settings.stream_layer_sum,
+        wavlm_static_batch=wavlm_settings.static_batch,
+        wavlm_warmup=wavlm_settings.warmup,
+        wavlm_runtime_preset=wavlm_settings.preset,
         emotion_autocast_dtype=emotion_autocast_dtype,
         emotion_compile=emotion_compile,
         emotion_compile_mode=emotion_compile_mode,
@@ -563,11 +677,13 @@ def run_worker(
                     vad_threshold=vad_threshold,
                     vad_min_speech_sec=vad_min_speech_sec,
                     vad_min_silence_sec=vad_min_silence_sec,
-                    wavlm_autocast_dtype=wavlm_autocast_dtype,
-                    wavlm_compile=wavlm_compile,
-                    wavlm_compile_mode=wavlm_compile_mode,
-                    wavlm_compile_dynamic=wavlm_compile_dynamic,
-                    wavlm_stream_layer_sum=wavlm_stream_layer_sum,
+                    wavlm_autocast_dtype=wavlm_settings.autocast_dtype,
+                    wavlm_compile=wavlm_settings.compile_model,
+                    wavlm_compile_mode=wavlm_settings.compile_mode,
+                    wavlm_compile_dynamic=wavlm_settings.compile_dynamic,
+                    wavlm_stream_layer_sum=wavlm_settings.stream_layer_sum,
+                    wavlm_static_batch=wavlm_settings.static_batch,
+                    wavlm_runtime_preset=wavlm_settings.preset,
                     emotion_autocast_dtype=emotion_autocast_dtype,
                     emotion_compile=emotion_compile,
                     emotion_compile_mode=emotion_compile_mode,
@@ -608,6 +724,14 @@ def run_worker(
                     "archive_id": aid,
                     "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                     "audio_duration_sec": pf_result.audio.duration_sec,
+                    "wavlm_runtime_preset": wavlm_settings.preset,
+                    "wavlm_static_batch": wavlm_settings.static_batch,
+                    "wavlm_batch_size": (
+                        WAVLM_COMPILED_STATIC_BATCH_SIZE
+                        if wavlm_settings.static_batch
+                        else None
+                    ),
+                    "torchinductor_cache": cache,
                     "prefetch_wait_sec": prefetch_wait_sec,
                     "download_decode_sec": pf_result.timings.download_decode_sec,
                     "vad_precompute_sec": pf_result.timings.vad_sec,

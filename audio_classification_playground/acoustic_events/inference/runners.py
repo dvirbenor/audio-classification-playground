@@ -44,6 +44,11 @@ from .emotion_runtime import (
     torch_matmul_precision,
 )
 from .log import get_logger
+from .wavlm_runtime import (
+    WAVLM_PREPROCESSING_POLICY,
+    WAVLM_STATIC_BATCH_PADDING_POLICY,
+    pad_windows_to_static_batch,
+)
 
 
 DEFAULT_AFFECT_MODELS = {
@@ -99,6 +104,8 @@ def run_affect_inference(
     wavlm_compile_mode: str = "reduce-overhead",
     wavlm_compile_dynamic: bool = False,
     wavlm_stream_layer_sum: bool = False,
+    wavlm_static_batch: bool = False,
+    wavlm_runtime_preset: str | None = None,
     allow_tf32: bool = False,
     predictor: Callable[[np.ndarray], Mapping[str, np.ndarray]] | None = None,
     progress: ProgressFn | None = None,
@@ -112,6 +119,16 @@ def run_affect_inference(
         raise ValueError("backbone must be one of: wavlm, whisper")
     audio = _coerce_audio(audio_path, sample_rate=sample_rate, recording_id=recording_id)
     resolved_model_id = model_id or DEFAULT_AFFECT_MODELS[backbone]
+    wavlm_effective = _wavlm_effective_runtime_config(
+        backbone=backbone,
+        predictor=predictor,
+        autocast_dtype=wavlm_autocast_dtype,
+        compile_model=wavlm_compile,
+        compile_mode=wavlm_compile_mode,
+        compile_dynamic=wavlm_compile_dynamic,
+        stream_layer_sum=wavlm_stream_layer_sum,
+        allow_tf32=allow_tf32,
+    )
     config = _inference_config(
         task="affect",
         model_id=resolved_model_id,
@@ -123,12 +140,7 @@ def run_affect_inference(
         transform_policy="vox_profile_affect_sigmoid_heads_v1",
         extra=_wavlm_runtime_config_extra(
             backbone=backbone,
-            autocast_dtype=wavlm_autocast_dtype,
-            compile_model=wavlm_compile,
-            compile_mode=wavlm_compile_mode,
-            compile_dynamic=wavlm_compile_dynamic,
-            stream_layer_sum=wavlm_stream_layer_sum,
-            allow_tf32=allow_tf32,
+            **wavlm_effective,
         ),
     )
     cached = _maybe_cached(out_dir, audio, "affect", config, reuse_cache, artifact_path)
@@ -159,6 +171,7 @@ def run_affect_inference(
                 wavlm_compile_mode=wavlm_compile_mode,
                 wavlm_compile_dynamic=wavlm_compile_dynamic,
                 wavlm_stream_layer_sum=wavlm_stream_layer_sum,
+                wavlm_static_batch=wavlm_static_batch,
                 allow_tf32=allow_tf32,
                 progress=progress,
             )
@@ -176,7 +189,16 @@ def run_affect_inference(
                 "id": resolved_model_id,
             },
             timing=_timing(sample_rate, window_sec, hop_sec, len(windows)),
-            runtime=_runtime(device=device, batch_size=batch_size),
+            runtime=_runtime(
+                device=device,
+                batch_size=batch_size,
+                extra=_wavlm_runtime_metadata(
+                    backbone=backbone,
+                    runtime_preset=wavlm_runtime_preset,
+                    static_batch=wavlm_static_batch,
+                    predictor=predictor,
+                ),
+            ),
             artifact_path=artifact_path,
             audio_path_override=audio_path_override,
             audio_source_key=audio_source_key,
@@ -205,6 +227,8 @@ def run_disfluency_inference(
     wavlm_compile_mode: str = "reduce-overhead",
     wavlm_compile_dynamic: bool = False,
     wavlm_stream_layer_sum: bool = False,
+    wavlm_static_batch: bool = False,
+    wavlm_runtime_preset: str | None = None,
     allow_tf32: bool = False,
     predictor: Callable[[np.ndarray], Mapping[str, np.ndarray]] | None = None,
     progress: ProgressFn | None = None,
@@ -218,6 +242,16 @@ def run_disfluency_inference(
         raise ValueError("backbone must be one of: wavlm, whisper")
     audio = _coerce_audio(audio_path, sample_rate=sample_rate, recording_id=recording_id)
     resolved_model_id = model_id or DEFAULT_DISFLUENCY_MODELS[backbone]
+    wavlm_effective = _wavlm_effective_runtime_config(
+        backbone=backbone,
+        predictor=predictor,
+        autocast_dtype=wavlm_autocast_dtype,
+        compile_model=wavlm_compile,
+        compile_mode=wavlm_compile_mode,
+        compile_dynamic=wavlm_compile_dynamic,
+        stream_layer_sum=wavlm_stream_layer_sum,
+        allow_tf32=allow_tf32,
+    )
     config = _inference_config(
         task="disfluency",
         model_id=resolved_model_id,
@@ -229,12 +263,7 @@ def run_disfluency_inference(
         transform_policy="vox_profile_disfluency_raw_logits_v1",
         extra=_wavlm_runtime_config_extra(
             backbone=backbone,
-            autocast_dtype=wavlm_autocast_dtype,
-            compile_model=wavlm_compile,
-            compile_mode=wavlm_compile_mode,
-            compile_dynamic=wavlm_compile_dynamic,
-            stream_layer_sum=wavlm_stream_layer_sum,
-            allow_tf32=allow_tf32,
+            **wavlm_effective,
         ),
     )
     cached = _maybe_cached(out_dir, audio, "disfluency", config, reuse_cache, artifact_path)
@@ -265,6 +294,7 @@ def run_disfluency_inference(
                 wavlm_compile_mode=wavlm_compile_mode,
                 wavlm_compile_dynamic=wavlm_compile_dynamic,
                 wavlm_stream_layer_sum=wavlm_stream_layer_sum,
+                wavlm_static_batch=wavlm_static_batch,
                 allow_tf32=allow_tf32,
                 progress=progress,
             )
@@ -282,7 +312,16 @@ def run_disfluency_inference(
                 "id": resolved_model_id,
             },
             timing=_timing(sample_rate, window_sec, hop_sec, len(windows)),
-            runtime=_runtime(device=device, batch_size=batch_size),
+            runtime=_runtime(
+                device=device,
+                batch_size=batch_size,
+                extra=_wavlm_runtime_metadata(
+                    backbone=backbone,
+                    runtime_preset=wavlm_runtime_preset,
+                    static_batch=wavlm_static_batch,
+                    predictor=predictor,
+                ),
+            ),
             artifact_path=artifact_path,
             audio_path_override=audio_path_override,
             audio_source_key=audio_source_key,
@@ -533,6 +572,8 @@ def run_all_inference(
     wavlm_compile_mode: str = "reduce-overhead",
     wavlm_compile_dynamic: bool = False,
     wavlm_stream_layer_sum: bool = False,
+    wavlm_static_batch: bool = False,
+    wavlm_runtime_preset: str | None = None,
     emotion_autocast_dtype: str | None = None,
     emotion_compile: bool = False,
     emotion_compile_mode: str = DEFAULT_EMOTION_COMPILE_MODE,
@@ -651,6 +692,8 @@ def run_all_inference(
                 wavlm_compile_mode=wavlm_compile_mode,
                 wavlm_compile_dynamic=wavlm_compile_dynamic,
                 wavlm_stream_layer_sum=wavlm_stream_layer_sum,
+                wavlm_static_batch=wavlm_static_batch,
+                wavlm_runtime_preset=wavlm_runtime_preset,
                 allow_tf32=allow_tf32,
                 predictor=predictors.get("affect"),
                 progress=progress,
@@ -674,6 +717,8 @@ def run_all_inference(
                 wavlm_compile_mode=wavlm_compile_mode,
                 wavlm_compile_dynamic=wavlm_compile_dynamic,
                 wavlm_stream_layer_sum=wavlm_stream_layer_sum,
+                wavlm_static_batch=wavlm_static_batch,
+                wavlm_runtime_preset=wavlm_runtime_preset,
                 allow_tf32=allow_tf32,
                 predictor=predictors.get("disfluency"),
                 progress=progress,
@@ -844,19 +889,53 @@ def _wavlm_runtime_config_extra(
 ) -> dict[str, object]:
     if backbone != "wavlm":
         return {}
-    extra: dict[str, object] = {}
-    if autocast_dtype is not None:
-        extra["torch_autocast_dtype"] = autocast_dtype
-    if compile_model:
-        extra["torch_compile"] = True
-        extra["torch_compile_target"] = "wavlm_backbone"
-        extra["torch_compile_mode"] = compile_mode
-        extra["torch_compile_dynamic"] = bool(compile_dynamic)
-    if stream_layer_sum:
-        extra["wavlm_stream_layer_sum"] = True
-    if allow_tf32:
-        extra["torch_allow_tf32"] = True
-    return extra
+    return {
+        "torch_autocast_dtype": autocast_dtype,
+        "torch_compile": bool(compile_model),
+        "torch_compile_target": "wavlm_backbone",
+        "torch_compile_mode": str(compile_mode),
+        "torch_compile_dynamic": bool(compile_dynamic),
+        "wavlm_stream_layer_sum": bool(stream_layer_sum),
+        "torch_allow_tf32": bool(allow_tf32),
+    }
+
+
+def _wavlm_effective_runtime_config(
+    *,
+    backbone: str,
+    predictor: object | None,
+    autocast_dtype: str | None,
+    compile_model: bool,
+    compile_mode: str,
+    compile_dynamic: bool,
+    stream_layer_sum: bool,
+    allow_tf32: bool,
+) -> dict[str, object]:
+    if backbone != "wavlm" or predictor is None:
+        return {
+            "autocast_dtype": autocast_dtype,
+            "compile_model": compile_model,
+            "compile_mode": compile_mode,
+            "compile_dynamic": compile_dynamic,
+            "stream_layer_sum": stream_layer_sum,
+            "allow_tf32": allow_tf32,
+        }
+    return {
+        "autocast_dtype": getattr(predictor, "wavlm_autocast_dtype", autocast_dtype),
+        "compile_model": getattr(predictor, "wavlm_compile", compile_model),
+        "compile_mode": getattr(predictor, "wavlm_compile_mode", compile_mode),
+        "compile_dynamic": getattr(
+            predictor,
+            "wavlm_compile_dynamic",
+            compile_dynamic,
+        ),
+        "stream_layer_sum": getattr(
+            predictor,
+            "wavlm_stream_layer_sum",
+            stream_layer_sum,
+        ),
+        "allow_tf32": allow_tf32,
+    }
 
 
 def cleanup_torch_memory() -> None:
@@ -1067,11 +1146,45 @@ def _timing(sample_rate: int, window_sec: float, hop_sec: float, n_frames: int) 
     }
 
 
-def _runtime(*, device: str | None, batch_size: int) -> dict:
-    return {
+def _runtime(
+    *,
+    device: str | None,
+    batch_size: int,
+    extra: Mapping[str, object] | None = None,
+) -> dict:
+    runtime = {
         "device": device or _default_device(),
         "batch_size": int(batch_size),
     }
+    if extra:
+        runtime.update(dict(extra))
+    return runtime
+
+
+def _wavlm_runtime_metadata(
+    *,
+    backbone: str,
+    runtime_preset: str | None,
+    static_batch: bool,
+    predictor: object | None = None,
+) -> dict[str, object]:
+    if backbone != "wavlm":
+        return {}
+    actual_preset = getattr(predictor, "wavlm_runtime_preset", runtime_preset)
+    actual_static_batch = bool(getattr(predictor, "wavlm_static_batch", static_batch))
+    metadata: dict[str, object] = {
+        "wavlm_preprocessing_policy": WAVLM_PREPROCESSING_POLICY,
+    }
+    if actual_preset is not None:
+        metadata["wavlm_runtime_preset"] = actual_preset
+    if actual_static_batch:
+        metadata["wavlm_static_batch_padding_policy"] = (
+            WAVLM_STATIC_BATCH_PADDING_POLICY
+        )
+    warmup_sec = getattr(predictor, "wavlm_warmup_sec", None)
+    if warmup_sec is not None:
+        metadata["wavlm_warmup_sec"] = float(warmup_sec)
+    return metadata
 
 
 def _cuda_memory_snapshot() -> dict[str, float] | None:
@@ -1142,11 +1255,16 @@ def _predict_affect(
     wavlm_compile_mode: str,
     wavlm_compile_dynamic: bool,
     wavlm_stream_layer_sum: bool,
+    wavlm_static_batch: bool,
     allow_tf32: bool,
     progress: ProgressFn | None,
 ) -> dict[str, np.ndarray]:
     import torch
     from .models import configure_torch_matmul
+
+    if len(windows) == 0:
+        empty = np.zeros((0,), dtype=np.float32)
+        return {"arousal": empty.copy(), "valence": empty.copy(), "dominance": empty.copy()}
 
     configure_torch_matmul(allow_tf32=allow_tf32)
     wrapper = _load_affect_wrapper(backbone)
@@ -1160,6 +1278,11 @@ def _predict_affect(
             mode=wavlm_compile_mode,
             dynamic=wavlm_compile_dynamic,
         )
+    windows, valid_count = pad_windows_to_static_batch(
+        windows,
+        batch_size=batch_size,
+        enabled=backbone == "wavlm" and wavlm_static_batch,
+    )
     arousal, valence, dominance = [], [], []
     with torch.inference_mode():
         for batch_np in _batches(windows, batch_size, progress, "affect"):
@@ -1176,9 +1299,9 @@ def _predict_affect(
             valence.append(v.detach().float().reshape(-1))
             dominance.append(d.detach().float().reshape(-1))
     return {
-        "arousal": torch.cat(arousal).cpu().numpy(),
-        "valence": torch.cat(valence).cpu().numpy(),
-        "dominance": torch.cat(dominance).cpu().numpy(),
+        "arousal": torch.cat(arousal)[:valid_count].cpu().numpy(),
+        "valence": torch.cat(valence)[:valid_count].cpu().numpy(),
+        "dominance": torch.cat(dominance)[:valid_count].cpu().numpy(),
     }
 
 
@@ -1194,11 +1317,18 @@ def _predict_disfluency(
     wavlm_compile_mode: str,
     wavlm_compile_dynamic: bool,
     wavlm_stream_layer_sum: bool,
+    wavlm_static_batch: bool,
     allow_tf32: bool,
     progress: ProgressFn | None,
 ) -> dict[str, np.ndarray]:
     import torch
     from .models import configure_torch_matmul
+
+    if len(windows) == 0:
+        return {
+            "fluency_logits": np.zeros((0, 2), dtype=np.float32),
+            "disfluency_type_logits": np.zeros((0, 5), dtype=np.float32),
+        }
 
     configure_torch_matmul(allow_tf32=allow_tf32)
     wrapper = _load_disfluency_wrapper(backbone)
@@ -1212,6 +1342,11 @@ def _predict_disfluency(
             mode=wavlm_compile_mode,
             dynamic=wavlm_compile_dynamic,
         )
+    windows, valid_count = pad_windows_to_static_batch(
+        windows,
+        batch_size=batch_size,
+        enabled=backbone == "wavlm" and wavlm_static_batch,
+    )
     fluency, dysfluency = [], []
     with torch.inference_mode():
         for batch_np in _batches(windows, batch_size, progress, "disfluency"):
@@ -1227,8 +1362,8 @@ def _predict_disfluency(
             fluency.append(f.detach().float())
             dysfluency.append(d.detach().float())
     return {
-        "fluency_logits": torch.cat(fluency, dim=0).cpu().numpy(),
-        "disfluency_type_logits": torch.cat(dysfluency, dim=0).cpu().numpy(),
+        "fluency_logits": torch.cat(fluency, dim=0)[:valid_count].cpu().numpy(),
+        "disfluency_type_logits": torch.cat(dysfluency, dim=0)[:valid_count].cpu().numpy(),
     }
 
 

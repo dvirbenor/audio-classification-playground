@@ -531,6 +531,61 @@ class InferenceArtifactTest(unittest.TestCase):
             self.assertTrue(config["wavlm_stream_layer_sum"])
             self.assertTrue(config["torch_allow_tf32"])
 
+    def test_wavlm_fast_exact_records_sentinel_config_and_runtime_metadata(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audio_path = _write_audio(Path(tmp) / "clip.wav")
+            result = run_affect_inference(
+                audio_path,
+                out_dir=Path(tmp) / "artifacts",
+                backbone="wavlm",
+                predictor=_fake_affect,
+                wavlm_runtime_preset="fast_exact",
+                progress=_quiet,
+            )
+
+            config = result.artifact.manifest["inference_config"]
+            self.assertIsNone(config["torch_autocast_dtype"])
+            self.assertFalse(config["torch_compile"])
+            self.assertEqual(config["torch_compile_target"], "wavlm_backbone")
+            self.assertEqual(config["torch_compile_mode"], "reduce-overhead")
+            self.assertFalse(config["torch_compile_dynamic"])
+            self.assertFalse(config["wavlm_stream_layer_sum"])
+            self.assertFalse(config["torch_allow_tf32"])
+
+            runtime = result.artifact.manifest["runtime"]
+            self.assertEqual(runtime["wavlm_runtime_preset"], "fast_exact")
+            self.assertEqual(
+                runtime["wavlm_preprocessing_policy"],
+                "wavlm_vectorized_znorm_v1",
+            )
+            self.assertNotIn("wavlm_static_batch_padding_policy", runtime)
+
+    def test_wavlm_static_runtime_metadata_is_non_semantic(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audio_path = _write_audio(Path(tmp) / "clip.wav")
+            predictor = _WarmAffectPredictor()
+            result = run_affect_inference(
+                audio_path,
+                out_dir=Path(tmp) / "artifacts",
+                backbone="wavlm",
+                predictor=predictor,
+                wavlm_static_batch=True,
+                wavlm_runtime_preset="compiled_static",
+                progress=_quiet,
+            )
+
+            config = result.artifact.manifest["inference_config"]
+            self.assertNotIn("wavlm_static_batch_padding_policy", config)
+            self.assertNotIn("wavlm_preprocessing_policy", config)
+
+            runtime = result.artifact.manifest["runtime"]
+            self.assertEqual(runtime["wavlm_runtime_preset"], "compiled_static")
+            self.assertEqual(
+                runtime["wavlm_static_batch_padding_policy"],
+                "raw_zero_pad_before_znorm_v1",
+            )
+            self.assertEqual(runtime["wavlm_warmup_sec"], 1.25)
+
     def test_artifacts_adapt_to_existing_producers(self):
         with tempfile.TemporaryDirectory() as tmp:
             audio_path = _write_audio(Path(tmp) / "clip.wav")
@@ -610,6 +665,13 @@ def _fake_affect(windows):
         "valence": np.linspace(0.2, 0.0, n, dtype=np.float32),
         "dominance": np.zeros(n, dtype=np.float32),
     }
+
+
+class _WarmAffectPredictor:
+    wavlm_warmup_sec = 1.25
+
+    def __call__(self, windows):
+        return _fake_affect(windows)
 
 
 def _fake_disfluency(windows):
