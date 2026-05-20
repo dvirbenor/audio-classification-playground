@@ -40,6 +40,7 @@ dependencies = [
     "onnx>=1.21.0",
     "onnxruntime-gpu==1.23.2",
     "onnxscript>=0.7.0",
+    "torchvision>=0.25.0",
 ]
 
 [tool.hatch.build.targets.wheel]
