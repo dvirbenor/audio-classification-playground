@@ -114,6 +114,7 @@ class WorkerAsyncVadTest(unittest.TestCase):
                 output_base=tempfile.mkdtemp(),
                 affect_backbone="wavlm",
                 disfluency_backbone="whisper",
+                wavlm_runtime_preset="fast_exact",
                 prefetch_lookahead=1,
                 vad_prefetch_workers=1,
             )
