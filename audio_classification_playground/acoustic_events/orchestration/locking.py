@@ -1,7 +1,8 @@
 """Distributed archive locking via atomic file creation on EFS.
 
-Lock files live under ``<output_base>/_meta/locks/`` with names of the
-form ``<session_id>__<archive_id>.lock``.  Atomicity is guaranteed by
+Archive-level lock files live under ``<output_base>/_meta/locks/`` with names
+of the form ``<session_id>__<archive_id>.lock``.  Task-fleet lock files live
+under ``<output_base>/_meta/locks/<namespace>/``.  Atomicity is guaranteed by
 ``os.open(..., O_CREAT | O_EXCL)``, which fails if the file already exists.
 
 Locks are released (deleted) on both success and failure, and a
@@ -22,17 +23,55 @@ LOGGER = logging.getLogger(__name__)
 LOCKS_DIR = "_meta/locks"
 
 
-def _lock_path(output_base: Path, entity: ArchiveEntity) -> Path:
-    return output_base / LOCKS_DIR / f"{entity.session_id}__{entity.archive_id}.lock"
+def _lock_path(
+    output_base: Path,
+    entity: ArchiveEntity,
+    *,
+    namespace: str | None = None,
+) -> Path:
+    locks_dir = output_base / LOCKS_DIR
+    if namespace:
+        locks_dir = locks_dir / namespace
+    return locks_dir / f"{entity.session_id}__{entity.archive_id}.lock"
 
 
-def try_claim(output_base: Path, entity: ArchiveEntity) -> bool:
+def iter_lock_files(output_base: Path) -> list[Path]:
+    """Return all flat and task-scoped lock files."""
+    locks_dir = output_base / LOCKS_DIR
+    if not locks_dir.is_dir():
+        return []
+    return sorted(p for p in locks_dir.rglob("*.lock") if p.is_file())
+
+
+def flat_lock_files(output_base: Path) -> list[Path]:
+    locks_dir = output_base / LOCKS_DIR
+    if not locks_dir.is_dir():
+        return []
+    return sorted(p for p in locks_dir.glob("*.lock") if p.is_file())
+
+
+def nested_lock_files(output_base: Path) -> list[Path]:
+    locks_dir = output_base / LOCKS_DIR
+    if not locks_dir.is_dir():
+        return []
+    return sorted(
+        p for p in locks_dir.rglob("*.lock")
+        if p.is_file() and p.parent != locks_dir
+    )
+
+
+def try_claim(
+    output_base: Path,
+    entity: ArchiveEntity,
+    *,
+    namespace: str | None = None,
+) -> bool:
     """Attempt to atomically create a lock file for *entity*.
 
     Returns ``True`` if the lock was acquired, ``False`` if another worker
     already holds it.
     """
-    lock = _lock_path(output_base, entity)
+    lock = _lock_path(output_base, entity, namespace=namespace)
     lock.parent.mkdir(parents=True, exist_ok=True)
     try:
         fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
@@ -41,15 +80,21 @@ def try_claim(output_base: Path, entity: ArchiveEntity) -> bool:
                 f"worker={os.environ.get('HOSTNAME', 'unknown')}\n"
                 f"pid={os.getpid()}\n"
                 f"time={time.time()}\n"
+                f"task_group={namespace or 'all'}\n"
             )
         return True
     except FileExistsError:
         return False
 
 
-def release_claim(output_base: Path, entity: ArchiveEntity) -> None:
+def release_claim(
+    output_base: Path,
+    entity: ArchiveEntity,
+    *,
+    namespace: str | None = None,
+) -> None:
     """Remove the lock file for *entity*.  Idempotent."""
-    lock = _lock_path(output_base, entity)
+    lock = _lock_path(output_base, entity, namespace=namespace)
     try:
         lock.unlink(missing_ok=True)
     except OSError as exc:
@@ -74,7 +119,7 @@ def reclaim_stale(
 
     cutoff = time.time() - older_than_minutes * 60
     reclaimed = 0
-    for lock_file in locks_dir.iterdir():
+    for lock_file in iter_lock_files(output_base):
         if not lock_file.name.endswith(".lock"):
             continue
         stem = lock_file.stem

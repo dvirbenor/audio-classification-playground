@@ -587,6 +587,7 @@ def run_all_inference(
     audio_path_override: str | None = None,
     audio_source_key: str | None = None,
     shutdown_check: Callable[[], bool] | None = None,
+    tasks_filter: Sequence[str] | None = None,
 ) -> InferenceRunResult:
     """Run VAD, affect, disfluency, and emotion sequentially.
 
@@ -750,6 +751,12 @@ def run_all_inference(
             ),
         ),
     ]
+    if tasks_filter is not None:
+        wanted = set(tasks_filter)
+        unknown = wanted - {task for task, _ in steps}
+        if unknown:
+            raise ValueError(f"Unknown tasks_filter entries: {sorted(unknown)}")
+        steps = [(task, step) for task, step in steps if task in wanted]
     task_elapsed_sec: dict[str, float] = {}
     for task, run_step in steps:
         if shutdown_check is not None and shutdown_check():

@@ -66,10 +66,21 @@ from .errors import (
     load_inference_attempt_counts,
     load_permanent_error_set,
 )
-from .locking import release_claim, try_claim
+from .locking import flat_lock_files, nested_lock_files, release_claim, try_claim
 from .manifest import ArchiveEntity, load_manifest
 from .prefetch import PrefetchResult, Prefetcher
-from .progress import is_archive_complete_for_config, is_task_complete_for_config
+from .progress import (
+    are_tasks_complete_by_artifact,
+    incomplete_tasks_by_artifact,
+    is_task_artifact_complete_for_archive,
+    is_task_complete_for_config,
+)
+from .task_groups import (
+    COMPLETION_POLICY_CONFIG,
+    COMPLETION_POLICY_EXISTS,
+    TASK_GROUP_ALL,
+    resolve_task_group,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -327,6 +338,24 @@ def build_expected_config_hashes(**kwargs) -> dict[str, str]:
     }
 
 
+def _guard_against_mixed_lock_modes(output_base: Path, *, task_group: str) -> None:
+    """Prevent all-in-one and task-fleet workers from sharing an output tree."""
+    if task_group == TASK_GROUP_ALL:
+        nested = nested_lock_files(output_base)
+        if nested:
+            raise RuntimeError(
+                "Refusing to start all-in-one worker: task-scoped locks are active "
+                f"under {output_base / '_meta' / 'locks'}"
+            )
+        return
+    flat = flat_lock_files(output_base)
+    if flat:
+        raise RuntimeError(
+            "Refusing to start task-fleet worker: archive-level all-mode locks are "
+            f"active under {output_base / '_meta' / 'locks'}"
+        )
+
+
 def run_worker(
     *,
     parquet_path: str | Path,
@@ -354,9 +383,12 @@ def run_worker(
     emotion_compile_mode: str = DEFAULT_EMOTION_COMPILE_MODE,
     emotion_runtime_mode: str | None = "auto",
     allow_tf32: bool = False,
-    prefetch_workers: int = PREFETCH_WORKERS,
-    prefetch_lookahead: int = PREFETCH_LOOKAHEAD,
-    vad_prefetch_workers: int = VAD_PREFETCH_WORKERS,
+    prefetch_workers: int | None = None,
+    prefetch_lookahead: int | None = None,
+    vad_prefetch_workers: int | None = None,
+    task_group: str = TASK_GROUP_ALL,
+    completion_policy: str = COMPLETION_POLICY_EXISTS,
+    force_recompute: bool = False,
     seed: int | None = None,
 ) -> None:
     """Entry point for a single worker pod.
@@ -364,6 +396,15 @@ def run_worker(
     This function does not return until all entities are processed or a
     SIGTERM signal is received.
     """
+    group = resolve_task_group(task_group)
+    if completion_policy not in (COMPLETION_POLICY_EXISTS, COMPLETION_POLICY_CONFIG):
+        raise ValueError("completion_policy must be one of: exists, config")
+    if prefetch_workers is None:
+        prefetch_workers = group.prefetch_workers
+    if prefetch_lookahead is None:
+        prefetch_lookahead = group.prefetch_lookahead
+    if vad_prefetch_workers is None:
+        vad_prefetch_workers = group.vad_prefetch_workers
     if prefetch_lookahead < 1:
         raise ValueError("prefetch_lookahead must be >= 1")
     if vad_prefetch_workers < 0:
@@ -433,6 +474,7 @@ def run_worker(
     )
 
     output_base = Path(output_base)
+    _guard_against_mixed_lock_modes(output_base, task_group=group.name)
     worker_id = f"{os.environ.get('HOSTNAME', 'unknown')}_{uuid.uuid4().hex[:8]}"
     timings_path = output_base / TIMINGS_DIR / f"{worker_id}.jsonl"
     shutdown_event = threading.Event()
@@ -450,7 +492,10 @@ def run_worker(
     LOGGER.info("Loading manifest from %s", parquet_path)
     entities = load_manifest(parquet_path)
     permanent_errors = load_permanent_error_set(output_base)
-    inference_attempts = load_inference_attempt_counts(output_base)
+    inference_attempts = load_inference_attempt_counts(
+        output_base,
+        task_group=None if group.name == TASK_GROUP_ALL else group.name,
+    )
 
     expected_wavlm_preset = (
         None if wavlm_settings.preset == "custom" else wavlm_settings.preset
@@ -502,7 +547,8 @@ def run_worker(
         vad_threshold=vad_threshold,
         vad_min_speech_sec=vad_min_speech_sec,
         vad_min_silence_sec=vad_min_silence_sec,
-        load_vad=vad_prefetch_workers == 0,
+        load_vad=vad_prefetch_workers == 0 and "vad" in group.tasks,
+        tasks_to_load=group.models,
         wavlm_autocast_dtype=wavlm_settings.autocast_dtype,
         wavlm_compile=wavlm_settings.compile_model,
         wavlm_compile_mode=wavlm_settings.compile_mode,
@@ -553,9 +599,49 @@ def run_worker(
     next_entity_idx = 0
     queued: deque[ArchiveEntity] = deque()
 
+    def _try_claim(entity: ArchiveEntity) -> bool:
+        if group.lock_namespace is None:
+            return try_claim(output_base, entity)
+        return try_claim(output_base, entity, namespace=group.lock_namespace)
+
     def _release(entity: ArchiveEntity) -> None:
-        release_claim(output_base, entity)
+        if group.lock_namespace is None:
+            release_claim(output_base, entity)
+        else:
+            release_claim(output_base, entity, namespace=group.lock_namespace)
         prefetcher.discard(entity)
+
+    def _task_complete(sid: str, aid: str, task: str) -> bool:
+        if force_recompute:
+            return False
+        if completion_policy == COMPLETION_POLICY_EXISTS:
+            return is_task_artifact_complete_for_archive(output_base, sid, aid, task)
+        return is_task_complete_for_config(
+            output_base,
+            sid,
+            aid,
+            task,
+            expected_hashes[task],
+            expected_config=expected_configs[task],
+            ignore_batch_size=True,
+        )
+
+    def _group_complete(sid: str, aid: str) -> bool:
+        if force_recompute:
+            return False
+        if completion_policy == COMPLETION_POLICY_EXISTS:
+            return are_tasks_complete_by_artifact(output_base, sid, aid, group.tasks)
+        return all(_task_complete(sid, aid, task) for task in group.tasks)
+
+    def _missing_tasks(sid: str, aid: str) -> tuple[str, ...]:
+        if force_recompute:
+            return group.tasks
+        if completion_policy == COMPLETION_POLICY_EXISTS:
+            return incomplete_tasks_by_artifact(output_base, sid, aid, group.tasks)
+        return tuple(task for task in group.tasks if not _task_complete(sid, aid, task))
+
+    def _attempt_key(sid: str, aid: str):
+        return (sid, aid) if group.name == TASK_GROUP_ALL else (sid, aid, group.name)
 
     def _fill_claimed_queue() -> None:
         nonlocal next_entity_idx, skipped
@@ -573,55 +659,42 @@ def run_worker(
                 skipped += 1
                 continue
 
-            if inference_attempts.get(entity_key, 0) >= max_inference_attempts:
+            attempt_key = _attempt_key(sid, aid)
+
+            if inference_attempts.get(attempt_key, 0) >= max_inference_attempts:
                 skipped += 1
                 continue
 
-            if is_archive_complete_for_config(
+            if _group_complete(sid, aid):
+                skipped += 1
+                continue
+
+            if not _try_claim(entity):
+                skipped += 1
+                continue
+
+            actual_attempts = count_inference_attempts_for(
                 output_base,
                 sid,
                 aid,
-                expected_hashes,
-                expected_configs=expected_configs,
-                ignore_batch_size=True,
-            ):
-                skipped += 1
-                continue
-
-            if not try_claim(output_base, entity):
-                skipped += 1
-                continue
-
-            actual_attempts = count_inference_attempts_for(output_base, sid, aid)
+                task_group=None if group.name == TASK_GROUP_ALL else group.name,
+            )
             if actual_attempts >= max_inference_attempts:
-                release_claim(output_base, entity)
-                inference_attempts[entity_key] = actual_attempts
+                _release(entity)
+                inference_attempts[attempt_key] = actual_attempts
                 skipped += 1
                 continue
 
-            if is_archive_complete_for_config(
-                output_base,
-                sid,
-                aid,
-                expected_hashes,
-                expected_configs=expected_configs,
-                ignore_batch_size=True,
-            ):
-                release_claim(output_base, entity)
+            if _group_complete(sid, aid):
+                _release(entity)
                 skipped += 1
                 continue
 
             precompute_vad = (
+                group.precompute_vad
+                and
                 vad_prefetch_workers > 0
-                and not is_task_complete_for_config(
-                    output_base,
-                    sid,
-                    aid,
-                    "vad",
-                    expected_hashes["vad"],
-                    expected_config=expected_configs["vad"],
-                    ignore_batch_size=True,
-                )
+                and "vad" in _missing_tasks(sid, aid)
             )
             prefetcher.submit(entity, precompute_vad=precompute_vad)
             queued.append(entity)
@@ -658,16 +731,30 @@ def run_worker(
                 vad_detector = _detector_for_result(
                     pf_result,
                     models,
-                    allow_sync_vad=vad_prefetch_workers == 0,
+                    allow_sync_vad=vad_prefetch_workers == 0 and "vad" in group.tasks,
                 )
+                tasks_to_run = _missing_tasks(sid, aid)
+                if not tasks_to_run:
+                    _release(entity)
+                    claim_released = True
+                    skipped += 1
+                    _fill_claimed_queue()
+                    continue
 
                 inference_started = time.perf_counter()
+                predictors = {}
+                if getattr(models, "affect", None) is not None:
+                    predictors["affect"] = models.affect
+                if getattr(models, "disfluency", None) is not None:
+                    predictors["disfluency"] = models.disfluency
+                if getattr(models, "emotion", None) is not None:
+                    predictors["emotion"] = models.emotion
                 result = run_all_inference(
                     pf_result.audio,
                     out_dir=str(output_base),
                     affect_backbone=affect_backbone,
                     disfluency_backbone=disfluency_backbone,
-                    reuse_cache=True,
+                    reuse_cache=not force_recompute,
                     batch_size=batch_size,
                     affect_batch_size=batches["affect"],
                     disfluency_batch_size=batches["disfluency"],
@@ -689,17 +776,14 @@ def run_worker(
                     emotion_compile_mode=emotion_compile_mode,
                     emotion_runtime_mode=emotion_runtime_mode,
                     allow_tf32=allow_tf32,
-                    predictors={
-                        "affect": models.affect,
-                        "disfluency": models.disfluency,
-                        "emotion": models.emotion,
-                    },
+                    predictors=predictors,
                     vad_detector=vad_detector,
                     cleanup_cuda=lambda: None,
                     artifact_path_fn=lambda task: _artifact_path_fn(task, entity),
                     audio_path_override=s3_uri,
                     audio_source_key=pf_result.s3_key,
                     shutdown_check=_shutdown_check,
+                    tasks_filter=tasks_to_run,
                 )
                 inference_sec = time.perf_counter() - inference_started
                 total_sec = time.perf_counter() - archive_started
@@ -720,6 +804,8 @@ def run_worker(
 
                 _append_timing_record(timings_path, {
                     "worker_id": worker_id,
+                    "task_group": group.name,
+                    "tasks_run": list(tasks_to_run),
                     "session_id": sid,
                     "archive_id": aid,
                     "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -769,6 +855,7 @@ def run_worker(
                 _handle_inference_error(
                     exc, output_base, entity,
                     inference_attempts, max_inference_attempts,
+                    task_group=group.name,
                 )
                 failed += 1
 
@@ -805,15 +892,27 @@ def _handle_inference_error(
     entity: ArchiveEntity,
     inference_attempts: dict,
     max_inference_attempts: int,
+    *,
+    task_group: str = TASK_GROUP_ALL,
 ) -> None:
     import torch
 
-    entity_key = (entity.session_id, entity.archive_id)
+    entity_key = (
+        (entity.session_id, entity.archive_id)
+        if task_group == TASK_GROUP_ALL
+        else (entity.session_id, entity.archive_id, task_group)
+    )
 
     if isinstance(exc, torch.cuda.OutOfMemoryError):
         LOGGER.error("GPU OOM for %s/%s — cleaning GPU memory", entity.session_id, entity.archive_id)
         cleanup_torch_memory()
-        append_inference_error(output_base, entity.session_id, entity.archive_id, exc)
+        append_inference_error(
+            output_base,
+            entity.session_id,
+            entity.archive_id,
+            exc,
+            task_group=None if task_group == TASK_GROUP_ALL else task_group,
+        )
         inference_attempts[entity_key] = inference_attempts.get(entity_key, 0) + 1
         return
 
@@ -821,6 +920,7 @@ def _handle_inference_error(
     append_inference_error(
         output_base, entity.session_id, entity.archive_id, exc,
         is_deterministic=deterministic,
+        task_group=None if task_group == TASK_GROUP_ALL else task_group,
     )
     if deterministic:
         inference_attempts[entity_key] = 9999

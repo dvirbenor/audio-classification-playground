@@ -101,6 +101,9 @@ def _cmd_run(args: argparse.Namespace) -> None:
         prefetch_workers=args.prefetch_workers,
         prefetch_lookahead=args.prefetch_lookahead,
         vad_prefetch_workers=args.vad_prefetch_workers,
+        task_group=args.task_group,
+        completion_policy=args.completion_policy,
+        force_recompute=args.force_recompute,
         seed=args.seed,
     )
 
@@ -193,9 +196,7 @@ def _print_errors_flat(errors_dir: Path, kind: str, summary: bool) -> None:
         return
 
     count = 0
-    for f in sorted(errors_dir.iterdir()):
-        if not f.name.endswith(".json"):
-            continue
+    for f in sorted(errors_dir.rglob("*.json")):
         try:
             data = json.loads(f.read_text(encoding="utf-8"))
             sid = data.get("session_id", "?")
@@ -451,9 +452,22 @@ def main(argv: list[str] | None = None) -> None:
         help="Enable TF32 matmul precision for supported NVIDIA GPUs.",
     )
     p_run.add_argument("--max-retries", type=int, default=3)
-    p_run.add_argument("--prefetch-workers", type=int, default=4)
-    p_run.add_argument("--prefetch-lookahead", type=int, default=4)
-    p_run.add_argument("--vad-prefetch-workers", type=int, default=1)
+    p_run.add_argument("--prefetch-workers", type=int, default=None)
+    p_run.add_argument("--prefetch-lookahead", type=int, default=None)
+    p_run.add_argument("--vad-prefetch-workers", type=int, default=None)
+    from .task_groups import task_group_choices
+    p_run.add_argument("--task-group", choices=task_group_choices(), default="all")
+    p_run.add_argument(
+        "--completion-policy",
+        choices=("exists", "config"),
+        default="exists",
+        help="How workers decide whether a task artifact should be reused.",
+    )
+    p_run.add_argument(
+        "--force-recompute",
+        action="store_true",
+        help="Ignore existing task artifacts and recompute selected task-group work.",
+    )
     p_run.add_argument("--seed", type=int, default=None)
 
     # --- progress ---

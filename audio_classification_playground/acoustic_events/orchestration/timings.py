@@ -229,7 +229,9 @@ def format_timing_csv(
 ) -> str:
     """Render timing records as CSV with grouping columns."""
     fields = fields or DEFAULT_TIMING_FIELDS
-    columns = ["worker_id", "session_id", "archive_id", "ts", "vad_mode", *fields]
+    columns = [
+        "worker_id", "task_group", "session_id", "archive_id", "ts", "vad_mode", *fields
+    ]
     lines = [",".join(columns)]
     for rec in records:
         row: list[str] = []

@@ -569,8 +569,10 @@ class ModelSuite:
         emotion_compile_mode: str = DEFAULT_EMOTION_COMPILE_MODE,
         emotion_runtime_mode: str | None = "auto",
         allow_tf32: bool = False,
+        tasks_to_load: Sequence[str] | None = None,
     ) -> None:
         configure_torch_matmul(allow_tf32=allow_tf32)
+        tasks = set(tasks_to_load or ("affect", "disfluency", "emotion"))
         emotion_settings = resolve_emotion_runtime_settings(
             mode=emotion_runtime_mode,
             default_mode="auto",
@@ -590,41 +592,47 @@ class ModelSuite:
                 else emotion_batch_size
             ),
         )
-        self.affect = AffectPredictor(
-            backbone=affect_backbone,
-            device=device,
-            batch_size=batches["affect"],
-            wavlm_autocast_dtype=wavlm_autocast_dtype,
-            wavlm_compile=wavlm_compile,
-            wavlm_compile_mode=wavlm_compile_mode,
-            wavlm_compile_dynamic=wavlm_compile_dynamic,
-            wavlm_stream_layer_sum=wavlm_stream_layer_sum,
-            wavlm_static_batch=wavlm_static_batch,
-            wavlm_warmup=wavlm_warmup,
-            wavlm_runtime_preset=wavlm_runtime_preset,
-        )
-        self.disfluency = DisfluencyPredictor(
-            backbone=disfluency_backbone,
-            device=device,
-            batch_size=batches["disfluency"],
-            wavlm_autocast_dtype=wavlm_autocast_dtype,
-            wavlm_compile=wavlm_compile,
-            wavlm_compile_mode=wavlm_compile_mode,
-            wavlm_compile_dynamic=wavlm_compile_dynamic,
-            wavlm_stream_layer_sum=wavlm_stream_layer_sum,
-            wavlm_static_batch=wavlm_static_batch,
-            wavlm_warmup=wavlm_warmup,
-            wavlm_runtime_preset=wavlm_runtime_preset,
-        )
-        self.emotion = EmotionPredictor(
-            batch_size=batches["emotion"],
-            device=emotion_settings.device,
-            autocast_dtype=emotion_settings.autocast_dtype,
-            compile_model=emotion_settings.compile_model,
-            compile_mode=emotion_settings.compile_mode,
-            allow_tf32=emotion_settings.allow_tf32,
-            warmup=emotion_settings.warmup,
-        )
+        self.affect = None
+        self.disfluency = None
+        self.emotion = None
+        if "affect" in tasks:
+            self.affect = AffectPredictor(
+                backbone=affect_backbone,
+                device=device,
+                batch_size=batches["affect"],
+                wavlm_autocast_dtype=wavlm_autocast_dtype,
+                wavlm_compile=wavlm_compile,
+                wavlm_compile_mode=wavlm_compile_mode,
+                wavlm_compile_dynamic=wavlm_compile_dynamic,
+                wavlm_stream_layer_sum=wavlm_stream_layer_sum,
+                wavlm_static_batch=wavlm_static_batch,
+                wavlm_warmup=wavlm_warmup,
+                wavlm_runtime_preset=wavlm_runtime_preset,
+            )
+        if "disfluency" in tasks:
+            self.disfluency = DisfluencyPredictor(
+                backbone=disfluency_backbone,
+                device=device,
+                batch_size=batches["disfluency"],
+                wavlm_autocast_dtype=wavlm_autocast_dtype,
+                wavlm_compile=wavlm_compile,
+                wavlm_compile_mode=wavlm_compile_mode,
+                wavlm_compile_dynamic=wavlm_compile_dynamic,
+                wavlm_stream_layer_sum=wavlm_stream_layer_sum,
+                wavlm_static_batch=wavlm_static_batch,
+                wavlm_warmup=wavlm_warmup,
+                wavlm_runtime_preset=wavlm_runtime_preset,
+            )
+        if "emotion" in tasks:
+            self.emotion = EmotionPredictor(
+                batch_size=batches["emotion"],
+                device=emotion_settings.device,
+                autocast_dtype=emotion_settings.autocast_dtype,
+                compile_model=emotion_settings.compile_model,
+                compile_mode=emotion_settings.compile_mode,
+                allow_tf32=emotion_settings.allow_tf32,
+                warmup=emotion_settings.warmup,
+            )
         self._vad_config = dict(
             threshold=vad_threshold,
             min_speech_sec=vad_min_speech_sec,

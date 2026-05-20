@@ -55,11 +55,34 @@ def _write_error_json(directory: Path, payload: dict) -> Path:
     return target
 
 
+def _stable_error_json(directory: Path, filename: str, payload: dict) -> Path:
+    directory.mkdir(parents=True, exist_ok=True)
+    target = directory / filename
+    if target.is_file():
+        return target
+    tmp = directory / f".{filename}.{uuid.uuid4().hex}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, default=str)
+        try:
+            fd = os.open(str(target), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            tmp.unlink(missing_ok=True)
+            return target
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(tmp.read_text(encoding="utf-8"))
+        tmp.unlink(missing_ok=True)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+    return target
+
+
 def append_audio_error(
     output_base: Path,
     error: AudioResolutionError,
 ) -> Path:
-    """Persist a single audio resolution error as a JSON file."""
+    """Persist an audio resolution error, deduped by archive/error type."""
     payload = {
         "session_id": error.session_id,
         "archive_id": error.archive_id,
@@ -71,7 +94,8 @@ def append_audio_error(
         "timestamp": time.time(),
         "worker": os.environ.get("HOSTNAME", "unknown"),
     }
-    path = _write_error_json(output_base / AUDIO_ERRORS_DIR, payload)
+    filename = f"{error.session_id}__{error.archive_id}__{error.error_type}.json"
+    path = _stable_error_json(output_base / AUDIO_ERRORS_DIR, filename, payload)
     LOGGER.info(
         "Audio error [%s]: %s/%s — %s",
         error.error_type, error.session_id, error.archive_id, error.detail,
@@ -85,6 +109,7 @@ def append_inference_error(
     archive_id: str,
     error: Exception,
     is_deterministic: bool = False,
+    task_group: str | None = None,
 ) -> Path:
     """Persist a single inference failure as a JSON file."""
     error_type_name = type(error).__name__
@@ -94,10 +119,14 @@ def append_inference_error(
         "error_type": error_type_name,
         "detail": str(error)[:2000],
         "is_deterministic": is_deterministic,
+        "task_group": task_group or "all",
         "timestamp": time.time(),
         "worker": os.environ.get("HOSTNAME", "unknown"),
     }
-    path = _write_error_json(output_base / INFERENCE_ERRORS_DIR, payload)
+    directory = output_base / INFERENCE_ERRORS_DIR
+    if task_group and task_group != "all":
+        directory = directory / task_group
+    path = _write_error_json(directory, payload)
     LOGGER.info(
         "Inference error [%s]: %s/%s — %s",
         error_type_name, session_id, archive_id, str(error)[:200],
@@ -114,7 +143,7 @@ def load_permanent_error_set(output_base: Path) -> set[tuple[str, str]]:
     if not errors_dir.is_dir():
         return set()
     result: set[tuple[str, str]] = set()
-    for f in errors_dir.iterdir():
+    for f in errors_dir.rglob("*.json"):
         if not f.name.endswith(".json"):
             continue
         try:
@@ -127,8 +156,12 @@ def load_permanent_error_set(output_base: Path) -> set[tuple[str, str]]:
     return result
 
 
-def load_inference_attempt_counts(output_base: Path) -> Counter[tuple[str, str]]:
-    """Count inference error files per ``(session_id, archive_id)``.
+def load_inference_attempt_counts(
+    output_base: Path,
+    *,
+    task_group: str | None = None,
+) -> Counter[tuple[str, str] | tuple[str, str, str]]:
+    """Count inference error files per archive or task group.
 
     Each JSON file represents one attempt.  Deterministic errors are counted
     with a high sentinel (9999) to ensure they exceed any max-retry threshold.
@@ -136,13 +169,22 @@ def load_inference_attempt_counts(output_base: Path) -> Counter[tuple[str, str]]
     errors_dir = output_base / INFERENCE_ERRORS_DIR
     if not errors_dir.is_dir():
         return Counter()
-    counts: Counter[tuple[str, str]] = Counter()
-    for f in errors_dir.iterdir():
-        if not f.name.endswith(".json"):
-            continue
+    counts: Counter[tuple[str, str] | tuple[str, str, str]] = Counter()
+    if task_group is None:
+        files = errors_dir.rglob("*.json")
+    elif task_group != "all":
+        files = (errors_dir / task_group).glob("*.json")
+    else:
+        files = errors_dir.glob("*.json")
+    for f in files:
         try:
             data = json.loads(f.read_text(encoding="utf-8"))
-            key = (data["session_id"], data["archive_id"])
+            group = str(data.get("task_group") or task_group or "all")
+            key = (
+                (data["session_id"], data["archive_id"])
+                if task_group is None
+                else (data["session_id"], data["archive_id"], group)
+            )
             if data.get("is_deterministic", False):
                 counts[key] = 9999
             else:
@@ -157,6 +199,8 @@ def count_inference_attempts_for(
     output_base: Path,
     session_id: str,
     archive_id: str,
+    *,
+    task_group: str | None = None,
 ) -> int:
     """Authoritative attempt count for a specific archive.
 
@@ -167,12 +211,23 @@ def count_inference_attempts_for(
     if not errors_dir.is_dir():
         return 0
     count = 0
-    for f in errors_dir.iterdir():
-        if not f.name.endswith(".json"):
-            continue
+    if task_group is None:
+        files = errors_dir.rglob("*.json")
+    elif task_group != "all":
+        files = (errors_dir / task_group).glob("*.json")
+    else:
+        files = errors_dir.glob("*.json")
+    for f in files:
         try:
             data = json.loads(f.read_text(encoding="utf-8"))
-            if data["session_id"] == session_id and data["archive_id"] == archive_id:
+            if (
+                data["session_id"] == session_id
+                and data["archive_id"] == archive_id
+                and (
+                    task_group is None
+                    or str(data.get("task_group") or task_group) == task_group
+                )
+            ):
                 if data.get("is_deterministic", False):
                     return 9999
                 count += 1
@@ -215,9 +270,7 @@ def summarize_errors_grouped(errors_dir: Path) -> list[ErrorGroup]:
 
     groups: dict[str, ErrorGroup] = {}
 
-    for f in errors_dir.iterdir():
-        if not f.name.endswith(".json"):
-            continue
+    for f in errors_dir.rglob("*.json"):
         try:
             data = json.loads(f.read_text(encoding="utf-8"))
             etype = data.get("error_type", "unknown")

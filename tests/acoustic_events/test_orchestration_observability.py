@@ -26,6 +26,7 @@ from audio_classification_playground.acoustic_events.orchestration.progress impo
     TASKS,
     QuickSummary,
     _walk_completed_tasks,
+    _walk_completed_tasks_scandir,
     quick_disk_summary,
     scan_progress,
 )
@@ -217,7 +218,7 @@ class TestWalkConcurrentRemoval(unittest.TestCase):
 
             with patch("audio_classification_playground.acoustic_events."
                         "orchestration.progress.os.scandir", side_effect=patched_scandir):
-                result = _walk_completed_tasks(base)
+                result = _walk_completed_tasks_scandir(base)
 
             # One archive should still be captured despite the error
             self.assertEqual(len(result), 1)

@@ -32,6 +32,7 @@ class LockInfo:
     lock_time: float
     hostname: str
     pid: int
+    task_group: str = "all"
 
 
 @dataclass
@@ -42,6 +43,7 @@ class WorkerHeartbeat:
     done: int
     last_activity_ts: float | None
     pace_per_hour: float | None
+    task_groups: tuple[str, ...] = ()
 
 
 @dataclass
@@ -58,7 +60,7 @@ class FleetHeartbeat:
 
 
 def parse_active_locks(output_base: Path) -> dict[str, list[LockInfo]]:
-    """Read all ``_meta/locks/*.lock`` files and group by hostname.
+    """Read all flat and task-scoped lock files and group by hostname.
 
     Returns ``{hostname: [LockInfo, ...]}``.
     """
@@ -67,13 +69,14 @@ def parse_active_locks(output_base: Path) -> dict[str, list[LockInfo]]:
         return {}
 
     by_host: dict[str, list[LockInfo]] = {}
-    for lock_file in locks_dir.iterdir():
-        if not lock_file.name.endswith(".lock"):
+    for lock_file in locks_dir.rglob("*.lock"):
+        if not lock_file.is_file():
             continue
         stem = lock_file.stem
         if "__" not in stem:
             continue
         session_id, _, archive_id = stem.partition("__")
+        task_group = "all" if lock_file.parent == locks_dir else lock_file.parent.name
 
         hostname = "unknown"
         pid = 0
@@ -93,6 +96,8 @@ def parse_active_locks(output_base: Path) -> dict[str, list[LockInfo]]:
                         lock_time = float(line[len("time="):])
                     except ValueError:
                         pass
+                elif line.startswith("task_group="):
+                    task_group = line[len("task_group="):] or task_group
         except OSError:
             continue
 
@@ -102,6 +107,7 @@ def parse_active_locks(output_base: Path) -> dict[str, list[LockInfo]]:
             lock_time=lock_time,
             hostname=hostname,
             pid=pid,
+            task_group=task_group,
         )
         by_host.setdefault(hostname, []).append(info)
 
@@ -162,6 +168,7 @@ class _WorkerTimingInfo:
     done: int
     recent_records: list[dict]
     latest_ts: float | None
+    task_groups: tuple[str, ...] = ()
 
 
 def load_recent_timings(
@@ -191,10 +198,13 @@ def load_recent_timings(
 
         records: list[dict] = []
         latest_ts: float | None = None
+        task_groups: set[str] = set()
         for line in tail_lines:
             try:
                 rec = json.loads(line)
                 records.append(rec)
+                if rec.get("task_group"):
+                    task_groups.add(str(rec["task_group"]))
                 ts_str = rec.get("ts")
                 if ts_str:
                     try:
@@ -215,6 +225,7 @@ def load_recent_timings(
             done=done,
             recent_records=records,
             latest_ts=latest_ts,
+            task_groups=tuple(sorted(task_groups)),
         )
 
     return result
@@ -236,13 +247,17 @@ def build_fleet_heartbeat(
     all_hostnames.discard("unknown")
 
     lock_count_by_host: dict[str, int] = {h: len(v) for h, v in locks.items()}
+    lock_groups_by_host: dict[str, set[str]] = {}
     latest_lock_by_host: dict[str, float] = {}
     for host, infos in locks.items():
         latest_lock_by_host[host] = max(li.lock_time for li in infos)
+        lock_groups_by_host[host] = {li.task_group for li in infos}
 
     timings_by_host: dict[str, list[_WorkerTimingInfo]] = {}
     for info in timings.values():
         timings_by_host.setdefault(info.hostname, []).append(info)
+        if info.task_groups:
+            lock_groups_by_host.setdefault(info.hostname, set()).update(info.task_groups)
 
     workers: list[WorkerHeartbeat] = []
     fleet_done = 0
@@ -264,6 +279,7 @@ def build_fleet_heartbeat(
                 done=0,
                 last_activity_ts=last_activity,
                 pace_per_hour=None,
+                task_groups=tuple(sorted(lock_groups_by_host.get(hostname, set()))),
             ))
             continue
 
@@ -301,6 +317,7 @@ def build_fleet_heartbeat(
             done=total_done,
             last_activity_ts=last_activity,
             pace_per_hour=pace,
+            task_groups=tuple(sorted(lock_groups_by_host.get(hostname, set()))),
         ))
 
     return FleetHeartbeat(
@@ -328,7 +345,7 @@ def count_error_files(output_base: Path) -> tuple[int, int]:
         if not d.is_dir():
             return 0
         try:
-            return sum(1 for f in d.iterdir() if f.name.endswith(".json"))
+            return sum(1 for f in d.rglob("*.json") if f.is_file())
         except OSError:
             return 0
 
@@ -389,16 +406,18 @@ def format_heartbeat(
     title = f"Fleet heartbeat{' ' * 34}{now}"
 
     col_w = "Worker"
+    col_g = "Group"
     col_l = "Locks"
     col_d = "Done"
     col_a = "Last activity"
     col_p = "Pace (arc/h)"
 
-    rows: list[tuple[str, str, str, str, str]] = []
+    rows: list[tuple[str, str, str, str, str, str]] = []
     for w in heartbeat.workers:
         pace_str = f"~{w.pace_per_hour:.1f}" if w.pace_per_hour is not None else "--"
         rows.append((
             w.worker_id,
+            ",".join(w.task_groups) if w.task_groups else "--",
             str(w.locks),
             f"{w.done:,}",
             _relative_time(w.last_activity_ts),
@@ -407,19 +426,21 @@ def format_heartbeat(
 
     w_widths = [
         max(len(col_w), *(len(r[0]) for r in rows)) if rows else len(col_w),
-        max(len(col_l), *(len(r[1]) for r in rows)) if rows else len(col_l),
-        max(len(col_d), *(len(r[2]) for r in rows)) if rows else len(col_d),
-        max(len(col_a), *(len(r[3]) for r in rows)) if rows else len(col_a),
-        max(len(col_p), *(len(r[4]) for r in rows)) if rows else len(col_p),
+        max(len(col_g), *(len(r[1]) for r in rows)) if rows else len(col_g),
+        max(len(col_l), *(len(r[2]) for r in rows)) if rows else len(col_l),
+        max(len(col_d), *(len(r[3]) for r in rows)) if rows else len(col_d),
+        max(len(col_a), *(len(r[4]) for r in rows)) if rows else len(col_a),
+        max(len(col_p), *(len(r[5]) for r in rows)) if rows else len(col_p),
     ]
 
-    def _fmt_row(vals: tuple[str, str, str, str, str]) -> str:
+    def _fmt_row(vals: tuple[str, str, str, str, str, str]) -> str:
         return (
             f"{vals[0]:<{w_widths[0]}}  "
-            f"{vals[1]:>{w_widths[1]}}  "
+            f"{vals[1]:<{w_widths[1]}}  "
             f"{vals[2]:>{w_widths[2]}}  "
             f"{vals[3]:>{w_widths[3]}}  "
-            f"{vals[4]:>{w_widths[4]}}"
+            f"{vals[4]:>{w_widths[4]}}  "
+            f"{vals[5]:>{w_widths[5]}}"
         )
 
     lines: list[str] = [title, "=" * len(title), ""]
@@ -427,7 +448,7 @@ def format_heartbeat(
     if not heartbeat.workers:
         lines.append("No active workers detected.")
     else:
-        header = _fmt_row((col_w, col_l, col_d, col_a, col_p))
+        header = _fmt_row((col_w, col_g, col_l, col_d, col_a, col_p))
         sep = "-" * len(header)
         lines.append(header)
         lines.append(sep)
@@ -444,6 +465,7 @@ def format_heartbeat(
         fleet_label = f"Fleet ({n_workers} worker{'s' if n_workers != 1 else ''})"
         fleet_row = _fmt_row((
             fleet_label,
+            "",
             str(heartbeat.fleet_locks),
             f"{heartbeat.fleet_done:,}",
             "",

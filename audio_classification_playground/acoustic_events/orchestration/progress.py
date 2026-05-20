@@ -79,6 +79,53 @@ def is_task_complete(task_dir: Path) -> bool:
     )
 
 
+def is_task_artifact_complete(task_dir: Path) -> bool:
+    """Check file existence plus manifest complete status."""
+    if not is_task_complete(task_dir):
+        return False
+    try:
+        with open(task_dir / MANIFEST_FILENAME, "r", encoding="utf-8") as f:
+            manifest = json.load(f)
+        return manifest.get("status") == "complete"
+    except (OSError, json.JSONDecodeError):
+        return False
+
+
+def is_task_artifact_complete_for_archive(
+    output_base: Path,
+    session_id: str,
+    archive_id: str,
+    task: str,
+) -> bool:
+    if task not in TASKS:
+        raise ValueError(f"Unknown task {task!r}; expected one of {TASKS}")
+    return is_task_artifact_complete(output_base / session_id / archive_id / task)
+
+
+def are_tasks_complete_by_artifact(
+    output_base: Path,
+    session_id: str,
+    archive_id: str,
+    tasks: tuple[str, ...],
+) -> bool:
+    return all(
+        is_task_artifact_complete_for_archive(output_base, session_id, archive_id, task)
+        for task in tasks
+    )
+
+
+def incomplete_tasks_by_artifact(
+    output_base: Path,
+    session_id: str,
+    archive_id: str,
+    tasks: tuple[str, ...],
+) -> tuple[str, ...]:
+    return tuple(
+        task for task in tasks
+        if not is_task_artifact_complete_for_archive(output_base, session_id, archive_id, task)
+    )
+
+
 def is_archive_complete(output_base: Path, session_id: str, archive_id: str) -> bool:
     """Fast file-existence check: all four tasks present."""
     archive_dir = output_base / session_id / archive_id
@@ -327,12 +374,11 @@ def scan_progress(
     perm_errors = permanent_audio_errors or set()
     inf_errors = inference_error_counts or {}
 
-    locks_dir = output_base / LOCKS_DIR
     locked_set: set[str] = set()
-    if locks_dir.is_dir():
-        for lf in locks_dir.iterdir():
-            if lf.name.endswith(".lock"):
-                locked_set.add(lf.stem)
+    from .locking import iter_lock_files
+
+    for lf in iter_lock_files(output_base):
+        locked_set.add(lf.stem)
 
     completed_map = _walk_completed_tasks(output_base)
 
@@ -403,11 +449,9 @@ def quick_disk_summary(output_base: Path) -> QuickSummary:
     summary.task_counts = task_counts
 
     # Locks
-    locks_dir = output_base / LOCKS_DIR
-    if locks_dir.is_dir():
-        summary.lock_count = sum(
-            1 for f in locks_dir.iterdir() if f.name.endswith(".lock")
-        )
+    from .locking import iter_lock_files
+
+    summary.lock_count = len(iter_lock_files(output_base))
 
     # Audio errors
     audio_dir = output_base / AUDIO_ERRORS_DIR

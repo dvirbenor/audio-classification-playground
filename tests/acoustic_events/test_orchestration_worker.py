@@ -303,7 +303,7 @@ class WorkerAsyncVadTest(unittest.TestCase):
         with _worker_patches(
             [entity],
             prefetcher_cls=FakePrefetcher,
-            task_complete_fn=lambda *args, **kwargs: True,
+            task_complete_fn=lambda *args, **kwargs: args[3] == "vad",
             run_all_fn=fake_run_all,
         ):
             worker.run_worker(
@@ -313,6 +313,7 @@ class WorkerAsyncVadTest(unittest.TestCase):
                 disfluency_backbone="whisper",
                 prefetch_lookahead=1,
                 vad_prefetch_workers=1,
+                completion_policy="config",
             )
 
         self.assertEqual(submit_args, [False])
@@ -528,15 +529,15 @@ def _worker_patches(
                 worker,
                 load_manifest=lambda parquet_path: list(entities),
                 load_permanent_error_set=lambda output_base: set(),
-                load_inference_attempt_counts=lambda output_base: Counter(),
-                is_archive_complete_for_config=lambda *args, **kwargs: False,
+                load_inference_attempt_counts=lambda *args, **kwargs: Counter(),
+                is_task_artifact_complete_for_archive=task_complete_fn,
                 is_task_complete_for_config=task_complete_fn,
                 try_claim=try_claim_fn,
                 release_claim=release_claim_fn,
                 count_inference_attempts_for=lambda *args, **kwargs: 0,
                 Prefetcher=prefetcher_cls,
                 run_all_inference=run_all_fn,
-                _handle_inference_error=handle_error_fn,
+                _handle_inference_error=lambda *args, **kwargs: handle_error_fn(*args),
             )
         )
         yield
