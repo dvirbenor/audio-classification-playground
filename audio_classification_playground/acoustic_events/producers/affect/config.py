@@ -19,7 +19,7 @@ class Config:
     # --- Block-aware baseline and scale -------------------------------------
     radius_sec: float = 120.0
     min_context_sec: float = 5.0
-    scale_floor_frac: float = 0.5
+    scale_floor_frac: float = 0.75
 
     # --- Prominence detection ------------------------------------------------
     z_seed: ScalarOrPerSignal = field(default_factory=lambda: DEFAULT_Z_SEED)
