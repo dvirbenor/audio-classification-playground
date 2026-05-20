@@ -215,4 +215,4 @@ def resolve_and_download(
             s3_key=dl_result.s3_key,
         )
 
-    return dl_result, chosen_key
+    return dl_result

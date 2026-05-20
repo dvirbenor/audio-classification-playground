@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 import numpy as np
 
+from audio_classification_playground.acoustic_events.orchestration import audio_resolver
 from audio_classification_playground.acoustic_events.inference.audio import AudioData
 from audio_classification_playground.acoustic_events.orchestration.audio_resolver import (
     AudioDownloadResult,
@@ -398,6 +399,36 @@ class PrefetchS3KeyPropagationTest(unittest.TestCase):
                     self.assertIn("corrupt audio", result.detail)
                 finally:
                     pf.shutdown()
+
+
+class ResolveAndDownloadResultShapeTest(unittest.TestCase):
+    def test_resolve_and_download_returns_audio_download_result_directly(self):
+        download = AudioDownloadResult(
+            local_path=Path("/tmp/a1.wav"),
+            s3_key="accounts/studio/takes/a1.wav",
+            object_size_bytes=123,
+            storage_class="STANDARD",
+            source_extension=".wav",
+        )
+
+        with patch.object(
+            audio_resolver,
+            "resolve_audio_key",
+            return_value=download.s3_key,
+        ), patch.object(
+            audio_resolver,
+            "download_audio",
+            return_value=download,
+        ):
+            result = audio_resolver.resolve_and_download(
+                session_id="s1",
+                archive_id="a1",
+                file_parent_dir="prefix",
+                s3_client=object(),
+            )
+
+        self.assertIs(result, download)
+        self.assertEqual(result.local_path, Path("/tmp/a1.wav"))
 
 
 if __name__ == "__main__":
