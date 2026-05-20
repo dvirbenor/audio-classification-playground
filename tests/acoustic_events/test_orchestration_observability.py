@@ -17,7 +17,11 @@ from audio_classification_playground.acoustic_events.orchestration.errors import
     AUDIO_ERRORS_DIR,
     INFERENCE_ERRORS_DIR,
     ErrorGroup,
+    append_audio_error,
     summarize_errors_grouped,
+)
+from audio_classification_playground.acoustic_events.orchestration.audio_resolver import (
+    AudioResolutionError,
 )
 from audio_classification_playground.acoustic_events.orchestration.manifest import (
     ArchiveEntity,
@@ -80,6 +84,14 @@ def _make_lock(base: Path, sid: str, aid: str) -> None:
     locks_dir = base / "_meta" / "locks"
     locks_dir.mkdir(parents=True, exist_ok=True)
     (locks_dir / f"{sid}__{aid}.lock").write_text("worker=test\n")
+
+
+def _make_task_lock(base: Path, task_group: str, sid: str, aid: str) -> None:
+    locks_dir = base / "_meta" / "locks" / task_group
+    locks_dir.mkdir(parents=True, exist_ok=True)
+    (locks_dir / f"{sid}__{aid}.lock").write_text(
+        f"worker=test\npid=1\ntime=1\ntask_group={task_group}\n"
+    )
 
 
 def _entity(sid: str, aid: str) -> ArchiveEntity:
@@ -423,9 +435,10 @@ class TestQuickDiskSummary(unittest.TestCase):
             base = Path(d)
             _make_lock(base, "s1", "a1")
             _make_lock(base, "s1", "a2")
+            _make_task_lock(base, "affect", "s1", "a3")
 
             s = quick_disk_summary(base)
-            self.assertEqual(s.lock_count, 2)
+            self.assertEqual(s.lock_count, 3)
 
     def test_audio_errors_counted(self):
         with tempfile.TemporaryDirectory() as d:
@@ -481,13 +494,6 @@ class TestAppendAudioErrorS3Key(unittest.TestCase):
     """Verify s3_key is included in the JSON payload written by append_audio_error."""
 
     def test_s3_key_written_to_json(self):
-        from audio_classification_playground.acoustic_events.orchestration.audio_resolver import (
-            AudioResolutionError,
-        )
-        from audio_classification_playground.acoustic_events.orchestration.errors import (
-            append_audio_error,
-        )
-
         with tempfile.TemporaryDirectory() as d:
             base = Path(d)
             err = AudioResolutionError(
@@ -505,13 +511,6 @@ class TestAppendAudioErrorS3Key(unittest.TestCase):
             self.assertFalse(data["is_permanent"])
 
     def test_s3_key_defaults_to_empty_for_no_matching_file(self):
-        from audio_classification_playground.acoustic_events.orchestration.audio_resolver import (
-            AudioResolutionError,
-        )
-        from audio_classification_playground.acoustic_events.orchestration.errors import (
-            append_audio_error,
-        )
-
         with tempfile.TemporaryDirectory() as d:
             base = Path(d)
             err = AudioResolutionError(
@@ -526,6 +525,23 @@ class TestAppendAudioErrorS3Key(unittest.TestCase):
 
             self.assertEqual(data["s3_key"], "")
             self.assertTrue(data["is_permanent"])
+
+    def test_audio_errors_are_deduped_by_archive_and_type(self):
+        with tempfile.TemporaryDirectory() as d:
+            base = Path(d)
+            err = AudioResolutionError(
+                session_id="s1",
+                archive_id="a1",
+                file_parent_dir="pfx",
+                error_type="download_failed",
+                detail="first",
+            )
+            first = append_audio_error(base, err)
+            second = append_audio_error(base, err)
+
+            self.assertEqual(first, second)
+            files = list((base / AUDIO_ERRORS_DIR).glob("*.json"))
+            self.assertEqual(len(files), 1)
 
 
 class TestGlacierTransientInGroupedSummary(unittest.TestCase):

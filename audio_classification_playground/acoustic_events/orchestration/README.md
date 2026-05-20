@@ -6,16 +6,42 @@ archives in parallel on multiple Kubernetes pods with shared EFS storage.
 ## Quick Start
 
 ```bash
-# Single-pod run
+# Existing all-in-one worker mode (default)
 python -m audio_classification_playground.acoustic_events.orchestration run \
     --parquet /efs/dvir/data/magic-clips-research/dataset-reference/all_archives.parquet \
     --output  /efs/dvir/data/magic-clips-research/acoustic-understanding/models-inference \
     --affect-backbone wavlm \
-    --disfluency-backbone whisper \
-    --batch-size 512 \
-    --prefetch-lookahead 4 \
-    --prefetch-workers 4 \
-    --vad-prefetch-workers 1
+    --disfluency-backbone wavlm \
+    --device cuda
+
+# Task-fleet mode: run these as separate GPU worker fleets.
+# Do not mix task-fleet workers with all-in-one workers on the same output tree.
+python -m audio_classification_playground.acoustic_events.orchestration run \
+    --parquet /efs/dvir/data/magic-clips-research/dataset-reference/all_archives.parquet \
+    --output  /efs/dvir/data/magic-clips-research/acoustic-understanding/models-inference \
+    --task-group affect \
+    --affect-backbone wavlm \
+    --disfluency-backbone wavlm \
+    --affect-batch-size 256 \
+    --device cuda
+
+python -m audio_classification_playground.acoustic_events.orchestration run \
+    --parquet /efs/dvir/data/magic-clips-research/dataset-reference/all_archives.parquet \
+    --output  /efs/dvir/data/magic-clips-research/acoustic-understanding/models-inference \
+    --task-group disfluency \
+    --affect-backbone wavlm \
+    --disfluency-backbone wavlm \
+    --disfluency-batch-size 384 \
+    --device cuda
+
+python -m audio_classification_playground.acoustic_events.orchestration run \
+    --parquet /efs/dvir/data/magic-clips-research/dataset-reference/all_archives.parquet \
+    --output  /efs/dvir/data/magic-clips-research/acoustic-understanding/models-inference \
+    --task-group emotion-vad \
+    --affect-backbone wavlm \
+    --disfluency-backbone wavlm \
+    --emotion-batch-size 128 \
+    --device cuda
 
 # Quick pulse check — no parquet needed, finishes in seconds
 python -m audio_classification_playground.acoustic_events.orchestration progress \
@@ -115,10 +141,22 @@ python -m audio_classification_playground.acoustic_events.orchestration reclaim-
   _meta/
     locks/
       <session_id>__<archive_id>.lock
+      affect/
+        <session_id>__<archive_id>.lock
+      disfluency/
+        <session_id>__<archive_id>.lock
+      emotion-vad/
+        <session_id>__<archive_id>.lock
     audio_errors/
-      <uuid>.json
+      <session_id>__<archive_id>__<error_type>.json
     inference_errors/
       <uuid>.json
+      affect/
+        <uuid>.json
+      disfluency/
+        <uuid>.json
+      emotion-vad/
+        <uuid>.json
     timings/
       <worker_id>.jsonl
 ```
@@ -129,28 +167,33 @@ python -m audio_classification_playground.acoustic_events.orchestration reclaim-
    `(session_id, archive_id)`.
 2. **Pre-filtering**: Loads permanent audio errors and inference attempt
    counts to skip known-bad archives.
-3. **Model loading**: Affect, disfluency, and emotion predictors are loaded
-   once. VAD is handled by background CPU workers by default.
+3. **Model loading**: In `--task-group all`, affect, disfluency, and emotion
+   predictors are loaded once. In task-fleet mode, each worker loads only the
+   resident model(s) needed by its task group.
 4. **Shuffled iteration**: Entities are shuffled (for balanced load across
    pods) and iterated.
-5. **Claimed prefetch**: config-aware completion check → atomic lock claim →
-   authoritative retry count check → submit download/decode/VAD prefetch.
-6. **Per-archive inference**: prefetch get → `run_all_inference` with
-   precomputed VAD intervals when available → release lock.
+5. **Claimed prefetch**: completion check → atomic lock claim →
+   authoritative retry count check → submit download/decode and, when the
+   task group writes VAD, optional VAD prefetch.
+6. **Per-archive inference**: prefetch get → filtered `run_all_inference`
+   for missing tasks in the task group → release lock.
 
 ### Coordination
 
-- **Locks**: Atomic `O_CREAT | O_EXCL` files on EFS. Released on both
-  success and failure. Stale locks reclaimed via the `reclaim-stale` CLI.
-  In async VAD mode, each pod may hold up to `--prefetch-lookahead` locks
-  while prefetch and inference overlap.
-- **Error logs**: Individual JSON files per error event — no `flock`,
-  no contention.
-- **Progress**: Derived from the directory structure: if
-  `manifest.json + predictions.npz` exist for all four tasks in an archive
-  directory, that archive is complete.  The progress scanner walks only
-  directories that exist on disk (via `os.scandir`) rather than probing
-  every expected path, keeping cost proportional to work done.
+- **Locks**: Atomic `O_CREAT | O_EXCL` files on EFS. All-in-one workers use
+  flat archive locks. Task fleets use nested locks under
+  `_meta/locks/<task-group>/`. Stale locks are reclaimed recursively via the
+  `reclaim-stale` CLI.
+- **Mixed-mode safety**: Workers refuse to start when all-in-one locks and
+  task-fleet locks coexist on the same output tree. Use separate output trees
+  for control/candidate comparisons.
+- **Error logs**: Audio errors are deduplicated by archive/error type because
+  multiple task fleets can encounter the same bad source audio. Inference
+  errors remain per-attempt and are task-scoped in fleet mode.
+- **Progress**: Derived from task artifact existence. A task is complete when
+  `manifest.json` and `predictions.npz` exist and the manifest status is
+  `complete`. The scanner walks only directories that exist on disk, keeping
+  cost proportional to work done.
 
 ### Error Handling
 
@@ -181,6 +224,39 @@ Async VAD prefetch means hard-killed pods can leave up to
 `--prefetch-lookahead` stale locks, not just the currently inferred archive.
 Keep `--prefetch-lookahead` conservative unless stale reclaim runs frequently.
 
+### Task Groups and Completion Policy
+
+`--task-group all` is the default and preserves the original all-in-one
+worker behavior. Task-fleet mode lets you run one resident model per GPU worker
+fleet:
+
+| Task group | Tasks written | Models loaded | Lock path | Prefetch defaults |
+|---|---|---|---|---|
+| `all` | `vad`, `affect`, `disfluency`, `emotion` | affect, disfluency, emotion | `_meta/locks/*.lock` | `4/4/1` |
+| `affect` | `affect` | affect | `_meta/locks/affect/*.lock` | `lookahead=8, workers=8, vad=0` |
+| `disfluency` | `disfluency` | disfluency | `_meta/locks/disfluency/*.lock` | `lookahead=8, workers=8, vad=0` |
+| `emotion-vad` | `vad`, `emotion` | emotion + CPU VAD | `_meta/locks/emotion-vad/*.lock` | `lookahead=12, workers=8, vad=1` |
+
+The default completion policy is `--completion-policy exists`. This protects
+already-generated production work: if a task artifact is complete on disk, it
+is skipped regardless of config hash, runtime preset, batch size, or task
+group. Config hashes are still written for audit/debug.
+
+Use strict config-aware reuse only for controlled experiments:
+
+```bash
+--completion-policy config
+```
+
+Use `--force-recompute` only when you intentionally want to ignore existing
+task artifacts for the selected task group. In task-fleet mode, partial
+archives are natural: for example, `emotion-vad` claims an archive when either
+VAD or emotion is missing and reuses whichever one is already complete.
+
+Do not run `--task-group all` workers and task-fleet workers on the same
+output tree at the same time. The worker has a startup guard for active mixed
+locks, but operationally the clean pattern is one output tree per mode.
+
 ### Batch Sizes
 
 `--batch-size` remains the legacy default for affect and disfluency.
@@ -196,6 +272,24 @@ task flags always win:
 
 Tune these as rollout settings after profiling on the target GPU. Do not
 increase emotion back to 512 without a target-GPU VRAM check.
+
+If you want to preserve a previous production run's explicit settings, keep
+the task-relevant flags on each fleet command. For example:
+
+```bash
+# affect fleet
+--affect-batch-size 256
+
+# disfluency fleet
+--disfluency-batch-size 384
+
+# emotion-vad fleet
+--emotion-batch-size 128
+```
+
+If the WavLM runtime auto-selects `compiled_static`, WavLM task batches are
+forced to the compiled static batch size. Use `--wavlm-runtime-preset
+fast_exact` for experiments that intentionally keep non-static batch sizes.
 
 The persistent worker uses an audio-fed emotion2vec path: decoded audio is
 copied to the model device once, and the same overlapping 3s / 0.25s windows
@@ -292,15 +386,22 @@ probability drift / top-1 diagnostics against the PyTorch direct scorer. Keep
 using the normal artifact comparison scripts before promoting any exported
 runtime into production.
 
-### Config-Aware Completion
+### Completion Semantics
 
-With the flat output layout (`session/archive/task/`), the config hash is
-no longer embedded in the directory path. The worker reads each task's
-`manifest.json` and validates it against the current model/input config.
-Batch size is treated as runtime-only for this flat layout, so existing
-complete artifacts are reused when only batch size changed. Stale artifacts
-from a previous backbone, window, hop, sample rate, model, or transform are
-automatically re-run.
+The production orchestrator defaults to artifact-existence completion:
+
+```
+manifest.json exists
++ predictions.npz exists
++ manifest.status == "complete"
+= task complete
+```
+
+This is intentionally broader than config-aware reuse so an orchestration
+refactor, batch-size change, runtime preset change, or task-fleet split does
+not sacrifice already-produced raw predictions. Config hashes remain in
+manifests for audit/debug and can be enforced with `--completion-policy
+config` when running a controlled comparison.
 
 ### Data Provenance
 
@@ -427,6 +528,8 @@ Disable splitting with `--no-split-by-vad-mode` for a single combined view.
 ```json
 {
     "worker_id": "pod-abc12_3f8a",
+    "task_group": "affect",
+    "tasks_run": ["affect"],
     "session_id": "abc",
     "archive_id": "def",
     "ts": "2026-05-15T01:30:00Z",
@@ -448,10 +551,12 @@ Disable splitting with `--no-split-by-vad-mode` for a single combined view.
 }
 ```
 
-`inference_sec` is wall-clock time around the entire `run_all_inference`
-call (includes inter-task overhead).  Per-task `*_sec` fields come from
-`InferenceRunResult.task_elapsed_sec`.  `*_reused` booleans come from
-`InferenceRunResult.reused`.
+`task_group` identifies the worker mode. `tasks_run` lists the missing tasks
+that were actually executed for that archive; in a partial `emotion-vad`
+retry it may contain only `["emotion"]` or only `["vad"]`.
+`inference_sec` is wall-clock time around the filtered `run_all_inference`
+call. Per-task `*_sec` fields come from `InferenceRunResult.task_elapsed_sec`.
+`*_reused` booleans come from `InferenceRunResult.reused`.
 
 **Multi-pod design:** each pod writes its own JSONL file (append-only,
 no locks). The CLI globs all files at analysis time. `worker_id` is
@@ -462,8 +567,8 @@ concatenated or moved.
 
 A compact, at-a-glance dashboard showing which pods are alive, how many
 archives each has completed, and the current processing pace.  No parquet
-or manifest required — reads only `_meta/` flat directories on EFS,
-so it completes instantly even with hundreds of thousands of archives.
+or manifest required — reads lock and timing metadata under `_meta/` on EFS,
+so it completes quickly even with hundreds of thousands of archives.
 
 ```bash
 python -m audio_classification_playground.acoustic_events.orchestration status \
@@ -476,13 +581,13 @@ Sample output:
 Fleet heartbeat                              2026-05-17 09:30:00 UTC
 ================================================================
 
-Worker          Locks  Done  Last activity  Pace (arc/h)
---------------------------------------------------------
-pod-gpu-abc123      4   512  12s ago              ~48.2
-pod-gpu-def456      4   300  3s ago               ~51.4
-pod-gpu-ghi789      3   301  47s ago              ~47.0
---------------------------------------------------------
-Fleet (3 workers)     11  1,113                      ~146.6
+Worker          Group       Locks  Done  Last activity  Pace (arc/h)
+--------------------------------------------------------------------
+pod-gpu-abc123  affect          8   512  12s ago              ~68.2
+pod-gpu-def456  disfluency      8   300  3s ago               ~74.4
+pod-gpu-ghi789  emotion-vad    12   301  47s ago              ~92.0
+--------------------------------------------------------------------
+Fleet (3 workers)             28  1,113                      ~234.6
 
 Errors: 7 audio, 2 inference
 ```
@@ -502,7 +607,8 @@ Completed: 14,203  |  Partial: 42  |  Errors: 7 audio, 2 inference
 
 | Column | Source | What it tells you |
 |---|---|---|
-| Locks | `_meta/locks/*.lock` ownership | Is the pod alive? (0 = dead or finished) |
+| Group | lock metadata or timing records | Which task fleet the pod belongs to |
+| Locks | `_meta/locks/**/*.lock` ownership | Is the pod alive? (0 = dead or finished) |
 | Done | `_meta/timings/<worker_id>.jsonl` line count | Is it making progress? |
 | Last activity | Latest lock claim time or timing record timestamp | Is it stuck? (>5 min = suspicious) |
 | Pace | Mean `total_sec` of last N records, extrapolated to archives/hour | How fast is it going? |
@@ -545,7 +651,7 @@ uv run python -c "
 import json, pathlib
 d = pathlib.Path('/efs/.../models-inference/_meta/audio_errors')
 keys = set()
-for f in d.glob('*.json'):
+for f in d.rglob('*.json'):
     try:
         data = json.loads(f.read_text())
     except (json.JSONDecodeError, OSError):
@@ -558,6 +664,10 @@ for k in sorted(keys):
     print(k)
 " > glacier_keys.txt
 ```
+
+Inference errors may be nested by task group in task-fleet mode. The
+`errors`, `status`, and summary helpers scan recursively, so operators do not
+need extra flags to see fleet-mode failures.
 
 ### Rollout with Glacier reclassification
 
@@ -577,7 +687,7 @@ uv run python -c "
 import json, pathlib
 d = pathlib.Path('/efs/.../models-inference/_meta/audio_errors')
 removed = 0
-for f in sorted(d.glob('*.json')):
+for f in sorted(d.rglob('*.json')):
     try:
         data = json.loads(f.read_text())
     except (json.JSONDecodeError, OSError):
@@ -617,17 +727,11 @@ spec:
     - --affect-backbone
     - wavlm
     - --disfluency-backbone
-    - whisper
-    - --batch-size
-    - "512"
-    - --emotion-batch-size
-    - "64"
-    - --prefetch-lookahead
-    - "4"
-    - --prefetch-workers
-    - "4"
-    - --vad-prefetch-workers
-    - "1"
+    - wavlm
+    - --task-group
+    - affect
+    - --affect-batch-size
+    - "256"
     resources:
       limits:
         nvidia.com/gpu: 1
@@ -645,7 +749,7 @@ spec:
 Before the full 600k run:
 
 ```bash
-# Run on 100 archives to verify everything works
+# All-in-one smoke on 100 archives
 python -m audio_classification_playground.acoustic_events.orchestration run \
     --parquet /path/to/pilot_100.parquet \
     --output  /efs/pilot-test \
@@ -660,38 +764,60 @@ python -m audio_classification_playground.acoustic_events.orchestration progress
     --output  /efs/pilot-test
 ```
 
+For task-fleet smoke, use a separate output tree and launch the three task
+groups (`affect`, `disfluency`, `emotion-vad`) with the same pilot parquet.
+Then verify progress, status, errors, timings, and stale-lock reclaim against
+that output tree before reusing the production output.
+
 ### Multi-Pod Parallelism
 
-Simply launch N pods with the same arguments. Each pod:
+For all-in-one mode, simply launch N pods with the same arguments. Each pod:
 
 - Shuffles with a different random seed (default: unseeded, i.e. random)
 - Claims archives via atomic lock files
 - Skips already-complete or locked archives
 - Reports progress to the same shared EFS directory
 
+For task-fleet mode, launch separate deployments/jobs with different
+`--task-group` values. Task-scoped locks allow affect, disfluency, and
+emotion-vad fleets to work on the same archive concurrently without duplicate
+writes within a task. Do not run all-in-one and task-fleet workers on the
+same output tree at the same time.
+
 ### Async VAD Prefetch
 
-`--vad-prefetch-workers` defaults to `1`, making CPU VAD the default
-prefetch path. Use `--vad-prefetch-workers 0` only as an emergency fallback
-to run VAD synchronously inside `run_all_inference`.
+In all-in-one mode, `--vad-prefetch-workers` defaults to `1`, making CPU VAD
+the default prefetch path. In affect/disfluency task fleets, the default is
+`0` because those workers do not write or consume VAD. In `emotion-vad`, the
+default is `1`.
 
-Recommended starting settings:
+All-in-one starting settings:
 
 ```bash
 --prefetch-lookahead 4 --prefetch-workers 4 --vad-prefetch-workers 1
 ```
 
-Increase `--vad-prefetch-workers` to `2` only if timing logs show the GPU is
-waiting for VAD-ready prefetch results. Larger `--prefetch-lookahead` values
-increase both locks held per pod and decoded-audio memory in flight; long
-archives at 16 kHz float32 can make that memory noticeable.
+Task-fleet defaults are already deeper because each single-task worker
+consumes prefetched audio faster:
+
+```text
+affect:       --prefetch-lookahead 8  --prefetch-workers 8  --vad-prefetch-workers 0
+disfluency:   --prefetch-lookahead 8  --prefetch-workers 8  --vad-prefetch-workers 0
+emotion-vad:  --prefetch-lookahead 12 --prefetch-workers 8  --vad-prefetch-workers 1
+```
+
+Tune by watching `prefetch_wait_sec` in timing records. Larger
+`--prefetch-lookahead` values increase both locks held per pod and decoded
+audio memory in flight; long archives at 16 kHz float32 can make that memory
+noticeable.
 
 ### EFS Metadata Budget
 
 The `_meta/` directory will contain:
 
 - Up to ~600k lock files (small, ephemeral)
-- Error JSON files (one per error event, typically <1 KB each)
+- Audio error JSON files deduped by archive/error type
+- Inference error JSON files per failed attempt, task-scoped in fleet mode
 - Timing JSONL files (one per worker process, ~200 bytes per record)
 
 EFS handles this volume well, but monitor the metadata cost if running
