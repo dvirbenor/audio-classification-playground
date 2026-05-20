@@ -1,0 +1,62 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: template-job
+  namespace: default
+spec:
+  backoffLimit: 10
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app: ml-experiment
+    spec:
+      restartPolicy: Never
+      terminationGracePeriodSeconds: 600
+      nodeSelector:
+        karpenter: ai-workers-gpu
+        node.kubernetes.io/instance-type: g5.4xlarge
+        karpenter.sh/capacity-type: on-demand
+      tolerations:
+        - key: karpenter
+          operator: Equal
+          value: ai-workers-gpu
+          effect: NoSchedule
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      initContainers: []
+      containers:
+        - name: experiment-container
+          image: python:3.11-slim
+          imagePullPolicy: IfNotPresent
+          env: []
+          volumeMounts:
+            - name: ai-efs
+              mountPath: /efs
+            - name: shm
+              mountPath: /dev/shm
+            - name: workspace
+              mountPath: /workspace
+            - name: github-ssh
+              mountPath: /mnt/github-ssh
+              readOnly: true
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+              nvidia.com/gpu: "1"
+      volumes:
+        - name: ai-efs
+          persistentVolumeClaim:
+            claimName: ai-efs-pvc
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 200Gi
+        - name: workspace
+          emptyDir: {}
+        - name: github-ssh
+          secret:
+            secretName: audio-playground-github-ssh
+            defaultMode: 256

@@ -5,7 +5,7 @@ config:
   image: 690765672468.dkr.ecr.us-east-1.amazonaws.com/ai-content-provenance:latest
   capacityType: on-demand
   nodeSelector:
-    node.kubernetes.io/instance-type: g5.4xlarge
+    node.kubernetes.io/instance-type: c6a.4xlarge
   env:
     CLEARML_WEB_HOST: http://clearml-webserver.clearml:8080
     CLEARML_API_HOST: http://clearml-apiserver.clearml:8008
@@ -20,9 +20,9 @@ config:
     enabled: true
 
 experiments:
-  - name: inference-affect-tighter
+  - name: inference-vad-cpu
     category: inference
-    description: Run affect acoustic-event inference on default g5.4xlarge
+    description: Run CPU-only VAD acoustic-event extraction on c6a.4xlarge
     cmd: /bin/bash
     args:
       - -lc
@@ -35,10 +35,10 @@ experiments:
 
         LOG_DIR="/efs/dvir/data/magic-clips-research/acoustic-understanding/models-inference/job-logs"
         mkdir -p "$LOG_DIR"
-        LOG_FILE="$LOG_DIR/inference-affect-tight-run-${RUN_ID}-${HOSTNAME:-unknown}.log"
+        LOG_FILE="$LOG_DIR/inference-vad-cpu-run-${RUN_ID}-${HOSTNAME:-unknown}.log"
         exec > >(tee -a "$LOG_FILE") 2>&1
 
-        echo "[$(date -Iseconds)] Starting inference-affect-tight run ${RUN_ID}"
+        echo "[$(date -Iseconds)] Starting inference-vad-cpu run ${RUN_ID}"
         cd /workspace
 
         mkdir -p /workspace/.ssh
@@ -60,13 +60,16 @@ experiments:
         python -m audio_classification_playground.acoustic_events.orchestration run \
           --parquet /efs/dvir/data/magic-clips-research/dataset-reference/all_archives.parquet \
           --output /efs/dvir/data/magic-clips-research/acoustic-understanding/models-inference \
-          --task-group affect \
+          --task-group vad \
           --completion-policy exists \
           --affect-backbone wavlm \
           --disfluency-backbone wavlm \
-          --device cuda \
+          --device cpu \
+          --prefetch-workers 10 \
+          --prefetch-lookahead 24 \
+          --vad-prefetch-workers 1 \
           --max-retries 3
 
-        echo "[$(date -Iseconds)] Finished inference-affect-tight run ${RUN_ID}"
+        echo "[$(date -Iseconds)] Finished inference-vad-cpu run ${RUN_ID}"
     grid:
       run_id: [1, 2, 3, 4, 5, 6, 7, 8]

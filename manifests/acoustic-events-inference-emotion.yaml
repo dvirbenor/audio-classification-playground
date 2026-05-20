@@ -20,9 +20,9 @@ config:
     enabled: true
 
 experiments:
-  - name: inference-affect-tighter
+  - name: inference-emotion-exclusive
     category: inference
-    description: Run affect acoustic-event inference on default g5.4xlarge
+    description: Run emotion-only acoustic-event inference on g5.4xlarge
     cmd: /bin/bash
     args:
       - -lc
@@ -32,13 +32,15 @@ experiments:
         export RUN_ID="{run_id}"
         export PYTHONUNBUFFERED=1
         export UV_LINK_MODE=copy
+        export TMPDIR=/workspace/tmp
+        mkdir -p "$TMPDIR"
 
         LOG_DIR="/efs/dvir/data/magic-clips-research/acoustic-understanding/models-inference/job-logs"
         mkdir -p "$LOG_DIR"
-        LOG_FILE="$LOG_DIR/inference-affect-tight-run-${RUN_ID}-${HOSTNAME:-unknown}.log"
+        LOG_FILE="$LOG_DIR/inference-emotion-run-${RUN_ID}-${HOSTNAME:-unknown}.log"
         exec > >(tee -a "$LOG_FILE") 2>&1
 
-        echo "[$(date -Iseconds)] Starting inference-affect-tight run ${RUN_ID}"
+        echo "[$(date -Iseconds)] Starting inference-emotion run ${RUN_ID}"
         cd /workspace
 
         mkdir -p /workspace/.ssh
@@ -60,13 +62,16 @@ experiments:
         python -m audio_classification_playground.acoustic_events.orchestration run \
           --parquet /efs/dvir/data/magic-clips-research/dataset-reference/all_archives.parquet \
           --output /efs/dvir/data/magic-clips-research/acoustic-understanding/models-inference \
-          --task-group affect \
+          --task-group emotion \
           --completion-policy exists \
           --affect-backbone wavlm \
           --disfluency-backbone wavlm \
           --device cuda \
+          --prefetch-workers 14 \
+          --prefetch-lookahead 28 \
+          --vad-prefetch-workers 0 \
           --max-retries 3
 
-        echo "[$(date -Iseconds)] Finished inference-affect-tight run ${RUN_ID}"
+        echo "[$(date -Iseconds)] Finished inference-emotion run ${RUN_ID}"
     grid:
       run_id: [1, 2, 3, 4, 5, 6, 7, 8]
