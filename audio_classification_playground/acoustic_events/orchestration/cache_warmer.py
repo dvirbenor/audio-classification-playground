@@ -14,7 +14,7 @@ from .audio_resolver import AudioResolutionError, BUCKET
 from .errors import load_inference_attempt_counts, load_permanent_error_set
 from .locking import iter_lock_files
 from .manifest import ArchiveEntity, load_manifest
-from .progress import TASKS, _walk_completed_tasks
+from .progress import TASKS, completed_tasks_for_entity_keys
 from .task_groups import (
     TASK_GROUP_AFFECT,
     TASK_GROUP_DISFLUENCY,
@@ -118,7 +118,10 @@ def _warm_one_cycle(
     max_inference_attempts: int,
 ) -> WarmCacheSummary:
     permanent_errors = load_permanent_error_set(output_base)
-    completed = _walk_completed_tasks(output_base)
+    completed = completed_tasks_for_entity_keys(
+        output_base,
+        [(entity.session_id, entity.archive_id) for entity in entities],
+    )
     active_locks = _active_locks(output_base)
     protected_s3_keys = _protected_s3_keys(cache, entities, active_locks)
     terminal_entities = _terminal_entities(

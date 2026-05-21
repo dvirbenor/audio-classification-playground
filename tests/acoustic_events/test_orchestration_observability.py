@@ -31,6 +31,7 @@ from audio_classification_playground.acoustic_events.orchestration.progress impo
     QuickSummary,
     _walk_completed_tasks,
     _walk_completed_tasks_scandir,
+    completed_tasks_for_entity_keys,
     quick_disk_summary,
     scan_progress,
 )
@@ -157,6 +158,21 @@ class TestWalkCompletedTasks(unittest.TestCase):
             result = _walk_completed_tasks(base)
             self.assertNotIn(("_meta", "fake_archive"), result)
             self.assertEqual(len(result), 1)
+
+    def test_audio_cache_tree_is_skipped(self):
+        with tempfile.TemporaryDirectory() as d:
+            base = Path(d)
+            _make_task_artifacts(base, "s1", "a1", list(TASKS))
+            cache_like_task_dir = (
+                base / "_meta" / "audio_cache" / "fake_archive" / "vad"
+            )
+            cache_like_task_dir.mkdir(parents=True)
+            (cache_like_task_dir / "manifest.json").write_text("{}")
+            (cache_like_task_dir / "predictions.npz").write_text("data")
+
+            result = _walk_completed_tasks(base)
+
+            self.assertEqual(result, {("s1", "a1"): set(TASKS)})
 
     def test_underscore_prefixed_session_not_skipped(self):
         """Session IDs starting with _ (but not == _meta) are valid."""
@@ -300,6 +316,43 @@ class TestScanProgress(unittest.TestCase):
         summary = scan_progress(Path("/nonexistent"), entities)
         self.assertEqual(summary.complete, 0)
         self.assertEqual(summary.remaining, 1)
+
+    def test_completed_tasks_for_entity_keys_is_manifest_targeted(self):
+        with tempfile.TemporaryDirectory() as d:
+            base = Path(d)
+            _make_task_artifacts(base, "s1", "requested", ["vad"])
+            _make_task_artifacts(base, "s9", "not_in_manifest", list(TASKS))
+
+            completed = completed_tasks_for_entity_keys(
+                base,
+                [("s1", "requested")],
+                use_cache=False,
+            )
+
+            self.assertEqual(completed, {("s1", "requested"): {"vad"}})
+
+    def test_completed_tasks_cache_preserves_entries_outside_request(self):
+        with tempfile.TemporaryDirectory() as d:
+            base = Path(d)
+            progress_cache = base / "_meta" / "progress_complete.txt"
+            progress_cache.parent.mkdir(parents=True)
+            progress_cache.write_text("old_sid\told_aid\n", encoding="utf-8")
+            _make_task_artifacts(base, "s1", "newly_complete", list(TASKS))
+
+            completed = completed_tasks_for_entity_keys(
+                base,
+                [("s1", "newly_complete")],
+                use_cache=True,
+            )
+
+            self.assertEqual(completed, {("s1", "newly_complete"): set(TASKS)})
+            cached_lines = set(
+                progress_cache.read_text(encoding="utf-8").splitlines()
+            )
+            self.assertEqual(
+                cached_lines,
+                {"old_sid\told_aid", "s1\tnewly_complete"},
+            )
 
 
 # ===========================================================================

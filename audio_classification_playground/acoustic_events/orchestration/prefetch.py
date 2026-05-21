@@ -142,8 +142,13 @@ class Prefetcher:
         self._shared_paths: dict[tuple[str, str], Path] = {}
         self._discarded: set[tuple[str, str]] = set()
 
-        if prewarm_vad and vad_workers > 0:
-            self._make_vad_detector()
+        if prewarm_vad and self._vad_pool is not None:
+            prewarm_futures = [
+                self._vad_pool.submit(self._thread_vad_detector)
+                for _ in range(vad_workers)
+            ]
+            for future in prewarm_futures:
+                future.result()
 
     def submit(self, entity: ArchiveEntity, *, precompute_vad: bool = False) -> None:
         """Queue *entity* for background download/decode and optional VAD."""

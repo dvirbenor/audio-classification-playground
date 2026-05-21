@@ -234,8 +234,7 @@ class PrefetcherTest(unittest.TestCase):
                 finally:
                     pf.shutdown()
 
-        self.assertEqual(len(factory_threads), 2)
-        self.assertEqual(len(set(factory_threads)), 2)
+        self.assertEqual(len(factory_threads), 1)
 
     def test_vad_failure_raises_from_get(self):
         entity = ArchiveEntity("s1", "a1", "prefix")

@@ -470,6 +470,53 @@ def _save_completion_cache(
             pass
 
 
+def completed_tasks_for_entity_keys(
+    output_base: Path,
+    entity_keys: list[tuple[str, str]],
+    *,
+    use_cache: bool = True,
+) -> dict[tuple[str, str], set[str]]:
+    """Return completed task names for known ``(session_id, archive_id)`` keys.
+
+    This is the manifest-targeted completion scan used by full progress and
+    cache warming.  It avoids walking the whole output tree, which matters on
+    EFS once the shared audio cache adds additional state below ``_meta/``.
+    """
+    entity_key_set = set(entity_keys)
+
+    all_cached_complete: set[tuple[str, str]] = set()
+    cached_complete: set[tuple[str, str]] = set()
+    if use_cache:
+        all_cached_complete = _load_completion_cache(output_base)
+        cached_complete = all_cached_complete & entity_key_set
+
+    keys_to_check = [k for k in entity_keys if k not in cached_complete]
+    LOGGER.info(
+        "Progress scan: %d entities, %d cached-complete, %d to verify on disk",
+        len(entity_keys),
+        len(cached_complete),
+        len(keys_to_check),
+    )
+
+    checked_map = _check_entities_parallel(output_base, keys_to_check)
+
+    completed_map: dict[tuple[str, str], set[str]] = {
+        key: set(TASKS) for key in cached_complete
+    }
+    completed_map.update(checked_map)
+
+    newly_complete = {k for k, v in checked_map.items() if len(v) == len(TASKS)}
+    if use_cache and newly_complete:
+        _save_completion_cache(output_base, all_cached_complete | newly_complete)
+        LOGGER.info(
+            "Progress cache updated: %d newly complete, %d total cached",
+            len(newly_complete),
+            len(all_cached_complete | newly_complete),
+        )
+
+    return completed_map
+
+
 # ---------------------------------------------------------------------------
 # Full progress scan (manifest-backed)
 # ---------------------------------------------------------------------------
@@ -503,38 +550,11 @@ def scan_progress(
         locked_set.add(lf.stem)
 
     entity_keys = [(e.session_id, e.archive_id) for e in entities]
-    entity_key_set = set(entity_keys)
-
-    # --- completion cache ---------------------------------------------------
-    cached_complete: set[tuple[str, str]] = set()
-    if use_cache:
-        cached_complete = _load_completion_cache(output_base) & entity_key_set
-
-    keys_to_check = [k for k in entity_keys if k not in cached_complete]
-    LOGGER.info(
-        "Progress scan: %d entities, %d cached-complete, %d to verify on disk",
-        len(entity_keys),
-        len(cached_complete),
-        len(keys_to_check),
+    completed_map = completed_tasks_for_entity_keys(
+        output_base,
+        entity_keys,
+        use_cache=use_cache,
     )
-
-    new_completed = _check_entities_parallel(output_base, keys_to_check)
-
-    # Merge cached + freshly verified
-    completed_map: dict[tuple[str, str], set[str]] = {}
-    for key in cached_complete:
-        completed_map[key] = set(TASKS)
-    completed_map.update(new_completed)
-
-    # Persist newly-discovered complete archives
-    newly_complete = {k for k, v in new_completed.items() if len(v) == len(TASKS)}
-    if use_cache and newly_complete:
-        _save_completion_cache(output_base, cached_complete | newly_complete)
-        LOGGER.info(
-            "Progress cache updated: %d newly complete, %d total cached",
-            len(newly_complete),
-            len(cached_complete) + len(newly_complete),
-        )
 
     # --- classify entities --------------------------------------------------
     summary = ProgressSummary(total_entities=len(entities))

@@ -7,6 +7,7 @@ from .manifest import ArchiveEntity, load_manifest
 from .progress import (
     ProgressSummary,
     QuickSummary,
+    completed_tasks_for_entity_keys,
     is_archive_complete,
     quick_disk_summary,
     scan_progress,
@@ -17,6 +18,7 @@ __all__ = [
     "ArchiveEntity",
     "ProgressSummary",
     "QuickSummary",
+    "completed_tasks_for_entity_keys",
     "is_archive_complete",
     "load_manifest",
     "quick_disk_summary",
