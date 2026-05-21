@@ -1,5 +1,8 @@
 import json
+import os
+import signal
 import tempfile
+import time
 import unittest
 from collections import Counter
 from contextlib import ExitStack, contextmanager
@@ -319,6 +322,263 @@ class WorkerAsyncVadTest(unittest.TestCase):
         self.assertEqual(submit_args, [False])
         self.assertEqual(vad_detectors, [None])
 
+    def test_emotion_task_group_loads_emotion_only_and_skips_vad(self):
+        entity = ArchiveEntity("s1", "a1", "prefix")
+        model_kwargs = []
+        prefetch_kwargs = []
+        submit_args = []
+        run_kwargs = []
+        lock_calls = []
+        release_calls = []
+
+        class FakeModels(_FakeModels):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                model_kwargs.append(kwargs)
+
+        class FakePrefetcher(_FakePrefetcher):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                prefetch_kwargs.append(kwargs)
+
+            def submit(self, submitted_entity, *, precompute_vad=False):
+                submit_args.append(precompute_vad)
+                super().submit(submitted_entity, precompute_vad=precompute_vad)
+
+        def try_claim(output_base, claimed_entity, *, namespace=None, task_group=None):
+            lock_calls.append((namespace, task_group, claimed_entity.archive_id))
+            return True
+
+        def release_claim(output_base, released_entity, *, namespace=None):
+            release_calls.append((namespace, released_entity.archive_id))
+
+        def fake_run_all(*args, **kwargs):
+            run_kwargs.append(kwargs)
+            return _fake_inference_result()
+
+        with _worker_patches(
+            [entity],
+            model_suite_cls=FakeModels,
+            prefetcher_cls=FakePrefetcher,
+            try_claim_fn=try_claim,
+            release_claim_fn=release_claim,
+            run_all_fn=fake_run_all,
+        ):
+            worker.run_worker(
+                parquet_path="manifest.parquet",
+                output_base=tempfile.mkdtemp(),
+                affect_backbone="wavlm",
+                disfluency_backbone="whisper",
+                task_group="emotion",
+            )
+
+        self.assertEqual(model_kwargs[0]["tasks_to_load"], ("emotion",))
+        self.assertFalse(model_kwargs[0]["load_vad"])
+        self.assertEqual(prefetch_kwargs[0]["max_workers"], 14)
+        self.assertEqual(prefetch_kwargs[0]["vad_workers"], 0)
+        self.assertEqual(submit_args, [False])
+        self.assertEqual(run_kwargs[0]["tasks_filter"], ("emotion",))
+        self.assertIsNone(run_kwargs[0]["vad_detector"])
+        self.assertEqual(lock_calls, [("emotion", "emotion", "a1")])
+        self.assertEqual(release_calls, [("emotion", "a1")])
+
+    def test_vad_task_group_loads_no_gpu_models_and_uses_single_vad_worker(self):
+        entity = ArchiveEntity("s1", "a1", "prefix")
+        model_kwargs = []
+        prefetch_kwargs = []
+        submit_args = []
+        run_kwargs = []
+        lock_calls = []
+
+        class FakeModels(_FakeModels):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                model_kwargs.append(kwargs)
+
+        class FakePrefetcher(_FakePrefetcher):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                prefetch_kwargs.append(kwargs)
+
+            def submit(self, submitted_entity, *, precompute_vad=False):
+                submit_args.append(precompute_vad)
+                super().submit(submitted_entity, precompute_vad=precompute_vad)
+
+        def try_claim(output_base, claimed_entity, *, namespace=None, task_group=None):
+            lock_calls.append((namespace, task_group, claimed_entity.archive_id))
+            return True
+
+        def fake_run_all(*args, **kwargs):
+            run_kwargs.append(kwargs)
+            return _fake_inference_result()
+
+        with _worker_patches(
+            [entity],
+            model_suite_cls=FakeModels,
+            prefetcher_cls=FakePrefetcher,
+            try_claim_fn=try_claim,
+            run_all_fn=fake_run_all,
+        ):
+            worker.run_worker(
+                parquet_path="manifest.parquet",
+                output_base=tempfile.mkdtemp(),
+                affect_backbone="wavlm",
+                disfluency_backbone="whisper",
+                task_group="vad",
+            )
+
+        self.assertEqual(model_kwargs[0]["tasks_to_load"], ())
+        self.assertFalse(model_kwargs[0]["load_vad"])
+        self.assertEqual(prefetch_kwargs[0]["max_workers"], 12)
+        self.assertEqual(prefetch_kwargs[0]["vad_workers"], 1)
+        self.assertEqual(submit_args, [True])
+        self.assertEqual(run_kwargs[0]["tasks_filter"], ("vad",))
+        self.assertEqual(
+            run_kwargs[0]["vad_detector"](np.zeros(4, dtype=np.float32), 16000),
+            [(0.0, 0.5)],
+        )
+        self.assertEqual(lock_calls, [("vad", "vad", "a1")])
+
+    def test_emotion_vad_group_claims_vad_and_emotion_task_locks(self):
+        entity = ArchiveEntity("s1", "a1", "prefix")
+        lock_calls = []
+        release_calls = []
+        submit_args = []
+
+        class FakePrefetcher(_FakePrefetcher):
+            def submit(self, submitted_entity, *, precompute_vad=False):
+                submit_args.append(precompute_vad)
+                super().submit(submitted_entity, precompute_vad=precompute_vad)
+
+        def try_claim(output_base, claimed_entity, *, namespace=None, task_group=None):
+            lock_calls.append((namespace, task_group, claimed_entity.archive_id))
+            return True
+
+        def release_claim(output_base, released_entity, *, namespace=None):
+            release_calls.append((namespace, released_entity.archive_id))
+
+        with _worker_patches(
+            [entity],
+            prefetcher_cls=FakePrefetcher,
+            try_claim_fn=try_claim,
+            release_claim_fn=release_claim,
+        ):
+            worker.run_worker(
+                parquet_path="manifest.parquet",
+                output_base=tempfile.mkdtemp(),
+                affect_backbone="wavlm",
+                disfluency_backbone="whisper",
+                task_group="emotion-vad",
+            )
+
+        self.assertEqual(
+            lock_calls,
+            [("vad", "emotion-vad", "a1"), ("emotion", "emotion-vad", "a1")],
+        )
+        self.assertEqual(Counter(release_calls), Counter({
+            ("vad", "a1"): 1,
+            ("emotion", "a1"): 1,
+        }))
+        self.assertEqual(submit_args, [True])
+
+    def test_emotion_vad_group_claims_only_missing_task_locks(self):
+        entity = ArchiveEntity("s1", "a1", "prefix")
+        lock_calls = []
+        submit_args = []
+        run_kwargs = []
+
+        class FakePrefetcher(_FakePrefetcher):
+            def submit(self, submitted_entity, *, precompute_vad=False):
+                submit_args.append(precompute_vad)
+                super().submit(submitted_entity, precompute_vad=precompute_vad)
+
+        def try_claim(output_base, claimed_entity, *, namespace=None, task_group=None):
+            lock_calls.append((namespace, task_group, claimed_entity.archive_id))
+            return True
+
+        def fake_run_all(*args, **kwargs):
+            run_kwargs.append(kwargs)
+            return _fake_inference_result()
+
+        with _worker_patches(
+            [entity],
+            prefetcher_cls=FakePrefetcher,
+            try_claim_fn=try_claim,
+            task_complete_fn=lambda *args, **kwargs: args[3] == "vad",
+            run_all_fn=fake_run_all,
+        ):
+            worker.run_worker(
+                parquet_path="manifest.parquet",
+                output_base=tempfile.mkdtemp(),
+                affect_backbone="wavlm",
+                disfluency_backbone="whisper",
+                task_group="emotion-vad",
+                completion_policy="config",
+            )
+
+        self.assertEqual(lock_calls, [("emotion", "emotion-vad", "a1")])
+        self.assertEqual(submit_args, [False])
+        self.assertEqual(run_kwargs[0]["tasks_filter"], ("emotion",))
+
+    def test_multi_task_group_releases_partial_claim_on_lock_conflict(self):
+        entity = ArchiveEntity("s1", "a1", "prefix")
+        lock_calls = []
+        release_calls = []
+        run_calls = []
+
+        def try_claim(output_base, claimed_entity, *, namespace=None, task_group=None):
+            lock_calls.append((namespace, task_group, claimed_entity.archive_id))
+            return namespace == "vad"
+
+        def release_claim(output_base, released_entity, *, namespace=None):
+            release_calls.append((namespace, released_entity.archive_id))
+
+        def fake_run_all(*args, **kwargs):
+            run_calls.append(kwargs)
+            return _fake_inference_result()
+
+        with _worker_patches(
+            [entity],
+            try_claim_fn=try_claim,
+            release_claim_fn=release_claim,
+            run_all_fn=fake_run_all,
+        ):
+            worker.run_worker(
+                parquet_path="manifest.parquet",
+                output_base=tempfile.mkdtemp(),
+                affect_backbone="wavlm",
+                disfluency_backbone="whisper",
+                task_group="emotion-vad",
+            )
+
+        self.assertEqual(
+            lock_calls,
+            [("vad", "emotion-vad", "a1"), ("emotion", "emotion-vad", "a1")],
+        )
+        self.assertEqual(release_calls, [("vad", "a1")])
+        self.assertEqual(run_calls, [])
+
+    def test_split_workers_refuse_active_legacy_emotion_vad_locks(self):
+        entity = ArchiveEntity("s1", "a1", "prefix")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            locks_dir = Path(tmpdir) / "_meta" / "locks" / "emotion-vad"
+            locks_dir.mkdir(parents=True)
+            (locks_dir / "s1__a1.lock").write_text(
+                "worker=legacy\npid=1\ntime=1\ntask_group=emotion-vad\n",
+                encoding="utf-8",
+            )
+
+            with _worker_patches([entity]):
+                with self.assertRaisesRegex(RuntimeError, "legacy 'emotion-vad' locks"):
+                    worker.run_worker(
+                        parquet_path="manifest.parquet",
+                        output_base=tmpdir,
+                        affect_backbone="wavlm",
+                        disfluency_backbone="whisper",
+                        task_group="emotion",
+                    )
+
     def test_shutdown_releases_current_and_queued_claims(self):
         entities = [ArchiveEntity("s1", f"a{i}", f"prefix/{i}") for i in range(3)]
         released = []
@@ -375,6 +635,210 @@ class WorkerAsyncVadTest(unittest.TestCase):
         self.assertEqual(calls, ["a0", "a1", "a2"])
         self.assertEqual(errors, ["a0"])
 
+    def test_ready_first_processes_ready_later_item_before_fifo_head(self):
+        entities = [
+            ArchiveEntity("s1", "a0", "prefix/0"),
+            ArchiveEntity("s1", "a1", "prefix/1"),
+        ]
+        calls = []
+
+        class FakePrefetcher(_FakePrefetcher):
+            def submit(self, entity, *, precompute_vad=False):
+                super().submit(entity, precompute_vad=precompute_vad)
+                if entity.archive_id == "a0":
+                    self._ready[(entity.session_id, entity.archive_id)] = False
+
+            def wait_any(self, entities, timeout_sec=0.5):
+                for entity in entities:
+                    self._ready[(entity.session_id, entity.archive_id)] = True
+                    return True
+                return False
+
+        def fake_run_all(*args, **kwargs):
+            calls.append(Path(kwargs["audio_source_key"]).stem)
+            return _fake_inference_result()
+
+        with _worker_patches(
+            entities,
+            prefetcher_cls=FakePrefetcher,
+            run_all_fn=fake_run_all,
+        ):
+            worker.run_worker(
+                parquet_path="manifest.parquet",
+                output_base=tempfile.mkdtemp(),
+                affect_backbone="wavlm",
+                disfluency_backbone="whisper",
+                prefetch_lookahead=2,
+                vad_prefetch_workers=1,
+                seed=0,
+            )
+
+        self.assertEqual(calls, ["a1", "a0"])
+
+    def test_ready_first_keeps_queue_order_when_multiple_items_are_ready(self):
+        entities = [
+            ArchiveEntity("s1", "a0", "prefix/0"),
+            ArchiveEntity("s1", "a1", "prefix/1"),
+        ]
+        calls = []
+
+        def fake_run_all(*args, **kwargs):
+            calls.append(Path(kwargs["audio_source_key"]).stem)
+            return _fake_inference_result()
+
+        with _worker_patches(entities, run_all_fn=fake_run_all):
+            worker.run_worker(
+                parquet_path="manifest.parquet",
+                output_base=tempfile.mkdtemp(),
+                affect_backbone="wavlm",
+                disfluency_backbone="whisper",
+                prefetch_lookahead=2,
+                vad_prefetch_workers=1,
+                seed=0,
+            )
+
+        self.assertEqual(calls, ["a0", "a1"])
+
+    def test_ready_first_waits_for_any_completion_when_none_are_ready(self):
+        entities = [
+            ArchiveEntity("s1", "a0", "prefix/0"),
+            ArchiveEntity("s1", "a1", "prefix/1"),
+        ]
+        calls = []
+        wait_calls = []
+
+        class FakePrefetcher(_FakePrefetcher):
+            def submit(self, entity, *, precompute_vad=False):
+                super().submit(entity, precompute_vad=precompute_vad)
+                self._ready[(entity.session_id, entity.archive_id)] = False
+
+            def wait_any(self, entities, timeout_sec=0.5):
+                wait_calls.append(timeout_sec)
+                for entity in reversed(tuple(entities)):
+                    self._ready[(entity.session_id, entity.archive_id)] = True
+                    return True
+                return False
+
+        def fake_run_all(*args, **kwargs):
+            calls.append(Path(kwargs["audio_source_key"]).stem)
+            return _fake_inference_result()
+
+        with _worker_patches(
+            entities,
+            prefetcher_cls=FakePrefetcher,
+            run_all_fn=fake_run_all,
+        ):
+            worker.run_worker(
+                parquet_path="manifest.parquet",
+                output_base=tempfile.mkdtemp(),
+                affect_backbone="wavlm",
+                disfluency_backbone="whisper",
+                prefetch_lookahead=2,
+                vad_prefetch_workers=1,
+                seed=0,
+            )
+
+        self.assertGreaterEqual(len(wait_calls), 1)
+        self.assertTrue(all(call == worker.PREFETCH_WAIT_ANY_TIMEOUT_SEC for call in wait_calls))
+        self.assertEqual(calls, ["a1", "a0"])
+
+    def test_fifo_scheduler_env_restores_head_of_queue_behavior(self):
+        entities = [
+            ArchiveEntity("s1", "a0", "prefix/0"),
+            ArchiveEntity("s1", "a1", "prefix/1"),
+        ]
+        calls = []
+
+        class FakePrefetcher(_FakePrefetcher):
+            def submit(self, entity, *, precompute_vad=False):
+                super().submit(entity, precompute_vad=precompute_vad)
+                if entity.archive_id == "a0":
+                    self._ready[(entity.session_id, entity.archive_id)] = False
+
+        def fake_run_all(*args, **kwargs):
+            calls.append(Path(kwargs["audio_source_key"]).stem)
+            return _fake_inference_result()
+
+        with patch.dict(
+            os.environ,
+            {worker.PREFETCH_SCHEDULER_ENV: worker.PREFETCH_SCHEDULER_FIFO},
+        ), _worker_patches(
+            entities,
+            prefetcher_cls=FakePrefetcher,
+            run_all_fn=fake_run_all,
+        ):
+            worker.run_worker(
+                parquet_path="manifest.parquet",
+                output_base=tempfile.mkdtemp(),
+                affect_backbone="wavlm",
+                disfluency_backbone="whisper",
+                prefetch_lookahead=2,
+                vad_prefetch_workers=1,
+                seed=0,
+            )
+
+        self.assertEqual(calls, ["a0", "a1"])
+
+    def test_shutdown_while_waiting_for_ready_prefetch_releases_claims(self):
+        entities = [
+            ArchiveEntity("s1", "a0", "prefix/0"),
+            ArchiveEntity("s1", "a1", "prefix/1"),
+        ]
+        released = []
+        calls = []
+
+        class FakePrefetcher(_FakePrefetcher):
+            def submit(self, entity, *, precompute_vad=False):
+                super().submit(entity, precompute_vad=precompute_vad)
+                self._ready[(entity.session_id, entity.archive_id)] = False
+
+            def wait_any(self, entities, timeout_sec=0.5):
+                signal.raise_signal(signal.SIGTERM)
+                return False
+
+        def fake_run_all(*args, **kwargs):
+            calls.append(Path(kwargs["audio_source_key"]).stem)
+            return _fake_inference_result()
+
+        with _worker_patches(
+            entities,
+            prefetcher_cls=FakePrefetcher,
+            release_claim_fn=lambda output_base, entity: released.append(entity.archive_id),
+            run_all_fn=fake_run_all,
+        ):
+            worker.run_worker(
+                parquet_path="manifest.parquet",
+                output_base=tempfile.mkdtemp(),
+                affect_backbone="wavlm",
+                disfluency_backbone="whisper",
+                prefetch_lookahead=2,
+                vad_prefetch_workers=1,
+                seed=0,
+            )
+
+        self.assertEqual(calls, [])
+        self.assertEqual(Counter(released), Counter({"a0": 1, "a1": 1}))
+
+    def test_timing_jsonl_is_success_path_only(self):
+        entity = ArchiveEntity("s1", "a1", "prefix")
+
+        def fake_run_all(*args, **kwargs):
+            raise RuntimeError("boom")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with _worker_patches([entity], run_all_fn=fake_run_all):
+                worker.run_worker(
+                    parquet_path="manifest.parquet",
+                    output_base=tmpdir,
+                    affect_backbone="wavlm",
+                    disfluency_backbone="whisper",
+                    prefetch_lookahead=1,
+                    vad_prefetch_workers=1,
+                )
+
+            timings_dir = Path(tmpdir) / "_meta" / "timings"
+            self.assertFalse(list(timings_dir.glob("*.jsonl")))
+
     def test_sync_vad_fallback_passes_model_vad(self):
         entity = ArchiveEntity("s1", "a1", "prefix")
         vad_detectors = []
@@ -421,25 +885,45 @@ class WorkerAsyncVadTest(unittest.TestCase):
             self.assertEqual(record["archive_id"], "a1")
             expected_fields = {
                 "worker_id", "session_id", "archive_id", "ts",
-                "audio_duration_sec", "prefetch_wait_sec",
-                "download_decode_sec", "vad_precompute_sec",
+                "s3_key", "audio_source_extension", "audio_object_size_bytes",
+                "audio_storage_class", "audio_duration_sec",
+                "prefetch_scheduler_wait_sec", "prefetch_get_wait_sec",
+                "prefetch_wait_sec", "decode_queue_wait_sec",
+                "download_decode_sec", "vad_queue_wait_sec",
+                "vad_precompute_sec", "prefetch_submit_to_ready_sec",
+                "prefetch_ready_age_sec",
                 "precomputed_vad", "vad_reused", "affect_reused",
                 "disfluency_reused", "emotion_reused",
                 "vad_sec", "affect_sec", "disfluency_sec", "emotion_sec",
                 "inference_sec", "total_sec",
             }
             self.assertTrue(expected_fields <= set(record.keys()))
-            for f in ("vad_sec", "affect_sec", "disfluency_sec", "emotion_sec",
-                       "inference_sec", "total_sec"):
+            for f in (
+                "prefetch_scheduler_wait_sec", "prefetch_get_wait_sec",
+                "prefetch_wait_sec", "decode_queue_wait_sec",
+                "download_decode_sec", "vad_queue_wait_sec",
+                "vad_precompute_sec", "prefetch_submit_to_ready_sec",
+                "prefetch_ready_age_sec", "vad_sec", "affect_sec",
+                "disfluency_sec", "emotion_sec", "inference_sec", "total_sec",
+            ):
                 self.assertIsInstance(record[f], (int, float))
 
 
 class _FakePrefetcher:
     def __init__(self, *args, **kwargs):
         self._precompute: dict[tuple[str, str], bool] = {}
+        self._ready: dict[tuple[str, str], bool] = {}
 
     def submit(self, entity, *, precompute_vad=False):
-        self._precompute[(entity.session_id, entity.archive_id)] = precompute_vad
+        key = (entity.session_id, entity.archive_id)
+        self._precompute[key] = precompute_vad
+        self._ready[key] = True
+
+    def is_ready(self, entity):
+        return self._ready.get((entity.session_id, entity.archive_id), False)
+
+    def wait_any(self, entities, timeout_sec=0.5):
+        return any(self.is_ready(entity) for entity in entities)
 
     def get(self, entity):
         precompute_vad = self._precompute[(entity.session_id, entity.archive_id)]
@@ -447,6 +931,7 @@ class _FakePrefetcher:
             audio=_fake_audio(entity.archive_id),
             s3_key=f"{entity.archive_id}.wav",
             vad_intervals=[(0.0, 0.5)] if precompute_vad else None,
+            ready_time=time.perf_counter(),
         )
 
     def discard(self, entity):
@@ -512,8 +997,8 @@ def _worker_patches(
     run_all_fn=None,
     handle_error_fn=None,
 ):
-    try_claim_fn = try_claim_fn or (lambda output_base, entity: True)
-    release_claim_fn = release_claim_fn or (lambda output_base, entity: None)
+    try_claim_fn = try_claim_fn or (lambda output_base, entity, **kwargs: True)
+    release_claim_fn = release_claim_fn or (lambda output_base, entity, **kwargs: None)
     task_complete_fn = task_complete_fn or (lambda *args, **kwargs: False)
     run_all_fn = run_all_fn or (lambda *args, **kwargs: _fake_inference_result())
     handle_error_fn = handle_error_fn or (lambda *args, **kwargs: None)

@@ -1,0 +1,72 @@
+config:
+  namespace: nlp-audio-understanding
+  team: nlp
+  project: audio-understanding
+  image: 690765672468.dkr.ecr.us-east-1.amazonaws.com/ai-content-provenance:latest
+  capacityType: on-demand
+  nodeSelector:
+    node.kubernetes.io/instance-type: g5.4xlarge
+  env:
+    CLEARML_WEB_HOST: http://clearml-webserver.clearml:8080
+    CLEARML_API_HOST: http://clearml-apiserver.clearml:8008
+    CLEARML_FILES_HOST: https://clearml-fileserver.ai-dev.riverside.fm
+    RS_OWNER: dvirbenor
+  ebs:
+    enabled: true
+    size: 1000Gi
+    persistent: false
+    mountPath: /workspace
+  s3Access:
+    enabled: true
+
+experiments:
+  - name: inference-affect-tighter
+    category: inference
+    description: Run affect acoustic-event inference on default g5.4xlarge
+    cmd: /bin/bash
+    args:
+      - -lc
+      - |
+        set -euo pipefail
+
+        export RUN_ID="{run_id}"
+        export PYTHONUNBUFFERED=1
+        export UV_LINK_MODE=copy
+
+        LOG_DIR="/efs/dvir/data/magic-clips-research/acoustic-understanding/models-inference/job-logs"
+        mkdir -p "$LOG_DIR"
+        LOG_FILE="$LOG_DIR/inference-affect-tight-run-${RUN_ID}-${HOSTNAME:-unknown}.log"
+        exec > >(tee -a "$LOG_FILE") 2>&1
+
+        echo "[$(date -Iseconds)] Starting inference-affect-tight run ${RUN_ID}"
+        cd /workspace
+
+        mkdir -p /workspace/.ssh
+        cp /mnt/github-ssh/id_ed25519 /workspace/.ssh/id_ed25519
+        cp /mnt/github-ssh/known_hosts /workspace/.ssh/known_hosts
+        chmod 700 /workspace/.ssh
+        chmod 400 /workspace/.ssh/id_ed25519
+        chmod 444 /workspace/.ssh/known_hosts
+        export GIT_SSH_COMMAND="ssh -i /workspace/.ssh/id_ed25519 -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=/workspace/.ssh/known_hosts"
+
+        rm -rf audio-classification-playground
+        git clone --branch main --single-branch git@github.com:dvirbenor/audio-classification-playground.git
+        cd audio-classification-playground
+        echo "Git commit: $(git rev-parse HEAD)"
+        uv sync --frozen
+        source .venv/bin/activate
+
+        source env.shared.sh
+        python -m audio_classification_playground.acoustic_events.orchestration run \
+          --parquet /efs/dvir/data/magic-clips-research/dataset-reference/all_archives.parquet \
+          --output /efs/dvir/data/magic-clips-research/acoustic-understanding/models-inference \
+          --task-group affect \
+          --completion-policy exists \
+          --affect-backbone wavlm \
+          --disfluency-backbone wavlm \
+          --device cuda \
+          --max-retries 3
+
+        echo "[$(date -Iseconds)] Finished inference-affect-tight run ${RUN_ID}"
+    grid:
+      run_id: [1, 2, 3, 4, 5, 6, 7, 8]

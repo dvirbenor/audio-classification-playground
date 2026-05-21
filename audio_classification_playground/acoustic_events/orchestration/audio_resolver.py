@@ -40,10 +40,27 @@ class AudioResolutionError:
     error_type: str  # "no_matching_file" | "glacier_storage_class" | "download_failed"
     detail: str = ""
     s3_key: str = ""
+    ready_time: float = 0.0
 
     @property
     def is_permanent(self) -> bool:
         return self.error_type == "no_matching_file"
+
+
+@dataclass(frozen=True)
+class AudioDownloadResult:
+    """Downloaded audio plus source metadata used for timing diagnostics."""
+
+    local_path: Path
+    s3_key: str
+    object_size_bytes: int | None = None
+    storage_class: str | None = None
+    source_extension: str = ""
+
+    def __iter__(self):
+        """Yield the legacy ``(local_path, s3_key)`` tuple shape."""
+        yield self.local_path
+        yield self.s3_key
 
 
 def _get_s3_client():
@@ -95,15 +112,20 @@ def download_audio(
     key: str,
     bucket: str = BUCKET,
     tmp_dir: str | None = None,
-) -> Path | AudioResolutionError:
+) -> AudioDownloadResult | AudioResolutionError:
     """Download a single S3 object, retrying transient failures.
 
-    Returns the local temp path on success, or an ``AudioResolutionError``
+    Returns ``AudioDownloadResult`` on success, or an ``AudioResolutionError``
     on resolution failure (Glacier storage class, exhausted retries, etc.).
     """
+    storage_class: str | None = None
+    object_size_bytes: int | None = None
     try:
         head = s3_client.head_object(Bucket=bucket, Key=key)
         storage_class = head.get("StorageClass", "STANDARD")
+        content_length = head.get("ContentLength")
+        if isinstance(content_length, int):
+            object_size_bytes = content_length
         restore_status = head.get("Restore", "")
         if storage_class in ("GLACIER", "DEEP_ARCHIVE") and 'ongoing-request="false"' not in restore_status:
             return AudioResolutionError(
@@ -126,7 +148,13 @@ def download_audio(
     for attempt in range(_MAX_DOWNLOAD_RETRIES):
         try:
             s3_client.download_file(bucket, key, str(tmp_path))
-            return tmp_path
+            return AudioDownloadResult(
+                local_path=tmp_path,
+                s3_key=key,
+                object_size_bytes=object_size_bytes,
+                storage_class=storage_class,
+                source_extension=(Path(key).suffix or suffix).lower(),
+            )
         except Exception as exc:
             last_exc = exc
             if attempt < _MAX_DOWNLOAD_RETRIES - 1:
@@ -155,10 +183,10 @@ def resolve_and_download(
     s3_client=None,
     bucket: str = BUCKET,
     tmp_dir: str | None = None,
-) -> tuple[Path, str] | AudioResolutionError:
+) -> AudioDownloadResult | AudioResolutionError:
     """Resolve the best audio key and download it.
 
-    Returns ``(local_path, s3_key)`` on success, or an
+    Returns ``AudioDownloadResult`` on success, or an
     ``AudioResolutionError`` populated with entity identifiers.
     """
     if s3_client is None:
@@ -187,4 +215,4 @@ def resolve_and_download(
             s3_key=dl_result.s3_key,
         )
 
-    return dl_result, chosen_key
+    return dl_result

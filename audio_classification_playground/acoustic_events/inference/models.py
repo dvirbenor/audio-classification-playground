@@ -572,7 +572,11 @@ class ModelSuite:
         tasks_to_load: Sequence[str] | None = None,
     ) -> None:
         configure_torch_matmul(allow_tf32=allow_tf32)
-        tasks = set(tasks_to_load or ("affect", "disfluency", "emotion"))
+        tasks = set(
+            ("affect", "disfluency", "emotion")
+            if tasks_to_load is None
+            else tasks_to_load
+        )
         emotion_settings = resolve_emotion_runtime_settings(
             mode=emotion_runtime_mode,
             default_mode="auto",
