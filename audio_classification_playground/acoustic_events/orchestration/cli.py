@@ -114,19 +114,28 @@ def _cmd_run(args: argparse.Namespace) -> None:
 
 
 def _print_full_progress(args: argparse.Namespace) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+
     from .errors import load_inference_attempt_counts, load_permanent_error_set
     from .manifest import load_manifest
     from .progress import scan_progress
 
     output_base = Path(args.output)
-    entities = load_manifest(args.parquet)
-    perm_errors = load_permanent_error_set(output_base)
-    inf_errors = load_inference_attempt_counts(output_base)
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        entities_future = pool.submit(load_manifest, args.parquet)
+        perm_errors_future = pool.submit(load_permanent_error_set, output_base)
+        inf_errors_future = pool.submit(load_inference_attempt_counts, output_base)
+
+    entities = entities_future.result()
+    perm_errors = perm_errors_future.result()
+    inf_errors = inf_errors_future.result()
 
     summary = scan_progress(
         output_base, entities,
         permanent_audio_errors=perm_errors,
         inference_error_counts=dict(inf_errors),
+        use_cache=not getattr(args, "no_cache", False),
     )
     lines = [
         f"Total entities:          {summary.total_entities}",
@@ -477,6 +486,8 @@ def main(argv: list[str] | None = None) -> None:
     p_progress.add_argument("--output", required=True)
     p_progress.add_argument("--fast", action="store_true",
                             help="Quick disk-only summary without loading the manifest")
+    p_progress.add_argument("--no-cache", action="store_true",
+                            help="Bypass completion cache and re-verify all archives on disk")
 
     # --- errors ---
     p_errors = sub.add_parser("errors", help="List error records")

@@ -9,10 +9,13 @@ Two flavours of completion check:
   by the worker loop to avoid reusing stale artifacts produced with a
   different backbone, batch size, or model.
 
-Progress scanning uses ``find(1)`` to collect artifact paths in a single
-subprocess, falling back to ``os.scandir`` when ``find`` is unavailable.
-This keeps cost proportional to *work completed on disk* and minimises
-network round-trips on EFS.
+Manifest-backed progress scanning (``scan_progress``) checks only the
+entities listed in the parquet via a thread pool of concurrent
+``stat`` / ``readdir`` calls.  This avoids walking the entire output tree
+and parallelises I/O against EFS.
+
+The parquet-free ``quick_disk_summary`` still uses ``find(1)`` (falling
+back to ``os.scandir``) since it has no entity list to target.
 """
 from __future__ import annotations
 
@@ -353,6 +356,121 @@ def _walk_completed_tasks(output_base: Path) -> dict[tuple[str, str], set[str]]:
 
 
 # ---------------------------------------------------------------------------
+# Targeted parallel entity check (manifest-backed progress)
+# ---------------------------------------------------------------------------
+
+_PARALLEL_WORKERS = 64
+
+
+def _check_entity_completion(
+    base_str: str,
+    sid: str,
+    aid: str,
+) -> tuple[str, str, frozenset[str]]:
+    """Check which tasks are complete for one ``(session_id, archive_id)``.
+
+    Uses string paths and ``os.path`` to avoid ``Path`` object overhead
+    when called from a thread pool over many entities.
+    """
+    archive_path = f"{base_str}/{sid}/{aid}"
+    try:
+        if not os.path.isdir(archive_path):
+            return (sid, aid, frozenset())
+    except OSError:
+        return (sid, aid, frozenset())
+    done: set[str] = set()
+    for task in TASKS:
+        if _is_task_complete_via_scandir(f"{archive_path}/{task}"):
+            done.add(task)
+    return (sid, aid, frozenset(done))
+
+
+def _check_entities_parallel(
+    output_base: Path,
+    entity_keys: list[tuple[str, str]],
+    max_workers: int = _PARALLEL_WORKERS,
+) -> dict[tuple[str, str], set[str]]:
+    """Check task completion for known entities using parallel I/O.
+
+    Issues concurrent ``stat`` / ``readdir`` calls against EFS via a thread
+    pool, replacing the single-threaded ``find(1)`` tree walk.  Only
+    probes paths for entities listed in the manifest — avoids scanning
+    the entire output tree.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    if not entity_keys:
+        return {}
+
+    base_str = str(output_base)
+    result: dict[tuple[str, str], set[str]] = {}
+
+    pool_size = min(max_workers, len(entity_keys))
+    with ThreadPoolExecutor(max_workers=pool_size) as pool:
+        futures = {
+            pool.submit(_check_entity_completion, base_str, sid, aid): (sid, aid)
+            for sid, aid in entity_keys
+        }
+        for future in as_completed(futures):
+            try:
+                sid, aid, done = future.result()
+                if done:
+                    result[(sid, aid)] = set(done)
+            except Exception:
+                pass
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Completion cache
+# ---------------------------------------------------------------------------
+
+_PROGRESS_CACHE = "_meta/progress_complete.txt"
+
+
+def _load_completion_cache(output_base: Path) -> set[tuple[str, str]]:
+    """Load the set of ``(session_id, archive_id)`` previously verified as
+    fully complete (all 4 tasks present).
+
+    The cache is a simple line-oriented text file stored inside the output
+    tree.  Returns an empty set on any read error.
+    """
+    cache_path = output_base / _PROGRESS_CACHE
+    try:
+        text = cache_path.read_text(encoding="utf-8")
+    except (OSError, FileNotFoundError):
+        return set()
+    result: set[tuple[str, str]] = set()
+    for line in text.splitlines():
+        parts = line.split("\t", 1)
+        if len(parts) == 2:
+            result.add((parts[0], parts[1]))
+    return result
+
+
+def _save_completion_cache(
+    output_base: Path,
+    complete: set[tuple[str, str]],
+) -> None:
+    """Atomically persist the set of fully-complete archives."""
+    cache_path = output_base / _PROGRESS_CACHE
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = cache_path.with_suffix(".tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            for sid, aid in sorted(complete):
+                f.write(f"{sid}\t{aid}\n")
+        os.replace(str(tmp), str(cache_path))
+    except OSError as exc:
+        LOGGER.warning("Could not write progress cache: %s", exc)
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+# ---------------------------------------------------------------------------
 # Full progress scan (manifest-backed)
 # ---------------------------------------------------------------------------
 
@@ -362,26 +480,63 @@ def scan_progress(
     entities: list,
     permanent_audio_errors: set[tuple[str, str]] | None = None,
     inference_error_counts: dict[tuple[str, str], int] | None = None,
+    *,
+    use_cache: bool = True,
 ) -> ProgressSummary:
     """Generate a comprehensive progress summary over all entities.
 
-    Walks the output tree once, then classifies each entity via in-memory
-    set lookups.  Semantics (skip order, field definitions) are identical
-    to the original per-entity probe implementation.
+    Checks only the entities listed in the manifest using parallel I/O,
+    then classifies each via in-memory set lookups.  When *use_cache* is
+    True (default), archives previously verified as fully complete are
+    read from a lightweight disk cache and not re-checked on EFS — this
+    makes repeated progress calls progressively faster as work completes.
+
+    Pass ``use_cache=False`` (CLI ``--no-cache``) to force a full re-scan.
     """
-    from .locking import LOCKS_DIR
+    from .locking import iter_lock_files
 
     perm_errors = permanent_audio_errors or set()
     inf_errors = inference_error_counts or {}
 
     locked_set: set[str] = set()
-    from .locking import iter_lock_files
-
     for lf in iter_lock_files(output_base):
         locked_set.add(lf.stem)
 
-    completed_map = _walk_completed_tasks(output_base)
+    entity_keys = [(e.session_id, e.archive_id) for e in entities]
+    entity_key_set = set(entity_keys)
 
+    # --- completion cache ---------------------------------------------------
+    cached_complete: set[tuple[str, str]] = set()
+    if use_cache:
+        cached_complete = _load_completion_cache(output_base) & entity_key_set
+
+    keys_to_check = [k for k in entity_keys if k not in cached_complete]
+    LOGGER.info(
+        "Progress scan: %d entities, %d cached-complete, %d to verify on disk",
+        len(entity_keys),
+        len(cached_complete),
+        len(keys_to_check),
+    )
+
+    new_completed = _check_entities_parallel(output_base, keys_to_check)
+
+    # Merge cached + freshly verified
+    completed_map: dict[tuple[str, str], set[str]] = {}
+    for key in cached_complete:
+        completed_map[key] = set(TASKS)
+    completed_map.update(new_completed)
+
+    # Persist newly-discovered complete archives
+    newly_complete = {k for k, v in new_completed.items() if len(v) == len(TASKS)}
+    if use_cache and newly_complete:
+        _save_completion_cache(output_base, cached_complete | newly_complete)
+        LOGGER.info(
+            "Progress cache updated: %d newly complete, %d total cached",
+            len(newly_complete),
+            len(cached_complete) + len(newly_complete),
+        )
+
+    # --- classify entities --------------------------------------------------
     summary = ProgressSummary(total_entities=len(entities))
     task_counts: dict[str, int] = {t: 0 for t in TASKS}
 

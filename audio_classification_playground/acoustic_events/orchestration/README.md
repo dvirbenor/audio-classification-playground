@@ -159,6 +159,7 @@ python -m audio_classification_playground.acoustic_events.orchestration reclaim-
         <uuid>.json
     timings/
       <worker_id>.jsonl
+    progress_complete.txt
 ```
 
 ### Processing Flow
@@ -192,8 +193,9 @@ python -m audio_classification_playground.acoustic_events.orchestration reclaim-
   errors remain per-attempt and are task-scoped in fleet mode.
 - **Progress**: Derived from task artifact existence. A task is complete when
   `manifest.json` and `predictions.npz` exist and the manifest status is
-  `complete`. The scanner walks only directories that exist on disk, keeping
-  cost proportional to work done.
+  `complete`. The `--parquet` scanner checks only entities listed in the
+  manifest using parallel I/O (64 threads), and caches fully-complete
+  archives in `_meta/progress_complete.txt` so subsequent calls skip them.
 
 ### Error Handling
 
@@ -457,8 +459,11 @@ python -m audio_classification_playground.acoustic_events.orchestration progress
     --output  /efs/.../models-inference
 ```
 
-This uses the same walk-based scanner internally, so it is dramatically
-faster than the original per-entity probe approach.
+This checks only the entities from the parquet using 64 parallel threads
+against EFS.  Fully-complete archives are cached in
+`_meta/progress_complete.txt` and skipped on subsequent runs, so repeated
+calls get progressively faster as work completes.  Use `--no-cache` to
+force a full re-scan if needed.
 
 ### Grouped error summary (`--group`)
 
