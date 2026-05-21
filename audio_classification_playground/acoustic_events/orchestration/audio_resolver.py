@@ -41,6 +41,9 @@ class AudioResolutionError:
     detail: str = ""
     s3_key: str = ""
     ready_time: float = 0.0
+    resolve_sec: float = 0.0
+    head_sec: float = 0.0
+    download_sec: float = 0.0
 
     @property
     def is_permanent(self) -> bool:
@@ -56,6 +59,9 @@ class AudioDownloadResult:
     object_size_bytes: int | None = None
     storage_class: str | None = None
     source_extension: str = ""
+    resolve_sec: float = 0.0
+    head_sec: float = 0.0
+    download_sec: float = 0.0
 
     def __iter__(self):
         """Yield the legacy ``(local_path, s3_key)`` tuple shape."""
@@ -120,8 +126,11 @@ def download_audio(
     """
     storage_class: str | None = None
     object_size_bytes: int | None = None
+    head_sec = 0.0
     try:
+        head_started = time.perf_counter()
         head = s3_client.head_object(Bucket=bucket, Key=key)
+        head_sec = time.perf_counter() - head_started
         storage_class = head.get("StorageClass", "STANDARD")
         content_length = head.get("ContentLength")
         if isinstance(content_length, int):
@@ -135,8 +144,11 @@ def download_audio(
                 error_type="glacier_storage_class",
                 detail=f"s3://{bucket}/{key} is in {storage_class}",
                 s3_key=key,
+                head_sec=head_sec,
             )
     except Exception as exc:
+        if head_sec == 0.0:
+            head_sec = time.perf_counter() - head_started
         LOGGER.warning("head_object failed for %s: %s", key, exc)
 
     suffix = Path(key).suffix or ".wav"
@@ -145,15 +157,19 @@ def download_audio(
     tmp_path = Path(tmp_path_str)
 
     last_exc: Exception | None = None
+    download_started = time.perf_counter()
     for attempt in range(_MAX_DOWNLOAD_RETRIES):
         try:
             s3_client.download_file(bucket, key, str(tmp_path))
+            download_sec = time.perf_counter() - download_started
             return AudioDownloadResult(
                 local_path=tmp_path,
                 s3_key=key,
                 object_size_bytes=object_size_bytes,
                 storage_class=storage_class,
                 source_extension=(Path(key).suffix or suffix).lower(),
+                head_sec=head_sec,
+                download_sec=download_sec,
             )
         except Exception as exc:
             last_exc = exc
@@ -173,6 +189,8 @@ def download_audio(
         error_type="download_failed",
         detail=f"s3://{bucket}/{key}: {last_exc}",
         s3_key=key,
+        head_sec=head_sec,
+        download_sec=time.perf_counter() - download_started,
     )
 
 
@@ -192,7 +210,9 @@ def resolve_and_download(
     if s3_client is None:
         s3_client = _get_s3_client()
 
+    resolve_started = time.perf_counter()
     result = resolve_audio_key(s3_client, file_parent_dir, bucket=bucket)
+    resolve_sec = time.perf_counter() - resolve_started
     if isinstance(result, AudioResolutionError):
         return AudioResolutionError(
             session_id=session_id,
@@ -201,6 +221,7 @@ def resolve_and_download(
             error_type=result.error_type,
             detail=result.detail,
             s3_key=result.s3_key,
+            resolve_sec=resolve_sec,
         )
 
     chosen_key = result
@@ -213,6 +234,10 @@ def resolve_and_download(
             error_type=dl_result.error_type,
             detail=dl_result.detail,
             s3_key=dl_result.s3_key,
+            resolve_sec=resolve_sec,
+            head_sec=dl_result.head_sec,
+            download_sec=dl_result.download_sec,
         )
 
+    object.__setattr__(dl_result, "resolve_sec", resolve_sec)
     return dl_result

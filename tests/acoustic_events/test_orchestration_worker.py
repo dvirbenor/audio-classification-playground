@@ -126,6 +126,40 @@ class WorkerAsyncVadTest(unittest.TestCase):
         self.assertEqual(model_kwargs[0]["disfluency_batch_size"], 512)
         self.assertEqual(model_kwargs[0]["emotion_batch_size"], 64)
 
+    def test_audio_cache_is_opt_in_and_requires_capacity(self):
+        entity = ArchiveEntity("s1", "a1", "prefix")
+        prefetch_kwargs = []
+
+        class FakePrefetcher(_FakePrefetcher):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                prefetch_kwargs.append(kwargs)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with _worker_patches([entity], prefetcher_cls=FakePrefetcher):
+                with self.assertRaisesRegex(ValueError, "max_cache_bytes"):
+                    worker.run_worker(
+                        parquet_path="manifest.parquet",
+                        output_base=tmpdir,
+                        affect_backbone="wavlm",
+                        disfluency_backbone="whisper",
+                        audio_cache_dir=Path(tmpdir) / "cache",
+                    )
+
+            with _worker_patches([entity], prefetcher_cls=FakePrefetcher):
+                worker.run_worker(
+                    parquet_path="manifest.parquet",
+                    output_base=tmpdir,
+                    affect_backbone="wavlm",
+                    disfluency_backbone="whisper",
+                    prefetch_lookahead=1,
+                    vad_prefetch_workers=1,
+                    audio_cache_dir=Path(tmpdir) / "cache",
+                    max_cache_bytes=10_000_000,
+                )
+
+        self.assertIsNotNone(prefetch_kwargs[0]["audio_cache"])
+
     def test_expected_configs_auto_runtime_records_optimized_emotion_on_cuda(self):
         with patch("torch.cuda.is_available", return_value=True), patch.object(
             worker,
@@ -887,9 +921,14 @@ class WorkerAsyncVadTest(unittest.TestCase):
                 "worker_id", "session_id", "archive_id", "ts",
                 "s3_key", "audio_source_extension", "audio_object_size_bytes",
                 "audio_storage_class", "audio_duration_sec",
+                "audio_cache_enabled", "audio_cache_payload_type",
+                "resolution_cache_hit", "object_cache_hit", "cache_write",
+                "cache_fallback", "cache_fallback_reason", "decoded_bytes",
                 "prefetch_scheduler_wait_sec", "prefetch_get_wait_sec",
                 "prefetch_wait_sec", "decode_queue_wait_sec",
-                "download_decode_sec", "vad_queue_wait_sec",
+                "download_decode_sec", "resolve_sec", "head_sec",
+                "download_sec", "decode_sec", "cache_wait_sec",
+                "vad_queue_wait_sec",
                 "vad_precompute_sec", "prefetch_submit_to_ready_sec",
                 "prefetch_ready_age_sec",
                 "precomputed_vad", "vad_reused", "affect_reused",
@@ -901,7 +940,9 @@ class WorkerAsyncVadTest(unittest.TestCase):
             for f in (
                 "prefetch_scheduler_wait_sec", "prefetch_get_wait_sec",
                 "prefetch_wait_sec", "decode_queue_wait_sec",
-                "download_decode_sec", "vad_queue_wait_sec",
+                "download_decode_sec", "resolve_sec", "head_sec",
+                "download_sec", "decode_sec", "cache_wait_sec",
+                "decoded_bytes", "vad_queue_wait_sec",
                 "vad_precompute_sec", "prefetch_submit_to_ready_sec",
                 "prefetch_ready_age_sec", "vad_sec", "affect_sec",
                 "disfluency_sec", "emotion_sec", "inference_sec", "total_sec",

@@ -56,6 +56,26 @@ python -m audio_classification_playground.acoustic_events.orchestration run \
     --vad-prefetch-workers 1 \
     --device cpu
 
+# Optional shared decoded-audio cache: start one warmer, then launch workers
+# with the same cache directory and cap.
+python -m audio_classification_playground.acoustic_events.orchestration warm-cache \
+    --parquet /efs/dvir/data/magic-clips-research/dataset-reference/all_archives.parquet \
+    --output  /efs/dvir/data/magic-clips-research/acoustic-understanding/models-inference \
+    --audio-cache-dir /efs/dvir/data/magic-clips-research/acoustic-understanding/models-inference/_meta/audio_cache \
+    --max-cache-bytes 1099511627776 \
+    --seed 123
+
+python -m audio_classification_playground.acoustic_events.orchestration run \
+    --parquet /efs/dvir/data/magic-clips-research/dataset-reference/all_archives.parquet \
+    --output  /efs/dvir/data/magic-clips-research/acoustic-understanding/models-inference \
+    --task-group affect \
+    --affect-backbone wavlm \
+    --disfluency-backbone wavlm \
+    --device cuda \
+    --seed 123 \
+    --audio-cache-dir /efs/dvir/data/magic-clips-research/acoustic-understanding/models-inference/_meta/audio_cache \
+    --max-cache-bytes 1099511627776
+
 # Quick pulse check — no parquet needed, finishes in seconds
 python -m audio_classification_playground.acoustic_events.orchestration progress \
     --output /efs/dvir/data/magic-clips-research/acoustic-understanding/models-inference \

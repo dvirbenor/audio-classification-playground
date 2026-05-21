@@ -101,6 +101,9 @@ def _cmd_run(args: argparse.Namespace) -> None:
         prefetch_workers=args.prefetch_workers,
         prefetch_lookahead=args.prefetch_lookahead,
         vad_prefetch_workers=args.vad_prefetch_workers,
+        audio_cache_dir=args.audio_cache_dir,
+        max_cache_bytes=args.max_cache_bytes,
+        audio_cache_lock_stale_minutes=args.audio_cache_lock_stale_minutes,
         task_group=args.task_group,
         completion_policy=args.completion_policy,
         force_recompute=args.force_recompute,
@@ -368,6 +371,20 @@ def _cmd_reclaim_stale(args: argparse.Namespace) -> None:
     print(f"Reclaimed {reclaimed} stale locks")
 
 
+def _cmd_warm_cache(args: argparse.Namespace) -> None:
+    from .cache_warmer import warm_cache
+
+    warm_cache(
+        parquet_path=args.parquet,
+        output_base=args.output,
+        audio_cache_dir=args.audio_cache_dir,
+        max_cache_bytes=args.max_cache_bytes,
+        seed=args.seed,
+        max_inference_attempts=args.max_retries,
+        audio_cache_lock_stale_minutes=args.audio_cache_lock_stale_minutes,
+    )
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         prog="acoustic-orchestration",
@@ -455,6 +472,24 @@ def main(argv: list[str] | None = None) -> None:
     p_run.add_argument("--prefetch-workers", type=int, default=None)
     p_run.add_argument("--prefetch-lookahead", type=int, default=None)
     p_run.add_argument("--vad-prefetch-workers", type=int, default=None)
+    p_run.add_argument(
+        "--audio-cache-dir",
+        type=Path,
+        default=None,
+        help="Enable shared decoded-audio cache at this directory.",
+    )
+    p_run.add_argument(
+        "--max-cache-bytes",
+        type=int,
+        default=None,
+        help="Required with --audio-cache-dir; shared decoded cache cap.",
+    )
+    p_run.add_argument(
+        "--audio-cache-lock-stale-minutes",
+        type=float,
+        default=60.0,
+        help="Minutes before abandoned cache locks may be reclaimed.",
+    )
     from .task_groups import task_group_choices
     p_run.add_argument("--task-group", choices=task_group_choices(), default="all")
     p_run.add_argument(
@@ -525,6 +560,21 @@ def main(argv: list[str] | None = None) -> None:
     p_reclaim.add_argument("--older-than", type=float, default=60.0,
                            help="Minutes since lock creation (default: 60)")
 
+    # --- warm-cache ---
+    p_warm = sub.add_parser("warm-cache", help="Warm the shared decoded-audio cache")
+    p_warm.add_argument("--parquet", required=True, help="Path to all_archives.parquet")
+    p_warm.add_argument("--output", required=True, help="EFS output base directory")
+    p_warm.add_argument("--audio-cache-dir", type=Path, required=True)
+    p_warm.add_argument("--max-cache-bytes", type=int, required=True)
+    p_warm.add_argument("--seed", type=int, default=None)
+    p_warm.add_argument("--max-retries", type=int, default=3)
+    p_warm.add_argument(
+        "--audio-cache-lock-stale-minutes",
+        type=float,
+        default=60.0,
+        help="Minutes before abandoned cache locks may be reclaimed.",
+    )
+
     args = parser.parse_args(argv)
     _validate_emotion_runtime_args(parser, args)
     _validate_wavlm_runtime_args(parser, args)
@@ -546,6 +596,7 @@ def main(argv: list[str] | None = None) -> None:
         "timings": _cmd_timings,
         "status": _cmd_status,
         "reclaim-stale": _cmd_reclaim_stale,
+        "warm-cache": _cmd_warm_cache,
     }
     handlers[args.command](args)
 

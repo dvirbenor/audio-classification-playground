@@ -58,6 +58,7 @@ from ..inference.wavlm_runtime import (
     resolve_wavlm_runtime_settings,
 )
 from .audio_resolver import AudioResolutionError, BUCKET
+from .audio_cache import SharedAudioCache
 from .errors import (
     append_audio_error,
     append_inference_error,
@@ -405,6 +406,9 @@ def run_worker(
     prefetch_workers: int | None = None,
     prefetch_lookahead: int | None = None,
     vad_prefetch_workers: int | None = None,
+    audio_cache_dir: str | Path | None = None,
+    max_cache_bytes: int | None = None,
+    audio_cache_lock_stale_minutes: float = 60.0,
     task_group: str = TASK_GROUP_ALL,
     completion_policy: str = COMPLETION_POLICY_EXISTS,
     force_recompute: bool = False,
@@ -428,6 +432,10 @@ def run_worker(
         raise ValueError("prefetch_lookahead must be >= 1")
     if vad_prefetch_workers < 0:
         raise ValueError("vad_prefetch_workers must be >= 0")
+    if audio_cache_dir is not None and max_cache_bytes is None:
+        raise ValueError("max_cache_bytes is required when audio_cache_dir is set")
+    if max_cache_bytes is not None and max_cache_bytes <= 0:
+        raise ValueError("max_cache_bytes must be > 0")
     prefetch_scheduler = os.environ.get(
         PREFETCH_SCHEDULER_ENV,
         PREFETCH_SCHEDULER_READY_FIRST,
@@ -607,12 +615,23 @@ def run_worker(
 
     LOGGER.info("Persistent inference models loaded")
 
+    audio_cache = None
+    if audio_cache_dir is not None:
+        audio_cache = SharedAudioCache(
+            audio_cache_dir,
+            sample_rate=sample_rate,
+            max_cache_bytes=int(max_cache_bytes),
+            stale_lock_minutes=audio_cache_lock_stale_minutes,
+            bucket=BUCKET,
+        )
+
     prefetcher = Prefetcher(
         sample_rate=sample_rate,
         max_workers=prefetch_workers,
         vad_workers=vad_prefetch_workers,
         vad_detector_factory=_new_vad_detector,
         bucket=BUCKET,
+        audio_cache=audio_cache,
     )
 
     rng = random.Random(seed)
@@ -921,6 +940,14 @@ def run_worker(
                     "audio_object_size_bytes": pf_result.audio_object_size_bytes,
                     "audio_storage_class": pf_result.audio_storage_class,
                     "audio_duration_sec": pf_result.audio.duration_sec,
+                    "audio_cache_enabled": pf_result.audio_cache_enabled,
+                    "audio_cache_payload_type": pf_result.audio_cache_payload_type,
+                    "resolution_cache_hit": pf_result.resolution_cache_hit,
+                    "object_cache_hit": pf_result.object_cache_hit,
+                    "cache_write": pf_result.cache_write,
+                    "cache_fallback": pf_result.cache_fallback,
+                    "cache_fallback_reason": pf_result.cache_fallback_reason,
+                    "decoded_bytes": pf_result.decoded_bytes,
                     "wavlm_runtime_preset": wavlm_settings.preset,
                     "wavlm_static_batch": wavlm_settings.static_batch,
                     "wavlm_batch_size": (
@@ -935,6 +962,11 @@ def run_worker(
                     "prefetch_wait_sec": prefetch_wait_sec,
                     "decode_queue_wait_sec": pf_result.timings.decode_queue_wait_sec,
                     "download_decode_sec": pf_result.timings.download_decode_sec,
+                    "resolve_sec": pf_result.timings.resolve_sec,
+                    "head_sec": pf_result.timings.head_sec,
+                    "download_sec": pf_result.timings.download_sec,
+                    "decode_sec": pf_result.timings.decode_sec,
+                    "cache_wait_sec": pf_result.timings.cache_wait_sec,
                     "vad_queue_wait_sec": pf_result.timings.vad_queue_wait_sec,
                     "vad_precompute_sec": pf_result.timings.vad_sec,
                     "prefetch_submit_to_ready_sec": (

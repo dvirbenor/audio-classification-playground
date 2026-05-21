@@ -4,8 +4,8 @@ config:
   project: audio-understanding
   image: 690765672468.dkr.ecr.us-east-1.amazonaws.com/ai-content-provenance:latest
   capacityType: on-demand
-  nodeSelector:
-    node.kubernetes.io/instance-type: c6a.4xlarge
+  ephemeralStorage: "10Gi"
+  instanceTypes: ["c6a.4xlarge", "c7a.4xlarge", "c6i.4xlarge", "c7i.4xlarge"]
   env:
     CLEARML_WEB_HOST: http://clearml-webserver.clearml:8080
     CLEARML_API_HOST: http://clearml-apiserver.clearml:8008
@@ -22,7 +22,14 @@ config:
 experiments:
   - name: inference-vad-cpu
     category: inference
-    description: Run CPU-only VAD acoustic-event extraction on c6a.4xlarge
+    description: Run CPU-only VAD acoustic-event extraction on compute-optimized 4xlarge
+    resources:
+      requests:
+        cpu: "13"
+        memory: "24Gi"
+      limits:
+        cpu: "13"
+        memory: "24Gi"
     cmd: /bin/bash
     args:
       - -lc
