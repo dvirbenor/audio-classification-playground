@@ -76,9 +76,10 @@ experiments:
           --audio-cache-dir "$AUDIO_CACHE" \
           --max-cache-bytes "$CACHE_BYTES" \
           --seed "$SEED" \
-          --warm-workers 10 \
+          --warm-workers 8 \
+          --s3-max-pool-connections 64 \
           --max-retries 3
 
         echo "[$(date -Iseconds)] Finished acoustic-cache-warmer run ${RUN_ID}"
     grid:
-      run_id: [1, 2]
+      run_id: [1]

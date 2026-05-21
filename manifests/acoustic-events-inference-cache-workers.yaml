@@ -197,8 +197,8 @@ experiments:
           --affect-backbone wavlm \
           --disfluency-backbone wavlm \
           --device cuda \
-          --prefetch-workers 14 \
-          --prefetch-lookahead 28 \
+          --prefetch-workers 8 \
+          --prefetch-lookahead 16 \
           --vad-prefetch-workers 0 \
           --max-retries 3 \
           --seed "$SEED" \
@@ -269,8 +269,8 @@ experiments:
           --affect-backbone wavlm \
           --disfluency-backbone wavlm \
           --device cpu \
-          --prefetch-workers 10 \
-          --prefetch-lookahead 24 \
+          --prefetch-workers 6 \
+          --prefetch-lookahead 12 \
           --vad-prefetch-workers 1 \
           --max-retries 3 \
           --seed "$SEED" \

@@ -392,6 +392,7 @@ def _cmd_warm_cache(args: argparse.Namespace) -> None:
         max_inference_attempts=args.max_retries,
         audio_cache_lock_stale_minutes=args.audio_cache_lock_stale_minutes,
         warm_workers=args.warm_workers,
+        s3_max_pool_connections=args.s3_max_pool_connections,
         once=args.once,
     )
 
@@ -586,6 +587,15 @@ def main(argv: list[str] | None = None) -> None:
         type=int,
         default=4,
         help="Concurrent cache materialization workers inside the warmer pod.",
+    )
+    p_warm.add_argument(
+        "--s3-max-pool-connections",
+        type=int,
+        default=None,
+        help=(
+            "S3 HTTP connection pool for the warmer. Default is "
+            "max(64, warm_workers * 4)."
+        ),
     )
     p_warm.add_argument(
         "--once",

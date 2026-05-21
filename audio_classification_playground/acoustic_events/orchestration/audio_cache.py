@@ -98,6 +98,7 @@ class SharedAudioCache:
         s3_client=None,
         bucket: str = BUCKET,
         poll_sec: float = _POLL_SEC,
+        s3_max_pool_connections: int = 64,
     ) -> None:
         if max_cache_bytes <= 0:
             raise ValueError("max_cache_bytes must be > 0")
@@ -110,6 +111,7 @@ class SharedAudioCache:
         self._s3_client = s3_client
         self.bucket = bucket
         self.poll_sec = float(poll_sec)
+        self.s3_max_pool_connections = int(s3_max_pool_connections)
 
     def get_decoded_audio(
         self,
@@ -137,7 +139,16 @@ class SharedAudioCache:
         if hit is not None:
             return hit
 
-        if self._current_cache_bytes() >= self.max_cache_bytes:
+        current_cache_bytes = self._current_cache_bytes()
+        if current_cache_bytes >= self.max_cache_bytes:
+            LOGGER.info(
+                "Decoded audio cache fallback: reason=cache_full entity=%s "
+                "cache_bytes=%d/%d s3_key=%s",
+                _entity_label(entity),
+                current_cache_bytes,
+                self.max_cache_bytes,
+                resolved.s3_key,
+            )
             return self._download_decode_without_cache(
                 entity,
                 resolved,
@@ -244,7 +255,7 @@ class SharedAudioCache:
                     return cached
 
             if self._s3_client is None:
-                self._s3_client = _get_s3_client()
+                self._s3_client = _get_s3_client(self.s3_max_pool_connections)
 
             started = time.perf_counter()
             result = resolve_audio_key(
@@ -271,6 +282,13 @@ class SharedAudioCache:
                         "detail": error.detail,
                         "created_at": time.time(),
                     })
+                    LOGGER.info(
+                        "Resolution cache permanent sentinel: entity=%s "
+                        "file_parent_dir=%s detail=%s",
+                        _entity_label(entity),
+                        entity.file_parent_dir,
+                        error.detail,
+                    )
                 return error
 
             resolved = _ResolvedAudio(
@@ -287,6 +305,12 @@ class SharedAudioCache:
                 "source_extension": resolved.source_extension,
                 "created_at": time.time(),
             })
+            LOGGER.debug(
+                "Resolution cache write: entity=%s s3_key=%s resolve_sec=%.3f",
+                _entity_label(entity),
+                resolved.s3_key,
+                resolve_sec,
+            )
             return resolved
         finally:
             self._release_lock(lock_path)
@@ -364,12 +388,30 @@ class SharedAudioCache:
                     removed_objects += 1
                     removed_bytes += removed
 
-        return CleanupSummary(
+        summary = CleanupSummary(
             removed_objects=removed_objects,
             removed_bytes=removed_bytes,
             removed_locks=removed_locks,
             removed_temps=removed_temps,
         )
+        if any((
+            summary.removed_objects,
+            summary.removed_bytes,
+            summary.removed_locks,
+            summary.removed_temps,
+        )):
+            LOGGER.info(
+                "Decoded audio cache cleanup: removed_objects=%d "
+                "removed_bytes=%d removed_locks=%d removed_temps=%d "
+                "cache_bytes=%d/%d",
+                summary.removed_objects,
+                summary.removed_bytes,
+                summary.removed_locks,
+                summary.removed_temps,
+                self.cache_bytes(),
+                self.max_cache_bytes,
+            )
+        return summary
 
     def reclaim_stale(self) -> tuple[int, int]:
         """Remove stale cache locks and temp files."""
@@ -393,6 +435,12 @@ class SharedAudioCache:
             if shard_dir is not None:
                 removed_temps += self._remove_stale_temps(shard_dir, cutoff)
         removed_temps += self._remove_stale_temps(self._object_root(), cutoff)
+        if removed_locks or removed_temps:
+            LOGGER.info(
+                "Decoded audio cache reclaimed stale state: locks=%d temps=%d",
+                removed_locks,
+                removed_temps,
+            )
         return removed_locks, removed_temps
 
     def _materialize_object(
@@ -408,7 +456,7 @@ class SharedAudioCache:
         waited_sec: float,
     ) -> CachedAudio | AudioResolutionError:
         if self._s3_client is None:
-            self._s3_client = _get_s3_client()
+            self._s3_client = _get_s3_client(self.s3_max_pool_connections)
 
         dl_result = download_audio(
             self._s3_client,
@@ -457,6 +505,15 @@ class SharedAudioCache:
         decoded_bytes = int(samples.nbytes)
         reserved = self._try_reserve(object_key, decoded_bytes)
         if not reserved:
+            LOGGER.info(
+                "Decoded audio cache fallback: reason=capacity entity=%s "
+                "decoded_bytes=%d cache_bytes=%d/%d s3_key=%s",
+                _entity_label(entity),
+                decoded_bytes,
+                self._current_cache_bytes(),
+                self.max_cache_bytes,
+                resolved.s3_key,
+            )
             return CachedAudio(
                 audio=AudioData(
                     path=audio.path,
@@ -513,7 +570,12 @@ class SharedAudioCache:
                     },
                 )
             except Exception:
-                LOGGER.warning("Decoded cache write failed for %s", resolved.s3_key, exc_info=True)
+                LOGGER.warning(
+                    "Decoded audio cache write failed: entity=%s s3_key=%s",
+                    _entity_label(entity),
+                    resolved.s3_key,
+                    exc_info=True,
+                )
                 return CachedAudio(
                     audio=AudioData(
                         path=audio.path,
@@ -545,6 +607,24 @@ class SharedAudioCache:
         finally:
             self._release_reservation(object_key)
 
+        LOGGER.info(
+            "Decoded audio cache write: entity=%s decoded_bytes=%d "
+            "source_bytes=%s resolve=%.3fs head=%.3fs download=%.3fs "
+            "decode=%.3fs waited=%.3fs path=%s",
+            _entity_label(entity),
+            decoded_bytes,
+            (
+                str(dl_result.object_size_bytes)
+                if dl_result.object_size_bytes is not None
+                else "unknown"
+            ),
+            resolved.resolve_sec,
+            dl_result.head_sec,
+            dl_result.download_sec,
+            decode_sec,
+            waited_sec,
+            object_path,
+        )
         return CachedAudio(
             audio=AudioData(
                 path=object_path,
@@ -583,7 +663,7 @@ class SharedAudioCache:
         fallback_reason: str,
     ) -> CachedAudio | AudioResolutionError:
         if self._s3_client is None:
-            self._s3_client = _get_s3_client()
+            self._s3_client = _get_s3_client(self.s3_max_pool_connections)
         dl_result = download_audio(
             self._s3_client,
             resolved.s3_key,
@@ -626,6 +706,19 @@ class SharedAudioCache:
             dl_result.local_path.unlink(missing_ok=True)
         decode_sec = time.perf_counter() - decode_started
         decoded_bytes = int(audio.samples.nbytes)
+        LOGGER.info(
+            "Decoded audio cache fallback complete: reason=%s entity=%s "
+            "decoded_bytes=%d resolve=%.3fs head=%.3fs download=%.3fs "
+            "decode=%.3fs s3_key=%s",
+            fallback_reason,
+            _entity_label(entity),
+            decoded_bytes,
+            resolved.resolve_sec,
+            dl_result.head_sec,
+            dl_result.download_sec,
+            decode_sec,
+            resolved.s3_key,
+        )
         return CachedAudio(
             audio=audio,
             s3_key=resolved.s3_key,
@@ -841,6 +934,7 @@ class SharedAudioCache:
                 lock_path.unlink(missing_ok=True)
             except OSError:
                 return False
+            LOGGER.info("Reclaimed stale decoded audio cache lock: %s", lock_path)
             if shard_dir is not None:
                 cutoff = time.time() - self.stale_lock_minutes * 60.0
                 self._remove_stale_temps(shard_dir, cutoff)
@@ -1031,10 +1125,14 @@ def _hash_text(value: str) -> str:
     return hashlib.blake2b(value.encode("utf-8"), digest_size=16).hexdigest()
 
 
-def _get_s3_client():
+def _get_s3_client(max_pool_connections: int = 64):
     import boto3
+    from botocore.config import Config
 
-    return boto3.client("s3")
+    return boto3.client(
+        "s3",
+        config=Config(max_pool_connections=int(max_pool_connections)),
+    )
 
 
 def _int_or_none(value) -> int | None:
@@ -1055,3 +1153,7 @@ def _locked_entities(output_base: Path) -> set[tuple[str, str]]:
         sid, _, aid = stem.partition("__")
         locked.add((sid, aid))
     return locked
+
+
+def _entity_label(entity: ArchiveEntity) -> str:
+    return f"{entity.session_id}/{entity.archive_id}"

@@ -27,6 +27,7 @@ LOGGER = logging.getLogger(__name__)
 WARMER_SCAN_INTERVAL_SEC = 60.0
 WARMER_RESUME_RATIO = 0.80
 WARMER_WORKERS = 4
+WARMER_PROGRESS_INTERVAL_SEC = 30.0
 
 
 @dataclass(frozen=True)
@@ -48,6 +49,7 @@ def warm_cache(
     max_inference_attempts: int = 3,
     audio_cache_lock_stale_minutes: float = 60.0,
     warm_workers: int = WARMER_WORKERS,
+    s3_max_pool_connections: int | None = None,
     sample_rate: int = SAMPLE_RATE,
     scan_interval_sec: float = WARMER_SCAN_INTERVAL_SEC,
     once: bool = False,
@@ -60,6 +62,8 @@ def warm_cache(
     """
     if warm_workers < 1:
         raise ValueError("warm_workers must be >= 1")
+    if s3_max_pool_connections is None:
+        s3_max_pool_connections = max(64, warm_workers * 4)
     output = Path(output_base)
     entities = load_manifest(parquet_path)
     rng = random.Random(seed)
@@ -70,10 +74,36 @@ def warm_cache(
         max_cache_bytes=max_cache_bytes,
         stale_lock_minutes=audio_cache_lock_stale_minutes,
         bucket=BUCKET,
+        s3_max_pool_connections=s3_max_pool_connections,
+    )
+    LOGGER.info(
+        "Cache warmer starting: entities=%d output=%s cache_dir=%s "
+        "max_cache_bytes=%d resume_below_bytes=%d seed=%s workers=%d "
+        "s3_max_pool_connections=%d stale_lock_minutes=%.1f scan_interval=%.1fs "
+        "once=%s",
+        len(entities),
+        output,
+        audio_cache_dir,
+        max_cache_bytes,
+        int(max_cache_bytes * WARMER_RESUME_RATIO),
+        seed,
+        warm_workers,
+        s3_max_pool_connections,
+        audio_cache_lock_stale_minutes,
+        scan_interval_sec,
+        once,
     )
 
     total = WarmCacheSummary()
+    cycle_idx = 0
     while True:
+        cycle_idx += 1
+        LOGGER.info(
+            "Cache warmer scan %d starting: cache_bytes=%d/%d",
+            cycle_idx,
+            cache.cache_bytes(),
+            max_cache_bytes,
+        )
         cycle = _warm_one_cycle(
             cache=cache,
             output_base=output,
@@ -89,27 +119,68 @@ def warm_cache(
             fallbacks=total.fallbacks + cycle.fallbacks,
             complete=cycle.complete,
         )
-        if cycle.complete or once:
-            return total
-        cache_bytes = cache.cache_bytes()
         LOGGER.info(
-            "Cache warmer cycle: warmed=%d hits=%d errors=%d fallbacks=%d "
-            "cache_bytes=%d/%d",
+            "Cache warmer scan %d complete: warmed=%d hits=%d errors=%d "
+            "fallbacks=%d complete=%s cache_bytes=%d/%d totals="
+            "warmed:%d hits:%d errors:%d fallbacks:%d",
+            cycle_idx,
             cycle.warmed,
             cycle.cache_hits,
             cycle.errors,
             cycle.fallbacks,
-            cache_bytes,
+            cycle.complete,
+            cache.cache_bytes(),
             max_cache_bytes,
+            total.warmed,
+            total.cache_hits,
+            total.errors,
+            total.fallbacks,
         )
+        if cycle.complete or once:
+            LOGGER.info(
+                "Cache warmer exiting: complete=%s once=%s warmed=%d hits=%d "
+                "errors=%d fallbacks=%d cache_bytes=%d/%d",
+                cycle.complete,
+                once,
+                total.warmed,
+                total.cache_hits,
+                total.errors,
+                total.fallbacks,
+                cache.cache_bytes(),
+                max_cache_bytes,
+            )
+            return total
+        cache_bytes = cache.cache_bytes()
         if cache_bytes >= max_cache_bytes:
+            LOGGER.info(
+                "Cache warmer paused above cap: cache_bytes=%d/%d; "
+                "cleaning until <=%d",
+                cache_bytes,
+                max_cache_bytes,
+                int(max_cache_bytes * WARMER_RESUME_RATIO),
+            )
             while cache.cache_bytes() > int(max_cache_bytes * WARMER_RESUME_RATIO):
-                cache.cleanup(
+                cleanup = cache.cleanup(
                     output_base=output,
                     target_bytes=int(max_cache_bytes * WARMER_RESUME_RATIO),
                 )
+                LOGGER.info(
+                    "Cache warmer pressure cleanup: removed_objects=%d "
+                    "removed_bytes=%d removed_locks=%d removed_temps=%d "
+                    "cache_bytes=%d/%d",
+                    cleanup.removed_objects,
+                    cleanup.removed_bytes,
+                    cleanup.removed_locks,
+                    cleanup.removed_temps,
+                    cache.cache_bytes(),
+                    max_cache_bytes,
+                )
                 time.sleep(scan_interval_sec)
         else:
+            LOGGER.info(
+                "Cache warmer sleeping %.1fs before next scan",
+                scan_interval_sec,
+            )
             time.sleep(scan_interval_sec)
 
 
@@ -136,7 +207,18 @@ def _warm_one_cycle(
         permanent_errors,
         max_inference_attempts=max_inference_attempts,
     )
-    cache.cleanup(
+    LOGGER.info(
+        "Cache warmer scan state: terminal=%d/%d permanent_errors=%d "
+        "active_locks=%d protected_s3_keys=%d cache_bytes=%d/%d",
+        len(terminal_entities),
+        len(entities),
+        len(permanent_errors),
+        sum(len(values) for values in active_locks.values()),
+        len(protected_s3_keys),
+        cache.cache_bytes(),
+        max_cache_bytes,
+    )
+    cleanup = cache.cleanup(
         output_base=output_base,
         terminal_entities=terminal_entities,
         protected_s3_keys=protected_s3_keys,
@@ -146,12 +228,22 @@ def _warm_one_cycle(
             else None
         ),
     )
+    LOGGER.info(
+        "Cache cleaner cycle: removed_objects=%d removed_bytes=%d "
+        "removed_locks=%d removed_temps=%d cache_bytes=%d/%d",
+        cleanup.removed_objects,
+        cleanup.removed_bytes,
+        cleanup.removed_locks,
+        cleanup.removed_temps,
+        cache.cache_bytes(),
+        max_cache_bytes,
+    )
 
     if len(terminal_entities) >= len(entities):
         return WarmCacheSummary(complete=True)
 
-    frontiers = [
-        _frontier_for_task(
+    frontier_by_task = {
+        task: _frontier_for_task(
             entities,
             task,
             completed,
@@ -159,8 +251,13 @@ def _warm_one_cycle(
             active_locks,
         )
         for task in TASKS
-    ]
-    start = min((idx for idx in frontiers if idx is not None), default=None)
+    }
+    start = min((idx for idx in frontier_by_task.values() if idx is not None), default=None)
+    LOGGER.info(
+        "Cache warmer frontiers: %s; slowest_start_index=%s",
+        _format_frontiers(frontier_by_task),
+        "none" if start is None else start,
+    )
     if start is None:
         return WarmCacheSummary(complete=True)
 
@@ -168,11 +265,51 @@ def _warm_one_cycle(
     hits = 0
     errors = 0
     fallbacks = 0
+    submitted = 0
+    completed_futures = 0
+    last_progress_log = time.monotonic()
     futures: set[Future] = set()
+
+    def collect_and_log(done: set[Future]) -> None:
+        nonlocal warmed
+        nonlocal hits
+        nonlocal errors
+        nonlocal fallbacks
+        nonlocal completed_futures
+        nonlocal last_progress_log
+        w, h, e, f = _collect(done)
+        warmed += w
+        hits += h
+        errors += e
+        fallbacks += f
+        completed_futures += len(done)
+        now = time.monotonic()
+        if now - last_progress_log >= WARMER_PROGRESS_INTERVAL_SEC:
+            LOGGER.info(
+                "Cache warmer progress: submitted=%d completed=%d warmed=%d "
+                "hits=%d errors=%d fallbacks=%d cache_bytes=%d/%d",
+                submitted,
+                completed_futures,
+                warmed,
+                hits,
+                errors,
+                fallbacks,
+                cache.cache_bytes(),
+                max_cache_bytes,
+            )
+            last_progress_log = now
 
     with ThreadPoolExecutor(max_workers=warm_workers, thread_name_prefix="cache-warm") as pool:
         for entity in entities[start:]:
             if cache.cache_bytes() >= max_cache_bytes:
+                LOGGER.info(
+                    "Cache warmer reached cap during submission: "
+                    "submitted=%d completed=%d cache_bytes=%d/%d",
+                    submitted,
+                    completed_futures,
+                    cache.cache_bytes(),
+                    max_cache_bytes,
+                )
                 break
             key = (entity.session_id, entity.archive_id)
             if key in terminal_entities or key in permanent_errors:
@@ -180,21 +317,28 @@ def _warm_one_cycle(
             if completed.get(key, set()) >= set(TASKS):
                 continue
             futures.add(pool.submit(cache.get_decoded_audio, entity))
+            submitted += 1
             while len(futures) >= warm_workers:
                 done, futures = wait(futures, return_when=FIRST_COMPLETED)
-                w, h, e, f = _collect(done)
-                warmed += w
-                hits += h
-                errors += e
-                fallbacks += f
+                collect_and_log(done)
         while futures:
             done, futures = wait(futures, return_when=FIRST_COMPLETED)
-            w, h, e, f = _collect(done)
-            warmed += w
-            hits += h
-            errors += e
-            fallbacks += f
+            collect_and_log(done)
 
+    LOGGER.info(
+        "Cache warmer submissions complete: start_index=%d submitted=%d "
+        "completed=%d warmed=%d hits=%d errors=%d fallbacks=%d "
+        "cache_bytes=%d/%d",
+        start,
+        submitted,
+        completed_futures,
+        warmed,
+        hits,
+        errors,
+        fallbacks,
+        cache.cache_bytes(),
+        max_cache_bytes,
+    )
     return WarmCacheSummary(
         warmed=warmed,
         cache_hits=hits,
@@ -214,6 +358,13 @@ def _collect(done: set[Future]) -> tuple[int, int, int, int]:
             errors += 1
             continue
         if isinstance(result, AudioResolutionError):
+            LOGGER.debug(
+                "Cache warmer audio error: %s/%s type=%s detail=%s",
+                result.session_id,
+                result.archive_id,
+                result.error_type,
+                result.detail,
+            )
             errors += 1
             continue
         if result.stats.object_cache_hit:
@@ -320,3 +471,10 @@ def _protected_s3_keys(
         if s3_key:
             protected.add(s3_key)
     return protected
+
+
+def _format_frontiers(frontier_by_task: dict[str, int | None]) -> str:
+    return ", ".join(
+        f"{task}={'done' if idx is None else idx}"
+        for task, idx in frontier_by_task.items()
+    )
