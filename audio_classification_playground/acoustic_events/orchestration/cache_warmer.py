@@ -47,6 +47,7 @@ def warm_cache(
     seed: int | None = None,
     max_inference_attempts: int = 3,
     audio_cache_lock_stale_minutes: float = 60.0,
+    warm_workers: int = WARMER_WORKERS,
     sample_rate: int = SAMPLE_RATE,
     scan_interval_sec: float = WARMER_SCAN_INTERVAL_SEC,
     once: bool = False,
@@ -57,6 +58,8 @@ def warm_cache(
     usage leaves it ``False`` so the warmer keeps rescanning until the
     manifest is terminal.
     """
+    if warm_workers < 1:
+        raise ValueError("warm_workers must be >= 1")
     output = Path(output_base)
     entities = load_manifest(parquet_path)
     rng = random.Random(seed)
@@ -77,6 +80,7 @@ def warm_cache(
             entities=entities,
             max_cache_bytes=max_cache_bytes,
             max_inference_attempts=max_inference_attempts,
+            warm_workers=warm_workers,
         )
         total = WarmCacheSummary(
             warmed=total.warmed + cycle.warmed,
@@ -116,6 +120,7 @@ def _warm_one_cycle(
     entities: list[ArchiveEntity],
     max_cache_bytes: int,
     max_inference_attempts: int,
+    warm_workers: int,
 ) -> WarmCacheSummary:
     permanent_errors = load_permanent_error_set(output_base)
     completed = completed_tasks_for_entity_keys(
@@ -165,7 +170,7 @@ def _warm_one_cycle(
     fallbacks = 0
     futures: set[Future] = set()
 
-    with ThreadPoolExecutor(max_workers=WARMER_WORKERS, thread_name_prefix="cache-warm") as pool:
+    with ThreadPoolExecutor(max_workers=warm_workers, thread_name_prefix="cache-warm") as pool:
         for entity in entities[start:]:
             if cache.cache_bytes() >= max_cache_bytes:
                 break
@@ -175,7 +180,7 @@ def _warm_one_cycle(
             if completed.get(key, set()) >= set(TASKS):
                 continue
             futures.add(pool.submit(cache.get_decoded_audio, entity))
-            while len(futures) >= WARMER_WORKERS:
+            while len(futures) >= warm_workers:
                 done, futures = wait(futures, return_when=FIRST_COMPLETED)
                 w, h, e, f = _collect(done)
                 warmed += w

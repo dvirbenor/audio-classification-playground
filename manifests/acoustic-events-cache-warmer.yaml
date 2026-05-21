@@ -1,0 +1,84 @@
+config:
+  namespace: nlp-audio-understanding
+  team: nlp
+  project: audio-understanding
+  image: 690765672468.dkr.ecr.us-east-1.amazonaws.com/ai-content-provenance:latest
+  capacityType: on-demand
+  ephemeralStorage: "10Gi"
+  instanceTypes: ["c6a.4xlarge", "c7a.4xlarge", "c6i.4xlarge", "c7i.4xlarge"]
+  env:
+    CLEARML_WEB_HOST: http://clearml-webserver.clearml:8080
+    CLEARML_API_HOST: http://clearml-apiserver.clearml:8008
+    CLEARML_FILES_HOST: https://clearml-fileserver.ai-dev.riverside.fm
+    RS_OWNER: dvirbenor
+  ebs:
+    enabled: true
+    size: 1000Gi
+    persistent: false
+    mountPath: /workspace
+  s3Access:
+    enabled: true
+
+experiments:
+  - name: acoustic-cache-warmer
+    category: inference
+    description: Warm and clean the shared decoded-audio cache on compute-optimized CPU
+    resources:
+      requests:
+        cpu: "13"
+        memory: "24Gi"
+      limits:
+        cpu: "13"
+        memory: "24Gi"
+    cmd: /bin/bash
+    args:
+      - -lc
+      - |
+        set -euo pipefail
+
+        export RUN_ID="{run_id}"
+        export PYTHONUNBUFFERED=1
+        export UV_LINK_MODE=copy
+
+        PARQUET="/efs/dvir/data/magic-clips-research/dataset-reference/all_archives.parquet"
+        OUTPUT="/efs/dvir/data/magic-clips-research/acoustic-understanding/models-inference"
+        AUDIO_CACHE="${OUTPUT}/_meta/audio_cache"
+        CACHE_BYTES=536870912000
+        SEED=123
+
+        LOG_DIR="${OUTPUT}/job-logs"
+        mkdir -p "$LOG_DIR"
+        LOG_FILE="$LOG_DIR/acoustic-cache-warmer-run-${RUN_ID}-${HOSTNAME:-unknown}.log"
+        exec > >(tee -a "$LOG_FILE") 2>&1
+
+        echo "[$(date -Iseconds)] Starting acoustic-cache-warmer run ${RUN_ID}"
+        cd /workspace
+
+        mkdir -p /workspace/.ssh
+        cp /mnt/github-ssh/id_ed25519 /workspace/.ssh/id_ed25519
+        cp /mnt/github-ssh/known_hosts /workspace/.ssh/known_hosts
+        chmod 700 /workspace/.ssh
+        chmod 400 /workspace/.ssh/id_ed25519
+        chmod 444 /workspace/.ssh/known_hosts
+        export GIT_SSH_COMMAND="ssh -i /workspace/.ssh/id_ed25519 -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=/workspace/.ssh/known_hosts"
+
+        rm -rf audio-classification-playground
+        git clone --branch main --single-branch git@github.com:dvirbenor/audio-classification-playground.git
+        cd audio-classification-playground
+        echo "Git commit: $(git rev-parse HEAD)"
+        uv sync --frozen
+        source .venv/bin/activate
+
+        source env.shared.sh
+        python -m audio_classification_playground.acoustic_events.orchestration warm-cache \
+          --parquet "$PARQUET" \
+          --output "$OUTPUT" \
+          --audio-cache-dir "$AUDIO_CACHE" \
+          --max-cache-bytes "$CACHE_BYTES" \
+          --seed "$SEED" \
+          --warm-workers 10 \
+          --max-retries 3
+
+        echo "[$(date -Iseconds)] Finished acoustic-cache-warmer run ${RUN_ID}"
+    grid:
+      run_id: [1, 2]

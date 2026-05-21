@@ -391,6 +391,7 @@ def _cmd_warm_cache(args: argparse.Namespace) -> None:
         seed=args.seed,
         max_inference_attempts=args.max_retries,
         audio_cache_lock_stale_minutes=args.audio_cache_lock_stale_minutes,
+        warm_workers=args.warm_workers,
         once=args.once,
     )
 
@@ -580,6 +581,12 @@ def main(argv: list[str] | None = None) -> None:
     p_warm.add_argument("--max-cache-bytes", type=int, required=True)
     p_warm.add_argument("--seed", type=int, default=None)
     p_warm.add_argument("--max-retries", type=int, default=3)
+    p_warm.add_argument(
+        "--warm-workers",
+        type=int,
+        default=4,
+        help="Concurrent cache materialization workers inside the warmer pod.",
+    )
     p_warm.add_argument(
         "--once",
         action="store_true",
