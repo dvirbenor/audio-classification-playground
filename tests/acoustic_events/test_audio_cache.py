@@ -194,12 +194,71 @@ class SharedAudioCacheTest(unittest.TestCase):
             os.utime(lock, (old, old))
             os.utime(tmp_file, (old, old))
 
-            locks, temps = cache.reclaim_stale()
+            locks, temps, reservations = cache.reclaim_stale()
 
         self.assertEqual(locks, 1)
         self.assertGreaterEqual(temps, 1)
+        self.assertEqual(reservations, 0)
         self.assertFalse(lock.exists())
         self.assertFalse(tmp_file.exists())
+
+    def test_reclaim_stale_removes_stale_reservation_and_temp(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = SharedAudioCache(
+                tmp,
+                sample_rate=16000,
+                max_cache_bytes=10_000_000,
+                stale_lock_minutes=0.001,
+                poll_sec=0.01,
+            )
+            key = decoded_object_key("accounts/a1.wav", 16000)
+            reservation = cache._reservation_path(key)
+            reservation.parent.mkdir(parents=True, exist_ok=True)
+            reservation.write_text(
+                '{"object_key":"%s","bytes":64000}' % key,
+                encoding="utf-8",
+            )
+            tmp_file = reservation.parent / ".tmp.reservation.json"
+            tmp_file.write_text("partial", encoding="utf-8")
+            old = time.time() - 120
+            os.utime(reservation, (old, old))
+            os.utime(tmp_file, (old, old))
+
+            locks, temps, reservations = cache.reclaim_stale()
+
+        self.assertEqual(locks, 0)
+        self.assertGreaterEqual(temps, 1)
+        self.assertEqual(reservations, 1)
+        self.assertFalse(reservation.exists())
+        self.assertFalse(tmp_file.exists())
+
+    def test_reclaim_stale_removes_reservation_for_ready_object(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = SharedAudioCache(
+                tmp,
+                sample_rate=16000,
+                max_cache_bytes=10_000_000,
+                stale_lock_minutes=60.0,
+                poll_sec=0.01,
+            )
+            key = decoded_object_key("accounts/a1.wav", 16000)
+            reservation = cache._reservation_path(key)
+            object_path, metadata_path = cache._object_paths(key)
+            reservation.parent.mkdir(parents=True, exist_ok=True)
+            object_path.parent.mkdir(parents=True, exist_ok=True)
+            reservation.write_text(
+                '{"object_key":"%s","bytes":64000}' % key,
+                encoding="utf-8",
+            )
+            object_path.write_bytes(b"ready")
+            metadata_path.write_text("{}", encoding="utf-8")
+
+            locks, temps, reservations = cache.reclaim_stale()
+
+        self.assertEqual(locks, 0)
+        self.assertEqual(temps, 0)
+        self.assertEqual(reservations, 1)
+        self.assertFalse(reservation.exists())
 
     def test_cleaner_refuses_to_evict_active_task_lock(self):
         entity = ArchiveEntity("s1", "a1", "prefix/a1")

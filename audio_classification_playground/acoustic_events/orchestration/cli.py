@@ -368,6 +368,8 @@ def _cmd_status(args: argparse.Namespace) -> None:
 
 
 def _cmd_reclaim_stale(args: argparse.Namespace) -> None:
+    from ..inference.artifacts import SAMPLE_RATE
+    from .audio_cache import SharedAudioCache
     from .locking import reclaim_stale
     from .progress import is_archive_complete
 
@@ -377,7 +379,22 @@ def _cmd_reclaim_stale(args: argparse.Namespace) -> None:
         older_than_minutes=args.older_than,
         is_complete_fn=lambda sid, aid: is_archive_complete(output_base, sid, aid),
     )
-    print(f"Reclaimed {reclaimed} stale locks")
+    cache_dir = output_base / "_meta" / "audio_cache"
+    if cache_dir.is_dir():
+        cache = SharedAudioCache(
+            cache_dir,
+            sample_rate=SAMPLE_RATE,
+            max_cache_bytes=1,
+            stale_lock_minutes=args.older_than,
+        )
+        cache_locks, cache_temps, cache_reservations = cache.reclaim_stale()
+        print(
+            f"Reclaimed {reclaimed} stale locks; "
+            f"cache locks={cache_locks}, temp files={cache_temps}, "
+            f"reservations={cache_reservations}"
+        )
+    else:
+        print(f"Reclaimed {reclaimed} stale locks")
 
 
 def _cmd_warm_cache(args: argparse.Namespace) -> None:
@@ -569,7 +586,10 @@ def main(argv: list[str] | None = None) -> None:
                           help="Include completed/partial counts (slower, walks output tree)")
 
     # --- reclaim-stale ---
-    p_reclaim = sub.add_parser("reclaim-stale", help="Remove orphan lock files")
+    p_reclaim = sub.add_parser(
+        "reclaim-stale",
+        help="Remove orphan orchestration and audio-cache lock files",
+    )
     p_reclaim.add_argument("--output", required=True)
     p_reclaim.add_argument("--older-than", type=float, default=60.0,
                            help="Minutes since lock creation (default: 60)")

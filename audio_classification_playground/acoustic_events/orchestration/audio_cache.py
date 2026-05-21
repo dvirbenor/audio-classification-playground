@@ -83,6 +83,7 @@ class CleanupSummary:
     removed_bytes: int = 0
     removed_locks: int = 0
     removed_temps: int = 0
+    removed_reservations: int = 0
 
 
 class SharedAudioCache:
@@ -352,7 +353,7 @@ class SharedAudioCache:
         if output_base is not None:
             protected_entities = _locked_entities(output_base)
 
-        removed_locks, removed_temps = self.reclaim_stale()
+        removed_locks, removed_temps, removed_reservations = self.reclaim_stale()
         removed_objects = 0
         removed_bytes = 0
 
@@ -393,31 +394,35 @@ class SharedAudioCache:
             removed_bytes=removed_bytes,
             removed_locks=removed_locks,
             removed_temps=removed_temps,
+            removed_reservations=removed_reservations,
         )
         if any((
             summary.removed_objects,
             summary.removed_bytes,
             summary.removed_locks,
             summary.removed_temps,
+            summary.removed_reservations,
         )):
             LOGGER.info(
                 "Decoded audio cache cleanup: removed_objects=%d "
                 "removed_bytes=%d removed_locks=%d removed_temps=%d "
-                "cache_bytes=%d/%d",
+                "removed_reservations=%d cache_bytes=%d/%d",
                 summary.removed_objects,
                 summary.removed_bytes,
                 summary.removed_locks,
                 summary.removed_temps,
+                summary.removed_reservations,
                 self.cache_bytes(),
                 self.max_cache_bytes,
             )
         return summary
 
-    def reclaim_stale(self) -> tuple[int, int]:
-        """Remove stale cache locks and temp files."""
+    def reclaim_stale(self) -> tuple[int, int, int]:
+        """Remove stale cache locks, temp files, and orphan reservations."""
         cutoff = time.time() - self.stale_lock_minutes * 60.0
         removed_locks = 0
         removed_temps = 0
+        removed_reservations = self._remove_stale_reservations(cutoff)
         for lock_file in self._lock_root().rglob("*.lock"):
             if not lock_file.is_file():
                 continue
@@ -435,13 +440,16 @@ class SharedAudioCache:
             if shard_dir is not None:
                 removed_temps += self._remove_stale_temps(shard_dir, cutoff)
         removed_temps += self._remove_stale_temps(self._object_root(), cutoff)
-        if removed_locks or removed_temps:
+        removed_temps += self._remove_stale_temps(self._reservation_root(), cutoff)
+        if removed_locks or removed_temps or removed_reservations:
             LOGGER.info(
-                "Decoded audio cache reclaimed stale state: locks=%d temps=%d",
+                "Decoded audio cache reclaimed stale state: locks=%d temps=%d "
+                "reservations=%d",
                 removed_locks,
                 removed_temps,
+                removed_reservations,
             )
-        return removed_locks, removed_temps
+        return removed_locks, removed_temps, removed_reservations
 
     def _materialize_object(
         self,
@@ -990,6 +998,26 @@ class SharedAudioCache:
         for path in root.rglob(".tmp.*"):
             try:
                 if path.stat().st_mtime > cutoff:
+                    continue
+                path.unlink(missing_ok=True)
+                removed += 1
+            except OSError:
+                continue
+        return removed
+
+    def _remove_stale_reservations(self, cutoff: float) -> int:
+        root = self._reservation_root()
+        if not root.is_dir():
+            return 0
+        removed = 0
+        for path in root.rglob("*.json"):
+            if path.name.startswith(".tmp."):
+                continue
+            try:
+                object_path, metadata_path = self._object_paths(path.stem)
+                ready = object_path.is_file() and metadata_path.is_file()
+                stale = path.stat().st_mtime < cutoff
+                if not ready and not stale:
                     continue
                 path.unlink(missing_ok=True)
                 removed += 1
