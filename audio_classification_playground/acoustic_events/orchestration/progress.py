@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import subprocess
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -456,9 +457,14 @@ def _save_completion_cache(
     """Atomically persist the set of fully-complete archives."""
     cache_path = output_base / _PROGRESS_CACHE
     cache_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = cache_path.with_suffix(".tmp")
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{cache_path.name}.",
+        suffix=".tmp",
+        dir=str(cache_path.parent),
+    )
+    tmp = Path(tmp_name)
     try:
-        with open(tmp, "w", encoding="utf-8") as f:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
             for sid, aid in sorted(complete):
                 f.write(f"{sid}\t{aid}\n")
         os.replace(str(tmp), str(cache_path))

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import random
+import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
@@ -28,6 +29,8 @@ WARMER_SCAN_INTERVAL_SEC = 60.0
 WARMER_RESUME_RATIO = 0.80
 WARMER_WORKERS = 4
 WARMER_PROGRESS_INTERVAL_SEC = 30.0
+CAPACITY_FALLBACK_BREAK_THRESHOLD = 20
+_PRESSURE_FALLBACK_REASONS = frozenset({"capacity", "cache_full"})
 
 
 @dataclass(frozen=True)
@@ -94,94 +97,138 @@ def warm_cache(
         once,
     )
 
+    entities_by_key: dict[tuple[str, str], ArchiveEntity] = {
+        (e.session_id, e.archive_id): e for e in entities
+    }
+
+    stop_cleanup = threading.Event()
+    cleanup_thread = threading.Thread(
+        target=_run_cleanup_loop,
+        kwargs={
+            "cache": cache,
+            "output_base": output,
+            "entities_by_key": entities_by_key,
+            "max_inference_attempts": max_inference_attempts,
+            "stop_event": stop_cleanup,
+            "interval_sec": scan_interval_sec,
+        },
+        daemon=True,
+        name="cache-cleanup",
+    )
+    cleanup_thread.start()
+
     total = WarmCacheSummary()
     cycle_idx = 0
-    while True:
-        cycle_idx += 1
-        LOGGER.info(
-            "Cache warmer scan %d starting: cache_bytes=%d/%d",
-            cycle_idx,
-            cache.cache_bytes(),
-            max_cache_bytes,
-        )
-        cycle = _warm_one_cycle(
-            cache=cache,
-            output_base=output,
-            entities=entities,
-            max_cache_bytes=max_cache_bytes,
-            max_inference_attempts=max_inference_attempts,
-            warm_workers=warm_workers,
-        )
-        total = WarmCacheSummary(
-            warmed=total.warmed + cycle.warmed,
-            cache_hits=total.cache_hits + cycle.cache_hits,
-            errors=total.errors + cycle.errors,
-            fallbacks=total.fallbacks + cycle.fallbacks,
-            complete=cycle.complete,
-        )
-        LOGGER.info(
-            "Cache warmer scan %d complete: warmed=%d hits=%d errors=%d "
-            "fallbacks=%d complete=%s cache_bytes=%d/%d totals="
-            "warmed:%d hits:%d errors:%d fallbacks:%d",
-            cycle_idx,
-            cycle.warmed,
-            cycle.cache_hits,
-            cycle.errors,
-            cycle.fallbacks,
-            cycle.complete,
-            cache.cache_bytes(),
-            max_cache_bytes,
-            total.warmed,
-            total.cache_hits,
-            total.errors,
-            total.fallbacks,
-        )
-        if cycle.complete or once:
+    try:
+        while True:
+            cycle_idx += 1
             LOGGER.info(
-                "Cache warmer exiting: complete=%s once=%s warmed=%d hits=%d "
-                "errors=%d fallbacks=%d cache_bytes=%d/%d",
+                "Cache warmer scan %d starting: cache_bytes=%d/%d",
+                cycle_idx,
+                cache.cache_bytes(),
+                max_cache_bytes,
+            )
+            cycle = _warm_one_cycle(
+                cache=cache,
+                output_base=output,
+                entities=entities,
+                max_cache_bytes=max_cache_bytes,
+                max_inference_attempts=max_inference_attempts,
+                warm_workers=warm_workers,
+            )
+            total = WarmCacheSummary(
+                warmed=total.warmed + cycle.warmed,
+                cache_hits=total.cache_hits + cycle.cache_hits,
+                errors=total.errors + cycle.errors,
+                fallbacks=total.fallbacks + cycle.fallbacks,
+                complete=cycle.complete,
+            )
+            LOGGER.info(
+                "Cache warmer scan %d complete: warmed=%d hits=%d errors=%d "
+                "fallbacks=%d complete=%s cache_bytes=%d/%d totals="
+                "warmed:%d hits:%d errors:%d fallbacks:%d",
+                cycle_idx,
+                cycle.warmed,
+                cycle.cache_hits,
+                cycle.errors,
+                cycle.fallbacks,
                 cycle.complete,
-                once,
+                cache.cache_bytes(),
+                max_cache_bytes,
                 total.warmed,
                 total.cache_hits,
                 total.errors,
                 total.fallbacks,
-                cache.cache_bytes(),
-                max_cache_bytes,
             )
-            return total
-        cache_bytes = cache.cache_bytes()
-        if cache_bytes >= max_cache_bytes:
-            LOGGER.info(
-                "Cache warmer paused above cap: cache_bytes=%d/%d; "
-                "cleaning until <=%d",
-                cache_bytes,
-                max_cache_bytes,
-                int(max_cache_bytes * WARMER_RESUME_RATIO),
-            )
-            while cache.cache_bytes() > int(max_cache_bytes * WARMER_RESUME_RATIO):
-                cleanup = cache.cleanup(
-                    output_base=output,
-                    target_bytes=int(max_cache_bytes * WARMER_RESUME_RATIO),
-                )
+            if cycle.complete or once:
                 LOGGER.info(
-                    "Cache warmer pressure cleanup: removed_objects=%d "
-                    "removed_bytes=%d removed_locks=%d removed_temps=%d "
-                    "cache_bytes=%d/%d",
-                    cleanup.removed_objects,
-                    cleanup.removed_bytes,
-                    cleanup.removed_locks,
-                    cleanup.removed_temps,
+                    "Cache warmer exiting: complete=%s once=%s warmed=%d hits=%d "
+                    "errors=%d fallbacks=%d cache_bytes=%d/%d",
+                    cycle.complete,
+                    once,
+                    total.warmed,
+                    total.cache_hits,
+                    total.errors,
+                    total.fallbacks,
                     cache.cache_bytes(),
                     max_cache_bytes,
                 )
+                return total
+            cache_bytes = cache.cache_bytes()
+            if cache_bytes >= max_cache_bytes:
+                LOGGER.info(
+                    "Cache warmer paused above cap: cache_bytes=%d/%d; "
+                    "cleaning until <=%d",
+                    cache_bytes,
+                    max_cache_bytes,
+                    int(max_cache_bytes * WARMER_RESUME_RATIO),
+                )
+                while cache.cache_bytes() > int(max_cache_bytes * WARMER_RESUME_RATIO):
+                    pressure_permanent = load_permanent_error_set(output)
+                    pressure_completed = completed_tasks_for_entity_keys(
+                        output,
+                        [(e.session_id, e.archive_id) for e in entities],
+                    )
+                    pressure_terminal = _terminal_entities(
+                        output,
+                        entities,
+                        pressure_completed,
+                        pressure_permanent,
+                        max_inference_attempts=max_inference_attempts,
+                    )
+                    pressure_locks = _active_locks(output)
+                    pressure_protected = _protected_s3_keys(
+                        cache, entities, pressure_locks
+                    )
+                    cleanup = cache.cleanup(
+                        output_base=output,
+                        terminal_entities=pressure_terminal,
+                        protected_s3_keys=pressure_protected,
+                        target_bytes=int(max_cache_bytes * WARMER_RESUME_RATIO),
+                    )
+                    LOGGER.info(
+                        "Cache warmer pressure cleanup: removed_objects=%d "
+                        "removed_bytes=%d removed_locks=%d removed_temps=%d "
+                        "cache_bytes=%d/%d",
+                        cleanup.removed_objects,
+                        cleanup.removed_bytes,
+                        cleanup.removed_locks,
+                        cleanup.removed_temps,
+                        cache.cache_bytes(),
+                        max_cache_bytes,
+                    )
+                    time.sleep(scan_interval_sec)
+            else:
+                LOGGER.info(
+                    "Cache warmer sleeping %.1fs before next scan",
+                    scan_interval_sec,
+                )
                 time.sleep(scan_interval_sec)
-        else:
-            LOGGER.info(
-                "Cache warmer sleeping %.1fs before next scan",
-                scan_interval_sec,
-            )
-            time.sleep(scan_interval_sec)
+    finally:
+        stop_cleanup.set()
+        cleanup_thread.join(timeout=30)
+        if cleanup_thread.is_alive():
+            LOGGER.warning("Background cache cleaner did not stop within 30s")
 
 
 def _warm_one_cycle(
@@ -270,6 +317,9 @@ def _warm_one_cycle(
     last_progress_log = time.monotonic()
     futures: set[Future] = set()
 
+    consecutive_pressure = 0
+    capacity_stalled = False
+
     def collect_and_log(done: set[Future]) -> None:
         nonlocal warmed
         nonlocal hits
@@ -277,12 +327,20 @@ def _warm_one_cycle(
         nonlocal fallbacks
         nonlocal completed_futures
         nonlocal last_progress_log
-        w, h, e, f = _collect(done)
+        nonlocal consecutive_pressure
+        nonlocal capacity_stalled
+        w, h, e, f, pf = _collect(done)
         warmed += w
         hits += h
         errors += e
         fallbacks += f
         completed_futures += len(done)
+        if pf > 0 and w == 0 and h == 0:
+            consecutive_pressure += pf
+        else:
+            consecutive_pressure = 0
+        if consecutive_pressure >= CAPACITY_FALLBACK_BREAK_THRESHOLD:
+            capacity_stalled = True
         now = time.monotonic()
         if now - last_progress_log >= WARMER_PROGRESS_INTERVAL_SEC:
             LOGGER.info(
@@ -299,9 +357,22 @@ def _warm_one_cycle(
             )
             last_progress_log = now
 
+    min_writeable_bytes = min(1_000_000, max_cache_bytes // 1000)
+
     with ThreadPoolExecutor(max_workers=warm_workers, thread_name_prefix="cache-warm") as pool:
         for entity in entities[start:]:
-            if cache.cache_bytes() >= max_cache_bytes:
+            if capacity_stalled:
+                LOGGER.info(
+                    "Cache warmer breaking: %d consecutive capacity fallbacks "
+                    "submitted=%d completed=%d cache_bytes=%d/%d",
+                    consecutive_pressure,
+                    submitted,
+                    completed_futures,
+                    cache.cache_bytes(),
+                    max_cache_bytes,
+                )
+                break
+            if cache.cache_bytes() >= max_cache_bytes - min_writeable_bytes:
                 LOGGER.info(
                     "Cache warmer reached cap during submission: "
                     "submitted=%d completed=%d cache_bytes=%d/%d",
@@ -321,6 +392,8 @@ def _warm_one_cycle(
             while len(futures) >= warm_workers:
                 done, futures = wait(futures, return_when=FIRST_COMPLETED)
                 collect_and_log(done)
+                if capacity_stalled:
+                    break
         while futures:
             done, futures = wait(futures, return_when=FIRST_COMPLETED)
             collect_and_log(done)
@@ -348,8 +421,9 @@ def _warm_one_cycle(
     )
 
 
-def _collect(done: set[Future]) -> tuple[int, int, int, int]:
-    warmed = hits = errors = fallbacks = 0
+def _collect(done: set[Future]) -> tuple[int, int, int, int, int]:
+    """Return (warmed, hits, errors, fallbacks, pressure_fallbacks)."""
+    warmed = hits = errors = fallbacks = pressure_fallbacks = 0
     for future in done:
         try:
             result = future.result()
@@ -373,7 +447,9 @@ def _collect(done: set[Future]) -> tuple[int, int, int, int]:
             warmed += 1
         if result.stats.cache_fallback:
             fallbacks += 1
-    return warmed, hits, errors, fallbacks
+            if result.stats.cache_fallback_reason in _PRESSURE_FALLBACK_REASONS:
+                pressure_fallbacks += 1
+    return warmed, hits, errors, fallbacks, pressure_fallbacks
 
 
 def _frontier_for_task(
@@ -478,3 +554,77 @@ def _format_frontiers(frontier_by_task: dict[str, int | None]) -> str:
         f"{task}={'done' if idx is None else idx}"
         for task, idx in frontier_by_task.items()
     )
+
+
+def _run_cleanup_loop(
+    *,
+    cache: SharedAudioCache,
+    output_base: Path,
+    entities_by_key: dict[tuple[str, str], ArchiveEntity],
+    max_inference_attempts: int,
+    stop_event: threading.Event,
+    interval_sec: float,
+) -> None:
+    """Background thread: periodically evict terminal entities from the cache."""
+    first = True
+    while not stop_event.is_set():
+        if not first:
+            stop_event.wait(interval_sec)
+            if stop_event.is_set():
+                break
+        first = False
+        try:
+            entries = cache._object_entries()
+            cached_keys = [
+                e["entity_key"] for e in entries if e["entity_key"] != ("", "")
+            ]
+            if not cached_keys:
+                continue
+            cached_key_set = set(cached_keys)
+
+            entities_subset = [
+                entities_by_key[k] for k in cached_key_set if k in entities_by_key
+            ]
+
+            completed = completed_tasks_for_entity_keys(output_base, cached_keys)
+            permanent_errors = load_permanent_error_set(output_base)
+            terminal = _terminal_entities(
+                output_base,
+                entities_subset,
+                completed,
+                permanent_errors,
+                max_inference_attempts=max_inference_attempts,
+            )
+            terminal = terminal & cached_key_set
+
+            if not terminal:
+                continue
+
+            active_locks = _active_locks(output_base)
+            protected = _protected_s3_keys(
+                cache, list(entities_by_key.values()), active_locks
+            )
+
+            cleanup = cache.cleanup(
+                output_base=output_base,
+                terminal_entities=terminal,
+                protected_s3_keys=protected,
+                target_bytes=None,
+            )
+            LOGGER.info(
+                "Background cache cleaner: removed_objects=%d removed_bytes=%d "
+                "removed_locks=%d removed_temps=%d terminal=%d/%d "
+                "cache_bytes=%d",
+                cleanup.removed_objects,
+                cleanup.removed_bytes,
+                cleanup.removed_locks,
+                cleanup.removed_temps,
+                len(terminal),
+                len(cached_keys),
+                cache.cache_bytes(),
+            )
+        except Exception:
+            LOGGER.warning(
+                "Background cache cleaner iteration failed", exc_info=True
+            )
+            stop_event.wait(min(interval_sec * 2, 300))
