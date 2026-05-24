@@ -950,6 +950,31 @@ class WorkerAsyncVadTest(unittest.TestCase):
                 self.assertIsInstance(record[f], (int, float))
 
 
+    def test_default_seed_none_processes_in_session_grouped_order(self):
+        entities = [
+            ArchiveEntity("s2", "a1", "prefix", "2024-01-02"),
+            ArchiveEntity("s1", "a2", "prefix", "2024-01-01"),
+            ArchiveEntity("s1", "a1", "prefix", "2024-01-01"),
+        ]
+        calls = []
+
+        def fake_run_all(*args, **kwargs):
+            calls.append(kwargs["audio_source_key"])
+            return _fake_inference_result()
+
+        with _worker_patches(entities, run_all_fn=fake_run_all):
+            worker.run_worker(
+                parquet_path="manifest.parquet",
+                output_base=tempfile.mkdtemp(),
+                affect_backbone="wavlm",
+                disfluency_backbone="whisper",
+                prefetch_lookahead=1,
+                vad_prefetch_workers=1,
+            )
+
+        self.assertEqual(calls, ["a1.wav", "a2.wav", "a1.wav"])
+
+
 class _FakePrefetcher:
     def __init__(self, *args, **kwargs):
         self._precompute: dict[tuple[str, str], bool] = {}

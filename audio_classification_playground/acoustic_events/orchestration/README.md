@@ -62,8 +62,7 @@ python -m audio_classification_playground.acoustic_events.orchestration warm-cac
     --parquet /efs/dvir/data/magic-clips-research/dataset-reference/all_archives.parquet \
     --output  /efs/dvir/data/magic-clips-research/acoustic-understanding/models-inference \
     --audio-cache-dir /efs/dvir/data/magic-clips-research/acoustic-understanding/models-inference/_meta/audio_cache \
-    --max-cache-bytes 1099511627776 \
-    --seed 123
+    --max-cache-bytes 1099511627776
 
 python -m audio_classification_playground.acoustic_events.orchestration run \
     --parquet /efs/dvir/data/magic-clips-research/dataset-reference/all_archives.parquet \
@@ -72,7 +71,6 @@ python -m audio_classification_playground.acoustic_events.orchestration run \
     --affect-backbone wavlm \
     --disfluency-backbone wavlm \
     --device cuda \
-    --seed 123 \
     --audio-cache-dir /efs/dvir/data/magic-clips-research/acoustic-understanding/models-inference/_meta/audio_cache \
     --max-cache-bytes 1099511627776
 
@@ -210,8 +208,10 @@ python -m audio_classification_playground.acoustic_events.orchestration reclaim-
 3. **Model loading**: In `--task-group all`, affect, disfluency, and emotion
    predictors are loaded once. In task-fleet mode, each worker loads only the
    resident model(s) needed by its task group.
-4. **Shuffled iteration**: Entities are shuffled (for balanced load across
-   pods) and iterated.
+4. **Session-grouped iteration**: By default, entities are sorted by
+   `(date, session_id)` so all archives of a session are processed
+   contiguously and older sessions complete first. Pass `--seed N` to
+   restore the legacy shuffled ordering.
 5. **Claimed prefetch**: completion check → atomic lock claim →
    authoritative retry count check → submit download/decode and, when the
    task group writes VAD, optional VAD prefetch.
@@ -839,7 +839,7 @@ that output tree before reusing the production output.
 
 For all-in-one mode, simply launch N pods with the same arguments. Each pod:
 
-- Shuffles with a different random seed (default: unseeded, i.e. random)
+- Sorts archives by (date, session_id) for session-contiguous processing
 - Claims archives via atomic lock files
 - Skips already-complete or locked archives
 - Reports progress to the same shared EFS directory

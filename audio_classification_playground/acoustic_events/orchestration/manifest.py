@@ -23,6 +23,7 @@ class ArchiveEntity:
     session_id: str
     archive_id: str
     file_parent_dir: str
+    date: str = ""
 
 
 def _validate_id(value: str, field: str) -> None:
@@ -48,18 +49,20 @@ def load_manifest(parquet_path: str | Path) -> list[ArchiveEntity]:
     if not path.is_file():
         raise FileNotFoundError(f"Manifest parquet not found: {path}")
 
-    table = pq.read_table(str(path), columns=["session_id", "archive_id", "file_parent_dir"])
+    table = pq.read_table(str(path), columns=["session_id", "archive_id", "file_parent_dir", "date"])
     df = table.to_pydict()
     session_ids = df["session_id"]
     archive_ids = df["archive_id"]
     file_parent_dirs = df["file_parent_dir"]
+    dates = df["date"]
 
     seen: dict[tuple[str, str], ArchiveEntity] = {}
     skipped = 0
-    for sid, aid, fpd in zip(session_ids, archive_ids, file_parent_dirs):
+    for sid, aid, fpd, date in zip(session_ids, archive_ids, file_parent_dirs, dates):
         sid_str = str(sid).strip()
         aid_str = str(aid).strip()
         fpd_str = str(fpd).strip() if fpd else ""
+        date_str = str(date).strip() if date else ""
         key = (sid_str, aid_str)
         if key in seen:
             skipped += 1
@@ -75,6 +78,7 @@ def load_manifest(parquet_path: str | Path) -> list[ArchiveEntity]:
             session_id=sid_str,
             archive_id=aid_str,
             file_parent_dir=fpd_str,
+            date=date_str,
         )
 
     entities = list(seen.values())
@@ -85,3 +89,8 @@ def load_manifest(parquet_path: str | Path) -> list[ArchiveEntity]:
         skipped,
     )
     return entities
+
+
+def sort_manifest_by_session(entities: list[ArchiveEntity]) -> list[ArchiveEntity]:
+    """Sort entities by (date, session_id, archive_id) for session-contiguous processing."""
+    return sorted(entities, key=lambda e: (e.date, e.session_id, e.archive_id))

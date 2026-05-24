@@ -14,7 +14,7 @@ from .audio_cache import SharedAudioCache
 from .audio_resolver import AudioResolutionError, BUCKET
 from .errors import load_inference_attempt_counts, load_permanent_error_set
 from .locking import iter_lock_files
-from .manifest import ArchiveEntity, load_manifest
+from .manifest import ArchiveEntity, load_manifest, sort_manifest_by_session
 from .progress import TASKS, completed_tasks_for_entity_keys
 from .task_groups import (
     TASK_GROUP_AFFECT,
@@ -69,8 +69,13 @@ def warm_cache(
         s3_max_pool_connections = max(64, warm_workers * 4)
     output = Path(output_base)
     entities = load_manifest(parquet_path)
-    rng = random.Random(seed)
-    rng.shuffle(entities)
+    if seed is not None:
+        rng = random.Random(seed)
+        rng.shuffle(entities)
+        LOGGER.info("Entity ordering: shuffled (seed=%d)", seed)
+    else:
+        entities = sort_manifest_by_session(entities)
+        LOGGER.info("Entity ordering: session-grouped sort (date, session_id)")
     cache = SharedAudioCache(
         audio_cache_dir,
         sample_rate=sample_rate,

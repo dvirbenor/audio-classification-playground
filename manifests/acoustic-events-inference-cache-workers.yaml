@@ -37,7 +37,6 @@ experiments:
         OUTPUT="/efs/dvir/data/magic-clips-research/acoustic-understanding/models-inference"
         AUDIO_CACHE="${OUTPUT}/_meta/audio_cache"
         CACHE_BYTES=536870912000
-        SEED=123
 
         LOG_DIR="${OUTPUT}/job-logs"
         mkdir -p "$LOG_DIR"
@@ -72,7 +71,6 @@ experiments:
           --disfluency-backbone wavlm \
           --device cuda \
           --max-retries 3 \
-          --seed "$SEED" \
           --audio-cache-dir "$AUDIO_CACHE" \
           --max-cache-bytes "$CACHE_BYTES"
 
@@ -99,7 +97,6 @@ experiments:
         OUTPUT="/efs/dvir/data/magic-clips-research/acoustic-understanding/models-inference"
         AUDIO_CACHE="${OUTPUT}/_meta/audio_cache"
         CACHE_BYTES=536870912000
-        SEED=123
 
         LOG_DIR="${OUTPUT}/job-logs"
         mkdir -p "$LOG_DIR"
@@ -134,7 +131,6 @@ experiments:
           --disfluency-backbone wavlm \
           --device cuda \
           --max-retries 3 \
-          --seed "$SEED" \
           --audio-cache-dir "$AUDIO_CACHE" \
           --max-cache-bytes "$CACHE_BYTES"
 
@@ -163,7 +159,6 @@ experiments:
         OUTPUT="/efs/dvir/data/magic-clips-research/acoustic-understanding/models-inference"
         AUDIO_CACHE="${OUTPUT}/_meta/audio_cache"
         CACHE_BYTES=536870912000
-        SEED=123
 
         LOG_DIR="${OUTPUT}/job-logs"
         mkdir -p "$LOG_DIR"
@@ -201,7 +196,6 @@ experiments:
           --prefetch-lookahead 16 \
           --vad-prefetch-workers 0 \
           --max-retries 3 \
-          --seed "$SEED" \
           --audio-cache-dir "$AUDIO_CACHE" \
           --max-cache-bytes "$CACHE_BYTES"
 
@@ -235,7 +229,6 @@ experiments:
         OUTPUT="/efs/dvir/data/magic-clips-research/acoustic-understanding/models-inference"
         AUDIO_CACHE="${OUTPUT}/_meta/audio_cache"
         CACHE_BYTES=536870912000
-        SEED=123
 
         LOG_DIR="${OUTPUT}/job-logs"
         mkdir -p "$LOG_DIR"
@@ -273,7 +266,6 @@ experiments:
           --prefetch-lookahead 12 \
           --vad-prefetch-workers 1 \
           --max-retries 3 \
-          --seed "$SEED" \
           --audio-cache-dir "$AUDIO_CACHE" \
           --max-cache-bytes "$CACHE_BYTES"
 

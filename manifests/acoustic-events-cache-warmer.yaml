@@ -44,7 +44,6 @@ experiments:
         OUTPUT="/efs/dvir/data/magic-clips-research/acoustic-understanding/models-inference"
         AUDIO_CACHE="${OUTPUT}/_meta/audio_cache"
         CACHE_BYTES=536870912000
-        SEED=123
 
         LOG_DIR="${OUTPUT}/job-logs"
         mkdir -p "$LOG_DIR"
@@ -75,7 +74,6 @@ experiments:
           --output "$OUTPUT" \
           --audio-cache-dir "$AUDIO_CACHE" \
           --max-cache-bytes "$CACHE_BYTES" \
-          --seed "$SEED" \
           --warm-workers 8 \
           --s3-max-pool-connections 64 \
           --max-retries 3

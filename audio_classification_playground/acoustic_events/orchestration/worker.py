@@ -68,7 +68,7 @@ from .errors import (
     load_permanent_error_set,
 )
 from .locking import flat_lock_files, nested_lock_files, release_claim, try_claim
-from .manifest import ArchiveEntity, load_manifest
+from .manifest import ArchiveEntity, load_manifest, sort_manifest_by_session
 from .prefetch import PrefetchResult, Prefetcher
 from .progress import (
     are_tasks_complete_by_artifact,
@@ -634,8 +634,13 @@ def run_worker(
         audio_cache=audio_cache,
     )
 
-    rng = random.Random(seed)
-    rng.shuffle(entities)
+    if seed is not None:
+        rng = random.Random(seed)
+        rng.shuffle(entities)
+        LOGGER.info("Entity ordering: shuffled (seed=%d)", seed)
+    else:
+        entities = sort_manifest_by_session(entities)
+        LOGGER.info("Entity ordering: session-grouped sort (date, session_id)")
 
     def _shutdown_check() -> bool:
         return shutdown_event.is_set()
