@@ -913,19 +913,34 @@ def run_worker(
                 LOGGER.info(
                     "Archive timings %s/%s: prefetch_wait=%.3fs "
                     "scheduler_wait=%.3fs get_wait=%.3fs download_decode=%.3fs "
-                    "vad=%.3fs ready_age=%.3fs inference=%.3fs total=%.3fs "
-                    "precomputed_vad=%s",
+                    "resolve=%.3fs head=%.3fs download=%.3fs decode=%.3fs "
+                    "cache_wait=%.3fs vad_queue=%.3fs vad=%.3fs ready_age=%.3fs "
+                    "inference=%.3fs total=%.3fs precomputed_vad=%s "
+                    "cache_enabled=%s resolution_hit=%s object_hit=%s "
+                    "cache_write=%s fallback=%s fallback_reason=%s",
                     sid,
                     aid,
                     prefetch_wait_sec,
                     prefetch_scheduler_wait_sec,
                     prefetch_get_wait_sec,
                     pf_result.timings.download_decode_sec,
+                    pf_result.timings.resolve_sec,
+                    pf_result.timings.head_sec,
+                    pf_result.timings.download_sec,
+                    pf_result.timings.decode_sec,
+                    pf_result.timings.cache_wait_sec,
+                    pf_result.timings.vad_queue_wait_sec,
                     pf_result.timings.vad_sec,
                     prefetch_ready_age_sec,
                     inference_sec,
                     total_sec,
                     pf_result.vad_intervals is not None,
+                    pf_result.audio_cache_enabled,
+                    pf_result.resolution_cache_hit,
+                    pf_result.object_cache_hit,
+                    pf_result.cache_write,
+                    pf_result.cache_fallback,
+                    pf_result.cache_fallback_reason or "-",
                 )
 
                 _append_timing_record(timings_path, {
