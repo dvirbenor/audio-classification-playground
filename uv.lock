@@ -354,6 +354,7 @@ dependencies = [
     { name = "soundfile" },
     { name = "speechbrain" },
     { name = "torch" },
+    { name = "torchao" },
     { name = "torchaudio" },
     { name = "torchcodec" },
     { name = "torchvision" },
@@ -396,6 +397,7 @@ requires-dist = [
     { name = "soundfile", specifier = ">=0.13.1" },
     { name = "speechbrain", specifier = ">=1.1.0" },
     { name = "torch", specifier = ">=2.8.0" },
+    { name = "torchao", specifier = ">=0.17.0" },
     { name = "torchaudio", specifier = ">=2.8.0" },
     { name = "torchcodec", specifier = ">=0.9.1" },
     { name = "torchvision", specifier = ">=0.25.0" },
@@ -5061,6 +5063,15 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/bf/2b/17cb15a383cf2135330371e034d13b9043dc6d8bd07c871b5aa3064fbed1/torch_complex-0.4.4.tar.gz", hash = "sha256:4153fd6b24a0bad689e6f193bfbd00f38283b1890d808bef684ddc6d1f63fd3f", size = 10025, upload-time = "2024-06-28T07:10:28.136Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/f4/c5/9b4d756a7ada951e9b17dcc636f98ed1073c737ae809b150ef408afb6298/torch_complex-0.4.4-py3-none-any.whl", hash = "sha256:6ab4ecd4f3a16e3adb70a7f7cd2e769a9dfd07d7a8e27d04ff9c621ebbe34b13", size = 9125, upload-time = "2024-06-28T07:10:26.651Z" },
+]
+
+[[package]]
+name = "torchao"
+version = "0.17.0"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/32/fe/a4036a8e80fa800c92dbcbf75f541cd4c106248b6b579db6dab1800f616a/torchao-0.17.0-cp310-abi3-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:87a418ce0ec064a821ceab83c921b501acef0ce9a6ccd1be358fcd16c3ae8c58", size = 3206172, upload-time = "2026-03-30T22:25:52.974Z" },
+    { url = "https://files.pythonhosted.org/packages/c9/37/ef37ca885265e5f79a168616767dd416a3cea1cc3b28bb6b503ce4a5b652/torchao-0.17.0-py3-none-any.whl", hash = "sha256:02eba449036715b9ae784fbaa1a6f97994bb7b0421ce92d1d5d1c08e5bd6d349", size = 1200680, upload-time = "2026-03-30T22:25:54.457Z" },
 ]
 
 [[package]]

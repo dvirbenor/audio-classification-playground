@@ -38,6 +38,7 @@ dependencies = [
     "boto3>=1.42.89",
     "pyarrow>=21.0.0",
     "torchvision>=0.25.0",
+    "torchao>=0.17.0",
 ]
 
 [tool.hatch.build.targets.wheel]
