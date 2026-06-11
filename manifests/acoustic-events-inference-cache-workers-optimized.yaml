@@ -46,6 +46,7 @@ experiments:
   - name: inference-affect-cache-vadgated
     category: inference
     description: Run VAD-gated affect acoustic-event inference on g7e.2xlarge with shared decoded-audio cache
+    image: 690765672468.dkr.ecr.us-east-1.amazonaws.com/ml-dev-containers:gpu-1.0.22
     nodeSelector:
       node.kubernetes.io/instance-type: g7e.2xlarge
     cmd: /bin/bash
@@ -80,7 +81,7 @@ experiments:
         export GIT_SSH_COMMAND="ssh -i /workspace/.ssh/id_ed25519 -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=/workspace/.ssh/known_hosts"
 
         rm -rf audio-classification-playground
-        git clone --branch main --single-branch git@github.com:dvirbenor/audio-classification-playground.git
+        git clone --branch feature/inference-optimization --single-branch git@github.com:dvirbenor/audio-classification-playground.git
         cd audio-classification-playground
         echo "Git commit: $(git rev-parse HEAD)"
         uv sync --frozen
@@ -109,6 +110,7 @@ experiments:
   - name: inference-disfluency-cache
     category: inference
     description: Run disfluency acoustic-event inference on g7e.2xlarge with shared decoded-audio cache
+    image: 690765672468.dkr.ecr.us-east-1.amazonaws.com/ml-dev-containers:gpu-1.0.22
     nodeSelector:
       node.kubernetes.io/instance-type: g7e.2xlarge
     cmd: /bin/bash
@@ -143,7 +145,7 @@ experiments:
         export GIT_SSH_COMMAND="ssh -i /workspace/.ssh/id_ed25519 -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=/workspace/.ssh/known_hosts"
 
         rm -rf audio-classification-playground
-        git clone --branch main --single-branch git@github.com:dvirbenor/audio-classification-playground.git
+        git clone --branch feature/inference-optimization --single-branch git@github.com:dvirbenor/audio-classification-playground.git
         cd audio-classification-playground
         echo "Git commit: $(git rev-parse HEAD)"
         uv sync --frozen
@@ -170,6 +172,7 @@ experiments:
   - name: inference-emotion-cache-vadgated
     category: inference
     description: Run VAD-gated emotion acoustic-event inference on g7e.2xlarge with shared decoded-audio cache
+    image: 690765672468.dkr.ecr.us-east-1.amazonaws.com/ml-dev-containers:gpu-1.0.22
     nodeSelector:
       node.kubernetes.io/instance-type: g7e.2xlarge
     cmd: /bin/bash
@@ -206,7 +209,7 @@ experiments:
         export GIT_SSH_COMMAND="ssh -i /workspace/.ssh/id_ed25519 -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=/workspace/.ssh/known_hosts"
 
         rm -rf audio-classification-playground
-        git clone --branch main --single-branch git@github.com:dvirbenor/audio-classification-playground.git
+        git clone --branch feature/inference-optimization --single-branch git@github.com:dvirbenor/audio-classification-playground.git
         cd audio-classification-playground
         echo "Git commit: $(git rev-parse HEAD)"
         uv sync --frozen
@@ -279,7 +282,7 @@ experiments:
         export GIT_SSH_COMMAND="ssh -i /workspace/.ssh/id_ed25519 -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=/workspace/.ssh/known_hosts"
 
         rm -rf audio-classification-playground
-        git clone --branch main --single-branch git@github.com:dvirbenor/audio-classification-playground.git
+        git clone --branch feature/inference-optimization --single-branch git@github.com:dvirbenor/audio-classification-playground.git
         cd audio-classification-playground
         echo "Git commit: $(git rev-parse HEAD)"
         uv sync --frozen
