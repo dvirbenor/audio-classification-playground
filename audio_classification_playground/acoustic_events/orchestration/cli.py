@@ -107,6 +107,9 @@ def _cmd_run(args: argparse.Namespace) -> None:
         task_group=args.task_group,
         completion_policy=args.completion_policy,
         force_recompute=args.force_recompute,
+        vad_gating_enabled=args.vad_gating,
+        vad_gating_bridge_sec=args.vad_gating_bridge_sec,
+        vad_gating_tasks=tuple(args.vad_gating_tasks),
         seed=args.seed,
     )
 
@@ -465,8 +468,9 @@ def main(argv: list[str] | None = None) -> None:
         default=None,
         help=(
             "Worker-level WavLM preset. If unset, workers choose "
-            "compiled_static when CUDA/compiler prerequisites are available "
-            "and fast_exact otherwise."
+            "compiled_static (torch.compile + static-batch-256 + fp16 autocast) "
+            "when CUDA/compiler prerequisites are available, and fast_exact "
+            "(eager fp32) otherwise. fp16 is the validated default (event-level A/B passed)."
         ),
     )
     p_run.add_argument(
@@ -531,6 +535,34 @@ def main(argv: list[str] | None = None) -> None:
         "--force-recompute",
         action="store_true",
         help="Ignore existing task artifacts and recompute selected task-group work.",
+    )
+    from ..inference.vad_gating import (
+        DEFAULT_BRIDGE_SEC as _DEFAULT_VAD_BRIDGE_SEC,
+        DEFAULT_GATED_TASKS as _DEFAULT_GATED_TASKS,
+        GATABLE_TASKS as _GATABLE_TASKS,
+    )
+    p_run.add_argument(
+        "--vad-gating",
+        action="store_true",
+        help="Skip GPU inference on non-speech windows using VAD intervals "
+             "(event-identical for the gated tasks; gated artifacts get a "
+             "distinct config hash).",
+    )
+    p_run.add_argument(
+        "--vad-gating-bridge-sec",
+        type=float,
+        default=_DEFAULT_VAD_BRIDGE_SEC,
+        help="Bridge VAD gaps up to this many seconds before gating; must be "
+             ">= the largest producer merge/close gap (default keeps it safe).",
+    )
+    p_run.add_argument(
+        "--vad-gating-tasks",
+        nargs="+",
+        choices=_GATABLE_TASKS,
+        default=list(_DEFAULT_GATED_TASKS),
+        help="Which tasks to VAD-gate. Default excludes disfluency (its region "
+             "detection reads non-speech frames, so gating it is not yet "
+             "event-identical — see VAD_GATING_IMPLEMENTATION_PLAN.md §5.5).",
     )
     p_run.add_argument("--seed", type=int, default=None)
 

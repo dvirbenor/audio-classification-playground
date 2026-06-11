@@ -1,0 +1,306 @@
+# VAD-gated variant of acoustic-events-inference-cache-workers.yaml.
+#
+# Only difference vs. the base manifest: the affect and emotion GPU fleets pass
+# `--vad-gating`, which skips GPU compute on non-speech windows using the VAD
+# `intervals_sec` artifact. Emitted events stay identical for the gated tasks;
+# gated runs record the gating descriptor in `inference_config` (see
+# VAD_GATING_IMPLEMENTATION_PLAN.md).
+#
+# NOT gated here:
+#   - disfluency: its region detection reads non-speech frames, so gating is not
+#     yet event-identical (plan §5.5). Left unchanged.
+#   - vad: the VAD step PRODUCES the intervals; it is never gated.
+#
+# Operational prerequisites (task-fleet mode reads VAD from disk):
+#   1. The affect/emotion fleets do NOT compute VAD (precompute_vad=False for
+#      those task groups). They load intervals from the persisted `vad` artifact
+#      via _load_vad_intervals_from_artifact. So the VAD CPU fleet must lead:
+#      run inference-vad-cpu-cache ahead of / alongside the GPU fleets. On any
+#      archive whose vad/ artifact does not yet exist, gating silently falls back
+#      to full-timeline compute (correct, just no speedup).
+#   2. Completion policy is `exists` (as in the base manifest). The fleet output
+#      path is FLAT (<output>/<session>/<archive>/<task>/ — no config hash), so a
+#      gated run SKIPS archives whose affect/emotion artifact already exists and
+#      only speeds up not-yet-done work. To re-run the whole corpus gated instead,
+#      use a fresh --output, or --completion-policy config, or --force-recompute.
+config:
+  namespace: nlp-audio-understanding
+  team: nlp
+  project: audio-understanding
+  image: 690765672468.dkr.ecr.us-east-1.amazonaws.com/ai-content-provenance:latest
+  capacityType: on-demand
+  env:
+    CLEARML_WEB_HOST: http://clearml-webserver.clearml:8080
+    CLEARML_API_HOST: http://clearml-apiserver.clearml:8008
+    CLEARML_FILES_HOST: https://clearml-fileserver.ai-dev.riverside.fm
+    RS_OWNER: dvirbenor
+  ebs:
+    enabled: true
+    size: 1000Gi
+    persistent: false
+    mountPath: /workspace
+  s3Access:
+    enabled: true
+
+experiments:
+  - name: inference-affect-cache-vadgated
+    category: inference
+    description: Run VAD-gated affect acoustic-event inference on g7e.2xlarge with shared decoded-audio cache
+    nodeSelector:
+      node.kubernetes.io/instance-type: g7e.2xlarge
+    cmd: /bin/bash
+    args:
+      - -lc
+      - |
+        set -euo pipefail
+
+        export RUN_ID="{run_id}"
+        export PYTHONUNBUFFERED=1
+        export UV_LINK_MODE=copy
+
+        PARQUET="/efs/dvir/data/magic-clips-research/dataset-reference/all_archives.parquet"
+        OUTPUT="/efs/dvir/data/magic-clips-research/acoustic-understanding/models-inference"
+        AUDIO_CACHE="${OUTPUT}/_meta/audio_cache"
+        CACHE_BYTES=536870912000
+
+        LOG_DIR="${OUTPUT}/job-logs"
+        mkdir -p "$LOG_DIR"
+        LOG_FILE="$LOG_DIR/inference-affect-cache-vadgated-run-${RUN_ID}-${HOSTNAME:-unknown}.log"
+        exec > >(tee -a "$LOG_FILE") 2>&1
+
+        echo "[$(date -Iseconds)] Starting inference-affect-cache-vadgated run ${RUN_ID}"
+        cd /workspace
+
+        mkdir -p /workspace/.ssh
+        cp /mnt/github-ssh/id_ed25519 /workspace/.ssh/id_ed25519
+        cp /mnt/github-ssh/known_hosts /workspace/.ssh/known_hosts
+        chmod 700 /workspace/.ssh
+        chmod 400 /workspace/.ssh/id_ed25519
+        chmod 444 /workspace/.ssh/known_hosts
+        export GIT_SSH_COMMAND="ssh -i /workspace/.ssh/id_ed25519 -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=/workspace/.ssh/known_hosts"
+
+        rm -rf audio-classification-playground
+        git clone --branch main --single-branch git@github.com:dvirbenor/audio-classification-playground.git
+        cd audio-classification-playground
+        echo "Git commit: $(git rev-parse HEAD)"
+        uv sync --frozen
+        source .venv/bin/activate
+
+        source env.shared.sh
+        python -m audio_classification_playground.acoustic_events.orchestration run \
+          --parquet "$PARQUET" \
+          --output "$OUTPUT" \
+          --task-group affect \
+          --wavlm-runtime-preset compiled_static \
+          --completion-policy exists \
+          --affect-backbone wavlm \
+          --disfluency-backbone wavlm \
+          --device cuda \
+          --vad-gating \
+          --max-retries 3 \
+          --audio-cache-dir "$AUDIO_CACHE" \
+          --max-cache-bytes "$CACHE_BYTES"
+
+        echo "[$(date -Iseconds)] Finished inference-affect-cache-vadgated run ${RUN_ID}"
+    grid:
+      run_id: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+
+  # disfluency is intentionally NOT VAD-gated (not yet event-identical, plan §5.5).
+  - name: inference-disfluency-cache
+    category: inference
+    description: Run disfluency acoustic-event inference on g7e.2xlarge with shared decoded-audio cache
+    nodeSelector:
+      node.kubernetes.io/instance-type: g7e.2xlarge
+    cmd: /bin/bash
+    args:
+      - -lc
+      - |
+        set -euo pipefail
+
+        export RUN_ID="{run_id}"
+        export PYTHONUNBUFFERED=1
+        export UV_LINK_MODE=copy
+
+        PARQUET="/efs/dvir/data/magic-clips-research/dataset-reference/all_archives.parquet"
+        OUTPUT="/efs/dvir/data/magic-clips-research/acoustic-understanding/models-inference"
+        AUDIO_CACHE="${OUTPUT}/_meta/audio_cache"
+        CACHE_BYTES=536870912000
+
+        LOG_DIR="${OUTPUT}/job-logs"
+        mkdir -p "$LOG_DIR"
+        LOG_FILE="$LOG_DIR/inference-disfluency-cache-run-${RUN_ID}-${HOSTNAME:-unknown}.log"
+        exec > >(tee -a "$LOG_FILE") 2>&1
+
+        echo "[$(date -Iseconds)] Starting inference-disfluency-cache run ${RUN_ID}"
+        cd /workspace
+
+        mkdir -p /workspace/.ssh
+        cp /mnt/github-ssh/id_ed25519 /workspace/.ssh/id_ed25519
+        cp /mnt/github-ssh/known_hosts /workspace/.ssh/known_hosts
+        chmod 700 /workspace/.ssh
+        chmod 400 /workspace/.ssh/id_ed25519
+        chmod 444 /workspace/.ssh/known_hosts
+        export GIT_SSH_COMMAND="ssh -i /workspace/.ssh/id_ed25519 -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=/workspace/.ssh/known_hosts"
+
+        rm -rf audio-classification-playground
+        git clone --branch main --single-branch git@github.com:dvirbenor/audio-classification-playground.git
+        cd audio-classification-playground
+        echo "Git commit: $(git rev-parse HEAD)"
+        uv sync --frozen
+        source .venv/bin/activate
+
+        source env.shared.sh
+        python -m audio_classification_playground.acoustic_events.orchestration run \
+          --parquet "$PARQUET" \
+          --output "$OUTPUT" \
+          --task-group disfluency \
+          --wavlm-runtime-preset compiled_static \
+          --completion-policy exists \
+          --affect-backbone wavlm \
+          --disfluency-backbone wavlm \
+          --device cuda \
+          --max-retries 3 \
+          --audio-cache-dir "$AUDIO_CACHE" \
+          --max-cache-bytes "$CACHE_BYTES"
+
+        echo "[$(date -Iseconds)] Finished inference-disfluency-cache run ${RUN_ID}"
+    grid:
+      run_id: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+
+  - name: inference-emotion-cache-vadgated
+    category: inference
+    description: Run VAD-gated emotion acoustic-event inference on g7e.2xlarge with shared decoded-audio cache
+    nodeSelector:
+      node.kubernetes.io/instance-type: g7e.2xlarge
+    cmd: /bin/bash
+    args:
+      - -lc
+      - |
+        set -euo pipefail
+
+        export RUN_ID="{run_id}"
+        export PYTHONUNBUFFERED=1
+        export UV_LINK_MODE=copy
+        export TMPDIR=/workspace/tmp
+        mkdir -p "$TMPDIR"
+
+        PARQUET="/efs/dvir/data/magic-clips-research/dataset-reference/all_archives.parquet"
+        OUTPUT="/efs/dvir/data/magic-clips-research/acoustic-understanding/models-inference"
+        AUDIO_CACHE="${OUTPUT}/_meta/audio_cache"
+        CACHE_BYTES=536870912000
+
+        LOG_DIR="${OUTPUT}/job-logs"
+        mkdir -p "$LOG_DIR"
+        LOG_FILE="$LOG_DIR/inference-emotion-cache-vadgated-run-${RUN_ID}-${HOSTNAME:-unknown}.log"
+        exec > >(tee -a "$LOG_FILE") 2>&1
+
+        echo "[$(date -Iseconds)] Starting inference-emotion-cache-vadgated run ${RUN_ID}"
+        cd /workspace
+
+        mkdir -p /workspace/.ssh
+        cp /mnt/github-ssh/id_ed25519 /workspace/.ssh/id_ed25519
+        cp /mnt/github-ssh/known_hosts /workspace/.ssh/known_hosts
+        chmod 700 /workspace/.ssh
+        chmod 400 /workspace/.ssh/id_ed25519
+        chmod 444 /workspace/.ssh/known_hosts
+        export GIT_SSH_COMMAND="ssh -i /workspace/.ssh/id_ed25519 -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=/workspace/.ssh/known_hosts"
+
+        rm -rf audio-classification-playground
+        git clone --branch main --single-branch git@github.com:dvirbenor/audio-classification-playground.git
+        cd audio-classification-playground
+        echo "Git commit: $(git rev-parse HEAD)"
+        uv sync --frozen
+        source .venv/bin/activate
+
+        source env.shared.sh
+        python -m audio_classification_playground.acoustic_events.orchestration run \
+          --parquet "$PARQUET" \
+          --output "$OUTPUT" \
+          --task-group emotion \
+          --emotion-runtime-mode optimized \
+          --completion-policy exists \
+          --affect-backbone wavlm \
+          --disfluency-backbone wavlm \
+          --device cuda \
+          --vad-gating \
+          --prefetch-workers 8 \
+          --prefetch-lookahead 16 \
+          --vad-prefetch-workers 0 \
+          --max-retries 3 \
+          --audio-cache-dir "$AUDIO_CACHE" \
+          --max-cache-bytes "$CACHE_BYTES"
+
+        echo "[$(date -Iseconds)] Finished inference-emotion-cache-vadgated run ${RUN_ID}"
+    grid:
+      run_id: [1, 2, 3, 4, 5, 6, 7, 8]
+
+  # vad PRODUCES the intervals other tasks gate on; it is never gated itself.
+  - name: inference-vad-cpu-cache
+    category: inference
+    description: Run CPU-only VAD acoustic-event inference with shared decoded-audio cache
+    instanceTypes: ["c6a.4xlarge", "c7a.4xlarge", "c6i.4xlarge", "c7i.4xlarge"]
+    ephemeralStorage: "10Gi"
+    resources:
+      requests:
+        cpu: "13"
+        memory: "24Gi"
+      limits:
+        cpu: "13"
+        memory: "24Gi"
+    cmd: /bin/bash
+    args:
+      - -lc
+      - |
+        set -euo pipefail
+
+        export RUN_ID="{run_id}"
+        export PYTHONUNBUFFERED=1
+        export UV_LINK_MODE=copy
+
+        PARQUET="/efs/dvir/data/magic-clips-research/dataset-reference/all_archives.parquet"
+        OUTPUT="/efs/dvir/data/magic-clips-research/acoustic-understanding/models-inference"
+        AUDIO_CACHE="${OUTPUT}/_meta/audio_cache"
+        CACHE_BYTES=536870912000
+
+        LOG_DIR="${OUTPUT}/job-logs"
+        mkdir -p "$LOG_DIR"
+        LOG_FILE="$LOG_DIR/inference-vad-cpu-cache-run-${RUN_ID}-${HOSTNAME:-unknown}.log"
+        exec > >(tee -a "$LOG_FILE") 2>&1
+
+        echo "[$(date -Iseconds)] Starting inference-vad-cpu-cache run ${RUN_ID}"
+        cd /workspace
+
+        mkdir -p /workspace/.ssh
+        cp /mnt/github-ssh/id_ed25519 /workspace/.ssh/id_ed25519
+        cp /mnt/github-ssh/known_hosts /workspace/.ssh/known_hosts
+        chmod 700 /workspace/.ssh
+        chmod 400 /workspace/.ssh/id_ed25519
+        chmod 444 /workspace/.ssh/known_hosts
+        export GIT_SSH_COMMAND="ssh -i /workspace/.ssh/id_ed25519 -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=/workspace/.ssh/known_hosts"
+
+        rm -rf audio-classification-playground
+        git clone --branch main --single-branch git@github.com:dvirbenor/audio-classification-playground.git
+        cd audio-classification-playground
+        echo "Git commit: $(git rev-parse HEAD)"
+        uv sync --frozen
+        source .venv/bin/activate
+
+        source env.shared.sh
+        python -m audio_classification_playground.acoustic_events.orchestration run \
+          --parquet "$PARQUET" \
+          --output "$OUTPUT" \
+          --task-group vad \
+          --completion-policy exists \
+          --affect-backbone wavlm \
+          --disfluency-backbone wavlm \
+          --device cpu \
+          --prefetch-workers 6 \
+          --prefetch-lookahead 12 \
+          --vad-prefetch-workers 1 \
+          --max-retries 3 \
+          --audio-cache-dir "$AUDIO_CACHE" \
+          --max-cache-bytes "$CACHE_BYTES"
+
+        echo "[$(date -Iseconds)] Finished inference-vad-cpu-cache run ${RUN_ID}"
+    grid:
+      run_id: [1, 2, 3, 4, 5, 6, 7, 8]

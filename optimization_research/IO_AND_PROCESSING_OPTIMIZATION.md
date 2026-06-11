@@ -178,9 +178,20 @@ superset of what each producer reads*.
      full-length, so all downstream frame/centre/hop alignment is unchanged.
    emotion's on-GPU `predict_audio` strided path needs the mask applied to the stride grid — slightly more
    work than affect/disfluency (which take an explicit `windows` array), same idea.
-2. **Safe gate = superset:** dilate raw VAD intervals by (max producer merge-gap + window_sec + margin)
-   so every frame any producer consumes is real. Keeps inference loosely coupled to producers (needs VAD
-   + a conservative constant, not each producer's exact config).
+2. **Safe gate = superset (the edge-correctness rule).** A kept window is bit-identical to full-timeline
+   (gating skips windows, never changes a computed window's audio), so the *only* failure mode is dropping
+   a window a producer reads. Avoid it with: **keep any window that OVERLAPS a VAD interval, after bridging
+   VAD gaps by ~1.0–1.5 s.** Why this is a provable superset of every consumer:
+   - windows are 3.5 s (affect) / 3.0 s (disf/emo), hop 0.25 s — a frame summarizes `[i·hop, i·hop+W]`.
+   - affect reads *containment* (`assign_frame_blocks`: window ⊆ merged block, gaps bridged ≤ `vad_merge_gap_sec=0.5`),
+     which is **stricter than overlap** → overlap-gating covers it automatically.
+   - disfluency uses overlap with `merge_gap_sec=0.5`/`min_support_sec=0.5`; emotion uses overlap with
+     `support_close_gap_sec=**1.0**` (the binding constant).
+   - So bridging ≥1.0 s (+margin) and gating by **overlap** (NOT containment — containment would drop
+     boundary-straddling windows the producers read) is a superset of all three.
+   Keeps inference loosely coupled to producers (needs VAD + one conservative bridge constant). Cost: the
+   bridge+overlap dilation keeps a few more windows than the bare speech fraction, so realized saving is
+   a bit under the measured 55% (the §6 `window_keep` dilated by window length but not yet by the 1 s gap).
 3. **Immutability:** add a `vad_gated` flag (+ dilation params) to `inference_config` so the artifact hash
    reflects it — same pattern as `autocast_dtype`. The stored predictions differ at non-speech frames, so
    it's a new artifact lineage.
@@ -193,6 +204,16 @@ superset of what each producer reads*.
 **Verdict: this is the lever worth pursuing after fp16.** It targets the actual cost (GPU on silence),
 the consumers already assume speech-gating, and the fill value is essentially irrelevant — making it far
 closer to a "stop computing what's already discarded" optimization than a semantic change.
+
+### IMPLEMENTED + measured (real-archive A/B, 3 archives, L40S)
+Built behind `--vad-gating` (default off); see `VAD_GATING_IMPLEMENTATION_PLAN.md` for the design/status
+and `baseline_results/vad_gating_ab.json` for data. Event-A/B (full vs gated, real composition path):
+- **affect & emotion: bit-identical** on all 3 archives (0 dropped/added, label 1.000, 0 drift).
+- **disfluency: not identical** (1 dropped event on 2/3 archives) — its region detection reads non-speech
+  frames; **excluded from the default gated set** (opt-in once its producer is made speech-scoped).
+- **Speed (GPU/archive):** affect+emotion gated (the safe, event-identical config) = **~1.4× mean**
+  (1.28–1.50×); all-three gated would be **~2.3× mean** (1.65–2.79×) once disfluency is made gating-safe.
+  Per-task speedups scale with silence (affect 1.6–2.8×, disfluency 1.7–2.9×, emotion 1.6–2.6×).
 
 ## Reproduce
 ```

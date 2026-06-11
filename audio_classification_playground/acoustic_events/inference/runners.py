@@ -44,6 +44,13 @@ from .emotion_runtime import (
     torch_matmul_precision,
 )
 from .log import get_logger
+from .vad_gating import (
+    VadGating,
+    gate_window_arrays,
+    intervals_from_array,
+    scatter_fill,
+    speech_window_mask,
+)
 from .wavlm_runtime import (
     WAVLM_PREPROCESSING_POLICY,
     WAVLM_STATIC_BATCH_PADDING_POLICY,
@@ -86,6 +93,49 @@ class TaskRun:
     reused: bool
 
 
+def _load_vad_intervals_from_artifact(
+    vad_path: Path | None,
+) -> list[tuple[float, float]] | None:
+    """Load ``intervals_sec`` from an existing VAD artifact, or ``None``.
+
+    Used by ``run_all_inference`` when gating is requested but the VAD task is
+    not (re)run in this call (e.g. VAD already complete, only affect missing).
+    """
+    if vad_path is None:
+        return None
+    try:
+        artifact = load_prediction_artifact(vad_path)
+    except (OSError, ValueError, KeyError, FileNotFoundError, json.JSONDecodeError):
+        return None
+    if artifact.manifest.get("task") != "vad":
+        return None
+    return intervals_from_array(artifact.arrays.get("intervals_sec"))
+
+
+def _task_gate(vad_gating: VadGating | None, task: str) -> VadGating | None:
+    """Return the gating settings if *task* should be gated, else ``None``."""
+    if vad_gating is not None and vad_gating.gates(task):
+        return vad_gating
+    return None
+
+
+def _apply_gating(
+    config: dict,
+    vad_gating: VadGating | None,
+    vad_intervals: Sequence[tuple[float, float]] | None = None,
+) -> dict:
+    """Merge the VAD-gating descriptor into an inference config (when it applies).
+
+    Tagged only when gating is active *and* intervals are actually available —
+    so an artifact is never labelled "gated" if it was in fact computed over the
+    full timeline (intervals missing). Changes ``inference_config_hash`` so gated
+    artifacts are a distinct lineage (immutability), mirroring ``autocast_dtype``.
+    """
+    if vad_gating is not None and vad_gating.active and vad_intervals is not None:
+        return {**config, **vad_gating.config_extra()}
+    return config
+
+
 def run_affect_inference(
     audio_path: str | Path | AudioData,
     *,
@@ -113,6 +163,8 @@ def run_affect_inference(
     artifact_path: Path | None = None,
     audio_path_override: str | None = None,
     audio_source_key: str | None = None,
+    vad_intervals: Sequence[tuple[float, float]] | None = None,
+    vad_gating: VadGating | None = None,
 ) -> TaskRun:
     """Run Vox-Profile dimensional affect inference and persist A/V/D arrays."""
     if backbone not in DEFAULT_AFFECT_MODELS:
@@ -143,6 +195,8 @@ def run_affect_inference(
             **wavlm_effective,
         ),
     )
+    affect_gate = _task_gate(vad_gating, "affect")
+    config = _apply_gating(config, affect_gate, vad_intervals)
     cached = _maybe_cached(out_dir, audio, "affect", config, reuse_cache, artifact_path)
     if cached is not None:
         _progress(progress, f"affect cache hit: {cached.path}")
@@ -157,11 +211,11 @@ def run_affect_inference(
     )
     _progress(progress, f"affect windows: {len(windows)}")
     try:
-        arrays = (
-            predictor(windows)
-            if predictor is not None
-            else _predict_affect(
-                windows,
+        def _run_affect(batch_windows):
+            if predictor is not None:
+                return predictor(batch_windows)
+            return _predict_affect(
+                batch_windows,
                 backbone=backbone,
                 model_id=resolved_model_id,
                 device=device,
@@ -175,6 +229,15 @@ def run_affect_inference(
                 allow_tf32=allow_tf32,
                 progress=progress,
             )
+
+        arrays, _ = gate_window_arrays(
+            _run_affect,
+            windows,
+            hop_sec=hop_sec,
+            window_sec=window_sec,
+            vad_intervals=vad_intervals,
+            gating=affect_gate,
+            fill=0.0,
         )
         arrays = _validate_affect_arrays(arrays)
         artifact = _write_task_artifact(
@@ -236,6 +299,8 @@ def run_disfluency_inference(
     artifact_path: Path | None = None,
     audio_path_override: str | None = None,
     audio_source_key: str | None = None,
+    vad_intervals: Sequence[tuple[float, float]] | None = None,
+    vad_gating: VadGating | None = None,
 ) -> TaskRun:
     """Run Vox-Profile disfluency inference and persist raw logits."""
     if backbone not in DEFAULT_DISFLUENCY_MODELS:
@@ -266,6 +331,8 @@ def run_disfluency_inference(
             **wavlm_effective,
         ),
     )
+    disfluency_gate = _task_gate(vad_gating, "disfluency")
+    config = _apply_gating(config, disfluency_gate, vad_intervals)
     cached = _maybe_cached(out_dir, audio, "disfluency", config, reuse_cache, artifact_path)
     if cached is not None:
         _progress(progress, f"disfluency cache hit: {cached.path}")
@@ -280,11 +347,11 @@ def run_disfluency_inference(
     )
     _progress(progress, f"disfluency windows: {len(windows)}")
     try:
-        arrays = (
-            predictor(windows)
-            if predictor is not None
-            else _predict_disfluency(
-                windows,
+        def _run_disfluency(batch_windows):
+            if predictor is not None:
+                return predictor(batch_windows)
+            return _predict_disfluency(
+                batch_windows,
                 backbone=backbone,
                 model_id=resolved_model_id,
                 device=device,
@@ -298,6 +365,15 @@ def run_disfluency_inference(
                 allow_tf32=allow_tf32,
                 progress=progress,
             )
+
+        arrays, _ = gate_window_arrays(
+            _run_disfluency,
+            windows,
+            hop_sec=hop_sec,
+            window_sec=window_sec,
+            vad_intervals=vad_intervals,
+            gating=disfluency_gate,
+            fill=0.0,
         )
         arrays = _validate_disfluency_arrays(arrays)
         artifact = _write_task_artifact(
@@ -355,6 +431,8 @@ def run_emotion_inference(
     artifact_path: Path | None = None,
     audio_path_override: str | None = None,
     audio_source_key: str | None = None,
+    vad_intervals: Sequence[tuple[float, float]] | None = None,
+    vad_gating: VadGating | None = None,
 ) -> TaskRun:
     """Run emotion2vec inference and persist canonical probabilities."""
     runtime_settings = resolve_emotion_runtime_settings(
@@ -388,6 +466,8 @@ def run_emotion_inference(
             allow_tf32=runtime_settings.allow_tf32,
         ),
     )
+    emotion_gate = _task_gate(vad_gating, "emotion")
+    config = _apply_gating(config, emotion_gate, vad_intervals)
     cached = _maybe_cached(out_dir, audio, "emotion", config, reuse_cache, artifact_path)
     if cached is not None:
         _progress(progress, f"emotion cache hit: {cached.path}")
@@ -400,40 +480,59 @@ def run_emotion_inference(
         hop_sec=hop_sec,
     )
     _progress(progress, f"emotion windows: {n_windows}")
+    gate_on = emotion_gate is not None and vad_intervals is not None
     try:
-        predict_audio = getattr(predictor, "predict_audio", None) if predictor is not None else None
-        if callable(predict_audio):
-            raw_scores, raw_labels = predict_audio(
+        if gate_on:
+            # Gate via the framed-windows path (numerically identical to the
+            # predict_audio stride path on the same windows) so non-speech
+            # windows are skipped and filled at the raw-score level.
+            raw_scores, raw_labels = _emotion_scores_gated(
                 audio.samples,
-                sample_rate=sample_rate,
-                window_sec=window_sec,
-                hop_sec=hop_sec,
-                progress=progress,
-            )
-        elif predictor is not None:
-            _progress(progress, "emotion framing audio")
-            windows = frame_audio(
-                audio.samples,
-                sample_rate=sample_rate,
-                window_sec=window_sec,
-                hop_sec=hop_sec,
-            )
-            raw_scores, raw_labels = predictor(windows)
-        else:
-            raw_scores, raw_labels = _predict_emotion2vec(
-                audio.samples,
+                predictor=predictor,
                 model_id=model_id,
                 sample_rate=sample_rate,
                 window_sec=window_sec,
                 hop_sec=hop_sec,
                 batch_size=resolved_batch_size,
-                device=runtime_settings.device,
-                autocast_dtype=runtime_settings.autocast_dtype,
-                compile_model=runtime_settings.compile_model,
-                compile_mode=runtime_settings.compile_mode,
-                allow_tf32=runtime_settings.allow_tf32,
+                runtime_settings=runtime_settings,
+                vad_intervals=vad_intervals,
+                vad_gating=vad_gating,
                 progress=progress,
             )
+        else:
+            predict_audio = getattr(predictor, "predict_audio", None) if predictor is not None else None
+            if callable(predict_audio):
+                raw_scores, raw_labels = predict_audio(
+                    audio.samples,
+                    sample_rate=sample_rate,
+                    window_sec=window_sec,
+                    hop_sec=hop_sec,
+                    progress=progress,
+                )
+            elif predictor is not None:
+                _progress(progress, "emotion framing audio")
+                windows = frame_audio(
+                    audio.samples,
+                    sample_rate=sample_rate,
+                    window_sec=window_sec,
+                    hop_sec=hop_sec,
+                )
+                raw_scores, raw_labels = predictor(windows)
+            else:
+                raw_scores, raw_labels = _predict_emotion2vec(
+                    audio.samples,
+                    model_id=model_id,
+                    sample_rate=sample_rate,
+                    window_sec=window_sec,
+                    hop_sec=hop_sec,
+                    batch_size=resolved_batch_size,
+                    device=runtime_settings.device,
+                    autocast_dtype=runtime_settings.autocast_dtype,
+                    compile_model=runtime_settings.compile_model,
+                    compile_mode=runtime_settings.compile_mode,
+                    allow_tf32=runtime_settings.allow_tf32,
+                    progress=progress,
+                )
         probabilities, labels = emotion2vec_scores_to_probabilities(raw_scores, raw_labels)
         artifact = _write_task_artifact(
             out_dir,
@@ -588,6 +687,8 @@ def run_all_inference(
     audio_source_key: str | None = None,
     shutdown_check: Callable[[], bool] | None = None,
     tasks_filter: Sequence[str] | None = None,
+    vad_gating: VadGating | None = None,
+    vad_intervals: Sequence[tuple[float, float]] | None = None,
 ) -> InferenceRunResult:
     """Run VAD, affect, disfluency, and emotion sequentially.
 
@@ -658,6 +759,17 @@ def run_all_inference(
     def _ap(task: str) -> Path | None:
         return artifact_path_fn(task) if artifact_path_fn is not None else None
 
+    # VAD-gating: resolve the speech intervals once and feed them to the GPU
+    # tasks.  Intervals come from (1) an explicit caller value, (2) the vad
+    # step when it runs in this call, or (3) an existing vad artifact on disk.
+    # If none are available, gating is a no-op for this run (full timeline).
+    gating = vad_gating if (vad_gating is not None and vad_gating.active) else None
+    gate_state = {
+        "intervals": (list(vad_intervals) if vad_intervals is not None else None)
+    }
+    if gating is not None and gate_state["intervals"] is None:
+        gate_state["intervals"] = _load_vad_intervals_from_artifact(_ap("vad"))
+
     artifacts: dict[str, PredictionArtifact] = {}
     reused: dict[str, bool] = {}
     steps = [
@@ -702,6 +814,8 @@ def run_all_inference(
                 artifact_path=_ap("affect"),
                 audio_path_override=audio_path_override,
                 audio_source_key=audio_source_key,
+                vad_intervals=gate_state["intervals"],
+                vad_gating=gating,
             ),
         ),
         (
@@ -727,6 +841,8 @@ def run_all_inference(
                 artifact_path=_ap("disfluency"),
                 audio_path_override=audio_path_override,
                 audio_source_key=audio_source_key,
+                vad_intervals=gate_state["intervals"],
+                vad_gating=gating,
             ),
         ),
         (
@@ -748,6 +864,8 @@ def run_all_inference(
                 artifact_path=_ap("emotion"),
                 audio_path_override=audio_path_override,
                 audio_source_key=audio_source_key,
+                vad_intervals=gate_state["intervals"],
+                vad_gating=gating,
             ),
         ),
     ]
@@ -789,6 +907,14 @@ def run_all_inference(
         )
         artifacts[task] = result.artifact
         reused[task] = result.reused
+        if (
+            task == "vad"
+            and gating is not None
+            and gate_state["intervals"] is None
+        ):
+            gate_state["intervals"] = intervals_from_array(
+                result.artifact.arrays.get("intervals_sec")
+            )
     return InferenceRunResult(
         artifacts=artifacts, reused=reused, task_elapsed_sec=task_elapsed_sec,
     )
@@ -1413,6 +1539,104 @@ def _predict_emotion2vec(
             compile_mode=compile_mode,
             progress=progress,
         )
+
+
+def _predict_emotion2vec_windows(
+    windows: np.ndarray,
+    *,
+    model_id: str,
+    sample_rate: int,
+    batch_size: int,
+    device: str | None,
+    autocast_dtype: str | None,
+    compile_model: bool,
+    compile_mode: str,
+    allow_tf32: bool,
+    progress: ProgressFn | None,
+) -> tuple[np.ndarray, Sequence[str]]:
+    """No-predictor emotion2vec scoring over an explicit windows array."""
+    from funasr import AutoModel
+
+    auto_kwargs = {
+        "model": model_id,
+        "batch_size": batch_size,
+        "disable_update": True,
+        "disable_pbar": True,
+    }
+    if device is not None:
+        auto_kwargs["device"] = device
+    with torch_matmul_precision(allow_tf32=allow_tf32):
+        model = AutoModel(**auto_kwargs)
+        return predict_emotion2vec_scores(
+            model,
+            windows,
+            sample_rate=sample_rate,
+            batch_size=batch_size,
+            autocast_dtype=autocast_dtype,
+            compile_model=compile_model,
+            compile_mode=compile_mode,
+            progress=progress,
+        )
+
+
+def _emotion_scores_gated(
+    samples: np.ndarray,
+    *,
+    predictor,
+    model_id: str,
+    sample_rate: int,
+    window_sec: float,
+    hop_sec: float,
+    batch_size: int,
+    runtime_settings,
+    vad_intervals: Sequence[tuple[float, float]],
+    vad_gating: VadGating,
+    progress: ProgressFn | None,
+) -> tuple[np.ndarray, Sequence[str]]:
+    """Score only speech windows, scatter into a full-length raw-score array.
+
+    Non-speech rows are filled with a uniform-positive sentinel (ones) so the
+    existing fold+normalize+sum-to-1 conversion stays valid; the emotion
+    producer never reads them (it gates on speech). Kept rows are identical to
+    the ungated framed path.
+    """
+    windows = frame_audio(
+        samples, sample_rate=sample_rate, window_sec=window_sec, hop_sec=hop_sec
+    )
+    n_windows = len(windows)
+    mask = speech_window_mask(
+        n_windows, hop_sec, window_sec, vad_intervals, bridge_sec=vad_gating.bridge_sec
+    )
+    kept = np.nonzero(mask)[0]
+    _progress(progress, f"emotion gated windows: {kept.size}/{n_windows}")
+
+    def _score(batch_windows):
+        if predictor is not None:
+            return predictor(batch_windows)
+        return _predict_emotion2vec_windows(
+            batch_windows,
+            model_id=model_id,
+            sample_rate=sample_rate,
+            batch_size=batch_size,
+            device=runtime_settings.device,
+            autocast_dtype=runtime_settings.autocast_dtype,
+            compile_model=runtime_settings.compile_model,
+            compile_mode=runtime_settings.compile_mode,
+            allow_tf32=runtime_settings.allow_tf32,
+            progress=progress,
+        )
+
+    if kept.size:
+        raw_sub, raw_labels = _score(windows[kept])
+        raw_scores = scatter_fill(
+            np.asarray(raw_sub, dtype=np.float32), kept, n_windows, fill=1.0
+        )
+    else:
+        # All silence: score one probe window only to learn the label set,
+        # then fill the whole timeline with the uniform sentinel.
+        _, raw_labels = _score(windows[:1])
+        raw_scores = np.full((n_windows, len(raw_labels)), 1.0, dtype=np.float32)
+    return raw_scores, raw_labels
 
 
 def _detect_silero_vad(

@@ -140,7 +140,9 @@ def resolve_wavlm_runtime_settings(
                 preset="compiled_static",
                 device=resolved_device,
                 task_batch_size=WAVLM_COMPILED_STATIC_BATCH_SIZE,
-                autocast_dtype=None,
+                # fp16 autocast is the validated default (event-level A/B passed on
+                # affect/disfluency/emotion; in inference_config_hash so artifacts don't collide).
+                autocast_dtype="fp16",
                 compile_model=True,
                 compile_mode=WAVLM_COMPILE_MODE,
                 compile_dynamic=False,

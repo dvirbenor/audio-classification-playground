@@ -51,6 +51,7 @@ from ..inference.runners import (
     resolve_task_batch_sizes,
     run_all_inference,
 )
+from ..inference.vad_gating import DEFAULT_BRIDGE_SEC, DEFAULT_GATED_TASKS, VadGating
 from ..inference.wavlm_runtime import (
     WAVLM_COMPILED_STATIC_BATCH_SIZE,
     configure_inductor_cache_namespace,
@@ -229,6 +230,7 @@ def build_expected_configs(
     emotion_runtime_mode: str | None = "auto",
     allow_tf32: bool = False,
     device: str | None = None,
+    vad_gating: VadGating | None = None,
 ) -> dict[str, dict]:
     """Compute expected inference configs for each task.
 
@@ -335,6 +337,12 @@ def build_expected_configs(
             "frame_speech_ratio_threshold": float(DEFAULT_VAD_FRAME_SPEECH_RATIO_THRESHOLD),
         },
     )
+    # VAD gating applies to the GPU tasks only (not the VAD step that produces
+    # the intervals); merge the descriptor so gated artifacts hash distinctly.
+    if vad_gating is not None and vad_gating.active:
+        for task in ("affect", "disfluency", "emotion"):
+            if vad_gating.gates(task):
+                configs[task] = {**configs[task], **vad_gating.config_extra()}
     return configs
 
 
@@ -412,6 +420,9 @@ def run_worker(
     task_group: str = TASK_GROUP_ALL,
     completion_policy: str = COMPLETION_POLICY_EXISTS,
     force_recompute: bool = False,
+    vad_gating_enabled: bool = False,
+    vad_gating_bridge_sec: float = DEFAULT_BRIDGE_SEC,
+    vad_gating_tasks: tuple[str, ...] = DEFAULT_GATED_TASKS,
     seed: int | None = None,
 ) -> None:
     """Entry point for a single worker pod.
@@ -513,6 +524,19 @@ def run_worker(
         prefetch_scheduler,
     )
 
+    vad_gating = VadGating(
+        enabled=bool(vad_gating_enabled),
+        bridge_sec=float(vad_gating_bridge_sec),
+        tasks=tuple(vad_gating_tasks),
+    )
+    if vad_gating.active:
+        LOGGER.info(
+            "VAD-gated inference enabled: bridge_sec=%.2f policy=%s tasks=%s",
+            vad_gating.bridge_sec,
+            vad_gating.policy,
+            ",".join(vad_gating.tasks),
+        )
+
     output_base = Path(output_base)
     _guard_against_mixed_lock_modes(output_base, task_group=group.name)
     worker_id = f"{os.environ.get('HOSTNAME', 'unknown')}_{uuid.uuid4().hex[:8]}"
@@ -563,6 +587,7 @@ def run_worker(
         emotion_runtime_mode=emotion_runtime_mode,
         allow_tf32=allow_tf32,
         device=emotion_settings.device,
+        vad_gating=vad_gating,
     )
     expected_hashes = {
         task: inference_config_hash(cfg)
@@ -911,6 +936,8 @@ def run_worker(
                     audio_source_key=pf_result.s3_key,
                     shutdown_check=_shutdown_check,
                     tasks_filter=tasks_to_run,
+                    vad_gating=vad_gating,
+                    vad_intervals=pf_result.vad_intervals,
                 )
                 inference_sec = time.perf_counter() - inference_started
                 total_sec = time.perf_counter() - archive_started

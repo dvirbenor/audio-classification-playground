@@ -121,7 +121,8 @@ def resolve_emotion_runtime_settings(
             requested_mode=mode or "auto",
             mode="optimized",
             device=resolved_device,
-            autocast_dtype=None,
+            # fp16 autocast is the validated default (emotion event-level A/B passed; in config hash).
+            autocast_dtype="fp16",
             compile_model=True,
             compile_mode=DEFAULT_EMOTION_COMPILE_MODE,
             allow_tf32=True,

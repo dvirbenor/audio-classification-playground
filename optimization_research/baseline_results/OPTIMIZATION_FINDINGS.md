@@ -293,5 +293,9 @@ fp8 tested on L40S ✅ → **weak** (torchao unusable; hand-rolled +13% affect o
 **All levers measured. fp16 is the win on all three tasks.** Ship as:
 - **floor (robust): fp16 autocast** — ~1.44× on affect/disfluency/emotion, no compile/header dependency.
 - **ceiling: fp16 + compile** — ~2.2× on WavLM, *only if the fleet image ships `python3.10-dev`* (§2e; emotion gets no compile benefit).
-Remaining code change: flip WavLM (and emotion) default to fp16 (config-hash handles immutability).
-Pending: event-level A/B for emotion fp16 (expected to pass, drift 1.2e-3); verify python3.10-dev in fleet image.
+**SHIPPED:** emotion fp16 event-level A/B **passed** (130 events across 3 real archives: 0 added/dropped,
+label 1.000, Δstart 0.000s, Δscore ≤0.002) → fp16 now validated event-safe on **all three tasks**.
+**Default flipped to fp16 in code** — `compiled_static` (WavLM) and `optimized` (emotion) now set
+`autocast_dtype="fp16"` (`wavlm_runtime.py` / `emotion_runtime.py`); 53 preset/artifact/worker tests pass;
+fp16 is in the config hash → fresh artifact dirs, old fp32 retained. Remaining: verify `python3.10-dev`
+(or matching `pythonX.Y-dev`) in the fleet image so `compiled_static` stays eligible.
