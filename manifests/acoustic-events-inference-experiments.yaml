@@ -52,7 +52,7 @@ experiments:
         export GIT_SSH_COMMAND="ssh -i /workspace/.ssh/id_ed25519 -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=/workspace/.ssh/known_hosts"
 
         rm -rf audio-classification-playground
-        git clone --branch main --single-branch git@github.com:dvirbenor/audio-classification-playground.git
+        git clone --branch feature/inference-optimization --single-branch git@github.com:dvirbenor/audio-classification-playground.git
         cd audio-classification-playground
         echo "Git commit: $(git rev-parse HEAD)"
         uv sync --frozen
@@ -67,7 +67,9 @@ experiments:
           --affect-backbone wavlm \
           --disfluency-backbone wavlm \
           --device cuda \
-          --max-retries 3
+          --max-retries 3 \
+          --wavlm-runtime-preset compiled_static \
+          --vad-gating
 
         echo "[$(date -Iseconds)] Finished inference-affect run ${RUN_ID}"
     grid:
@@ -103,7 +105,7 @@ experiments:
         export GIT_SSH_COMMAND="ssh -i /workspace/.ssh/id_ed25519 -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=/workspace/.ssh/known_hosts"
 
         rm -rf audio-classification-playground
-        git clone --branch main --single-branch git@github.com:dvirbenor/audio-classification-playground.git
+        git clone --branch feature/inference-optimization --single-branch git@github.com:dvirbenor/audio-classification-playground.git
         cd audio-classification-playground
         echo "Git commit: $(git rev-parse HEAD)"
         uv sync --frozen
@@ -118,7 +120,9 @@ experiments:
           --affect-backbone wavlm \
           --disfluency-backbone wavlm \
           --device cuda \
-          --max-retries 3
+          --max-retries 3 \
+          --wavlm-runtime-preset compiled_static \
+          --vad-gating
 
         echo "[$(date -Iseconds)] Finished inference-disfluency run ${RUN_ID}"
     grid:
@@ -154,7 +158,7 @@ experiments:
         export GIT_SSH_COMMAND="ssh -i /workspace/.ssh/id_ed25519 -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=/workspace/.ssh/known_hosts"
 
         rm -rf audio-classification-playground
-        git clone --branch main --single-branch git@github.com:dvirbenor/audio-classification-playground.git
+        git clone --branch feature/inference-optimization --single-branch git@github.com:dvirbenor/audio-classification-playground.git
         cd audio-classification-playground
         echo "Git commit: $(git rev-parse HEAD)"
         uv sync --frozen
@@ -169,7 +173,8 @@ experiments:
           --affect-backbone wavlm \
           --disfluency-backbone wavlm \
           --device cuda \
-          --max-retries 3
+          --max-retries 3 \
+          --vad-gating
 
         echo "[$(date -Iseconds)] Finished emotion-vad run ${RUN_ID}"
     grid:
