@@ -267,3 +267,12 @@ review_packages_validation_vad_gated/robbiestaniforth-2026-2-9__14-44-54/5f33796
 review_packages_validation_vad_gated/robbiestaniforth-2026-2-9__14-44-54/5f33796c4f01250141eff666/tracks/affect.default.npz
 review_packages_validation_vad_gated/robbiestaniforth-2026-2-9__14-44-54/5f33796c4f01250141eff666/tracks/disfluency.default.npz
 review_packages_validation_vad_gated/robbiestaniforth-2026-2-9__14-44-54/5f33796c4f01250141eff666/tracks/emotion.categorical.v1.npz
+
+# --- Inference-optimization research artifacts (regenerable; keep MD writeups + scripts, ignore raw data) ---
+# Benchmark output JSONs — regenerate by re-running the scripts/*.py with --json-out (see the MD files).
+optimization_research/**/*.json
+# Benchmark audio: large real-archive WAVs + their index sidecar.
+# Regenerate (deterministic — fixed seed + manifest):
+#   uv run python scripts/retrieve_benchmark_audio.py --seed 0 --n 5 --out-dir benchmark_audio
+benchmark_audio/*.wav
+benchmark_audio/index.json

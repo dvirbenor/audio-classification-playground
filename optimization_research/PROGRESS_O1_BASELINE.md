@@ -94,10 +94,19 @@ No production default changed.
   (repo-owned, reinstall-safe, fp32 bit-identical). Measured only **~1.05×**: WavLM is GEMM-bound
   (short ~150–174-token windows → attention ~3% of FLOPs). Keep it (free) but not a headline.
   *Not wired into model load yet.* See `OPTIMIZATION_FINDINGS.md §2`.
-- **(4) O6 INT8 PTQ — now the highest-leverage remaining lever** (int8 tensor cores ~2× the dominant
-  GEMMs). Needs a calibration set + event-level A/B (drift). Bigger expected win than TRT here.
-- **(5) Measure TRT** via `benchmark_wavlm_onnx_trt.py` (needs `onnxruntime-gpu`) before the O4 build —
-  its attention-fusion edge is small for this workload, so the "2–4×" is overstated; measure GEMM-autotune gain.
-- **(2) Flip WavLM default to fp16** (+ optionally wire SDPA on) — unblocked; not yet done in code.
+- **(4) O6 INT8 PTQ** ✅ TESTED → **REJECTED** (`compare_wavlm_int8.py`, see `OPTIMIZATION_FINDINGS.md §2b`):
+  (a) speed blocked — int8+compile fails to trace on torch 2.10/torchao 0.17 (needs torch≥2.11), eager
+  int8 is *slower* (76/88 win/s); (b) **fails the event gate** — adds/drops events, flips ~18% affect
+  labels, shifts affect scores up to 1.54 / boundaries up to 4 s. Affect regression has a real int8
+  accuracy cliff. Revisit only with torch≥2.11 + mixed-precision + static calibration; uncertain payoff.
+- **(5) O4 TensorRT** ✅ TESTED → **REJECTED** (`benchmark_wavlm_onnx_trt.py`, `OPTIMIZATION_FINDINGS.md §2c`):
+  ONNX export OK (gated-attention risk didn't bite); ONNX/TRT-fp32 bit-exact. TRT-fp32 only **1.19×** vs
+  eager (structural win is small — confirms GEMM-bound); TRT-fp16 **2.44× but NaN** (fp16 overflow). Doesn't
+  beat PyTorch fp16+compile (2.2×, lossless). Not worth the deploy cost. Installed onnxruntime-gpu+tensorrt
+  via `uv pip` (venv only, not in uv.lock).
+
+**All optimization levers now measured → endpoint = PyTorch fp16+compile (2.2×, lossless, event-safe).**
+Remaining actions:
+- **(2) Flip WavLM default to fp16** (+ optionally wire SDPA on) — the one code change left; unblocked by the A/B.
 - **(a)** Worker end-to-end → I/O-inclusive archives/sec from timings JSONL (compute- vs I/O-bound).
 - Verify the emotion `optimized` no-fallback compile guard against the fleet image (O1 finding #2).
