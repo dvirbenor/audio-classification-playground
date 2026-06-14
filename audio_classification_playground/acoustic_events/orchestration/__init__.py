@@ -3,6 +3,8 @@
 See ``orchestration/README.md`` for architecture overview, usage, and
 deployment instructions.
 """
+from typing import TYPE_CHECKING
+
 from .manifest import ArchiveEntity, load_manifest
 from .progress import (
     ProgressSummary,
@@ -12,7 +14,21 @@ from .progress import (
     quick_disk_summary,
     scan_progress,
 )
-from .worker import run_worker
+
+if TYPE_CHECKING:
+    from .worker import run_worker
+
+
+def __getattr__(name: str):
+    # Lazily import ``run_worker`` so that read-only CLI commands
+    # (progress/status/timings/errors) and other lightweight consumers don't
+    # pull in ``worker`` and its heavy torch/inference dependency chain.
+    if name == "run_worker":
+        from .worker import run_worker
+
+        return run_worker
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 __all__ = [
     "ArchiveEntity",
