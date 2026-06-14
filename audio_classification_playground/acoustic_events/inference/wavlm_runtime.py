@@ -85,8 +85,15 @@ def resolve_wavlm_runtime_settings(
     compile_dynamic: bool,
     stream_layer_sum: bool,
     allow_tf32: bool,
+    static_batch_size: int | None = None,
 ) -> WavLMRuntimeSettings:
-    """Resolve orchestration WavLM presets to the existing low-level knobs."""
+    """Resolve orchestration WavLM presets to the existing low-level knobs.
+
+    ``static_batch_size`` overrides the compiled-static batch dimension (default
+    ``WAVLM_COMPILED_STATIC_BATCH_SIZE``). Larger fixed batches better fill big
+    GPUs (e.g. Blackwell); the value is excluded from the semantic
+    ``inference_config_hash`` so it never changes artifact identity.
+    """
     resolved_device = resolve_wavlm_device(device)
     granular = has_custom_wavlm_runtime_knobs(
         autocast_dtype=autocast_dtype,
@@ -106,6 +113,19 @@ def resolve_wavlm_runtime_settings(
             "WavLM runtime presets cannot be combined with granular WavLM knobs; "
             "omit the preset for custom experiments."
         )
+    if static_batch_size is not None:
+        if int(static_batch_size) <= 0:
+            raise ValueError("wavlm_static_batch_size must be a positive integer")
+        if granular:
+            raise ValueError(
+                "wavlm_static_batch_size only applies to the compiled_static "
+                "preset; it cannot be combined with granular WavLM knobs."
+            )
+        if preset == "fast_exact":
+            raise ValueError(
+                "wavlm_static_batch_size requires the compiled_static preset "
+                "(fast_exact does not use a static batch)."
+            )
 
     if preset is None and granular:
         return WavLMRuntimeSettings(
@@ -139,7 +159,11 @@ def resolve_wavlm_runtime_settings(
                 requested_preset=requested,
                 preset="compiled_static",
                 device=resolved_device,
-                task_batch_size=WAVLM_COMPILED_STATIC_BATCH_SIZE,
+                task_batch_size=(
+                    int(static_batch_size)
+                    if static_batch_size is not None
+                    else WAVLM_COMPILED_STATIC_BATCH_SIZE
+                ),
                 # fp16 autocast is the validated default (event-level A/B passed on
                 # affect/disfluency/emotion; in inference_config_hash so artifacts don't collide).
                 autocast_dtype="fp16",

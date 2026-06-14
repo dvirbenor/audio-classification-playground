@@ -53,7 +53,6 @@ from ..inference.runners import (
 )
 from ..inference.vad_gating import DEFAULT_BRIDGE_SEC, DEFAULT_GATED_TASKS, VadGating
 from ..inference.wavlm_runtime import (
-    WAVLM_COMPILED_STATIC_BATCH_SIZE,
     configure_inductor_cache_namespace,
     inductor_cache_status,
     resolve_wavlm_runtime_settings,
@@ -224,6 +223,7 @@ def build_expected_configs(
     wavlm_compile_dynamic: bool = False,
     wavlm_stream_layer_sum: bool = False,
     wavlm_runtime_preset: str | None = None,
+    wavlm_static_batch_size: int | None = None,
     emotion_autocast_dtype: str | None = None,
     emotion_compile: bool = False,
     emotion_compile_mode: str = DEFAULT_EMOTION_COMPILE_MODE,
@@ -255,6 +255,7 @@ def build_expected_configs(
         compile_dynamic=wavlm_compile_dynamic,
         stream_layer_sum=wavlm_stream_layer_sum,
         allow_tf32=allow_tf32,
+        static_batch_size=wavlm_static_batch_size,
     )
     batches = _resolve_worker_batch_sizes(
         batch_size=batch_size,
@@ -406,6 +407,7 @@ def run_worker(
     wavlm_compile_dynamic: bool = False,
     wavlm_stream_layer_sum: bool = False,
     wavlm_runtime_preset: str | None = None,
+    wavlm_static_batch_size: int | None = None,
     emotion_autocast_dtype: str | None = None,
     emotion_compile: bool = False,
     emotion_compile_mode: str = DEFAULT_EMOTION_COMPILE_MODE,
@@ -477,6 +479,7 @@ def run_worker(
         compile_dynamic=wavlm_compile_dynamic,
         stream_layer_sum=wavlm_stream_layer_sum,
         allow_tf32=allow_tf32,
+        static_batch_size=wavlm_static_batch_size,
     )
     if wavlm_runtime_preset is not None and wavlm_settings.preset != wavlm_runtime_preset:
         LOGGER.warning(
@@ -581,6 +584,7 @@ def run_worker(
         wavlm_compile_dynamic=wavlm_compile_dynamic,
         wavlm_stream_layer_sum=wavlm_stream_layer_sum,
         wavlm_runtime_preset=expected_wavlm_preset,
+        wavlm_static_batch_size=wavlm_static_batch_size,
         emotion_autocast_dtype=emotion_autocast_dtype,
         emotion_compile=emotion_compile,
         emotion_compile_mode=emotion_compile_mode,
@@ -997,8 +1001,11 @@ def run_worker(
                     "decoded_bytes": pf_result.decoded_bytes,
                     "wavlm_runtime_preset": wavlm_settings.preset,
                     "wavlm_static_batch": wavlm_settings.static_batch,
+                    # Actual resolved batch dim (honours --wavlm-static-batch-size),
+                    # not the hardcoded default — lets timings be grouped by batch
+                    # size when comparing throughput across runs.
                     "wavlm_batch_size": (
-                        WAVLM_COMPILED_STATIC_BATCH_SIZE
+                        wavlm_settings.task_batch_size
                         if wavlm_settings.static_batch
                         else None
                     ),

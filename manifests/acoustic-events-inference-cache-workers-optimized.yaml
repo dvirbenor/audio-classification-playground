@@ -49,6 +49,23 @@ experiments:
     image: 690765672468.dkr.ecr.us-east-1.amazonaws.com/ml-dev-containers:gpu-1.0.22
     nodeSelector:
       node.kubernetes.io/instance-type: g7e.2xlarge
+    resources:
+      requests:
+        cpu: "7"
+        memory: "50Gi"
+        nvidia.com/gpu: "1"
+      limits:
+        cpu: "8"
+        memory: "58Gi"
+        nvidia.com/gpu: "1"
+    tolerations:
+      - key: karpenter
+        operator: Equal
+        value: ai-workers-gpu
+        effect: NoSchedule
+      - key: nvidia.com/gpu
+        operator: Exists
+        effect: NoSchedule
     cmd: /bin/bash
     args:
       - -lc
@@ -112,6 +129,23 @@ experiments:
     image: 690765672468.dkr.ecr.us-east-1.amazonaws.com/ml-dev-containers:gpu-1.0.22
     nodeSelector:
       node.kubernetes.io/instance-type: g7e.2xlarge
+    resources:
+      requests:
+        cpu: "7"
+        memory: "50Gi"
+        nvidia.com/gpu: "1"
+      limits:
+        cpu: "8"
+        memory: "58Gi"
+        nvidia.com/gpu: "1"
+    tolerations:
+      - key: karpenter
+        operator: Equal
+        value: ai-workers-gpu
+        effect: NoSchedule
+      - key: nvidia.com/gpu
+        operator: Exists
+        effect: NoSchedule
     cmd: /bin/bash
     args:
       - -lc
@@ -175,6 +209,23 @@ experiments:
     image: 690765672468.dkr.ecr.us-east-1.amazonaws.com/ml-dev-containers:gpu-1.0.22
     nodeSelector:
       node.kubernetes.io/instance-type: g7e.2xlarge
+    resources:
+      requests:
+        cpu: "7"
+        memory: "50Gi"
+        nvidia.com/gpu: "1"
+      limits:
+        cpu: "8"
+        memory: "58Gi"
+        nvidia.com/gpu: "1"
+    tolerations:
+      - key: karpenter
+        operator: Equal
+        value: ai-workers-gpu
+        effect: NoSchedule
+      - key: nvidia.com/gpu
+        operator: Exists
+        effect: NoSchedule
     cmd: /bin/bash
     args:
       - -lc

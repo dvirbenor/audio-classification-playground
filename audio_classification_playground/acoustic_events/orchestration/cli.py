@@ -93,6 +93,7 @@ def _cmd_run(args: argparse.Namespace) -> None:
         wavlm_compile_dynamic=args.wavlm_compile_dynamic,
         wavlm_stream_layer_sum=args.wavlm_stream_layer_sum,
         wavlm_runtime_preset=args.wavlm_runtime_preset,
+        wavlm_static_batch_size=args.wavlm_static_batch_size,
         emotion_autocast_dtype=args.emotion_autocast_dtype,
         emotion_compile=args.emotion_compile,
         emotion_compile_mode=args.emotion_compile_mode,
@@ -474,6 +475,17 @@ def main(argv: list[str] | None = None) -> None:
         ),
     )
     p_run.add_argument(
+        "--wavlm-static-batch-size",
+        type=int,
+        default=None,
+        help=(
+            "Override the compiled_static WavLM batch dimension (default 256). "
+            "Larger fixed batches better fill big GPUs (e.g. Blackwell); requires "
+            "the compiled_static preset. Excluded from inference_config_hash, so "
+            "it never changes artifact identity."
+        ),
+    )
+    p_run.add_argument(
         "--emotion-runtime-mode",
         choices=["auto", "optimized", "fp32-eager", "custom"],
         default="auto",
@@ -715,22 +727,34 @@ def _validate_wavlm_runtime_args(
 ) -> None:
     if getattr(args, "command", None) != "run":
         return
-    if args.wavlm_runtime_preset is None:
-        return
     from ..inference.wavlm_runtime import has_custom_wavlm_runtime_knobs
 
-    if has_custom_wavlm_runtime_knobs(
+    granular = has_custom_wavlm_runtime_knobs(
         autocast_dtype=args.wavlm_autocast_dtype,
         compile_model=args.wavlm_compile,
         compile_mode=args.wavlm_compile_mode,
         compile_dynamic=args.wavlm_compile_dynamic,
         stream_layer_sum=args.wavlm_stream_layer_sum,
         allow_tf32=args.allow_tf32,
-    ):
+    )
+    if args.wavlm_runtime_preset is not None and granular:
         parser.error(
             "--wavlm-runtime-preset cannot be mixed with granular WavLM "
             "runtime flags; omit the preset for custom experiments."
         )
+    if args.wavlm_static_batch_size is not None:
+        if args.wavlm_static_batch_size <= 0:
+            parser.error("--wavlm-static-batch-size must be a positive integer")
+        if granular:
+            parser.error(
+                "--wavlm-static-batch-size only applies to the compiled_static "
+                "preset; it cannot be mixed with granular WavLM runtime flags."
+            )
+        if args.wavlm_runtime_preset == "fast_exact":
+            parser.error(
+                "--wavlm-static-batch-size requires the compiled_static preset "
+                "(fast_exact does not use a static batch)."
+            )
 
 
 if __name__ == "__main__":

@@ -36,8 +36,6 @@ spec:
               mountPath: /efs
             - name: shm
               mountPath: /dev/shm
-            - name: workspace
-              mountPath: /workspace
             - name: github-ssh
               mountPath: /mnt/github-ssh
               readOnly: true
@@ -54,8 +52,6 @@ spec:
           emptyDir:
             medium: Memory
             sizeLimit: 200Gi
-        - name: workspace
-          emptyDir: {}
         - name: github-ssh
           secret:
             secretName: audio-playground-github-ssh

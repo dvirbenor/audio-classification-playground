@@ -56,6 +56,74 @@ def test_wavlm_runtime_preset_rejects_granular_knobs():
         )
 
 
+def test_wavlm_static_batch_size_overrides_compiled_static_batch():
+    with patch(
+        "audio_classification_playground.acoustic_events.inference.wavlm_runtime."
+        "wavlm_compiled_static_is_eligible",
+        return_value=True,
+    ):
+        settings = resolve_wavlm_runtime_settings(
+            preset="compiled_static",
+            device="cuda",
+            autocast_dtype=None,
+            compile_model=False,
+            compile_mode="reduce-overhead",
+            compile_dynamic=False,
+            stream_layer_sum=False,
+            allow_tf32=False,
+            static_batch_size=512,
+        )
+
+    assert settings.preset == "compiled_static"
+    assert settings.task_batch_size == 512
+    assert settings.static_batch is True
+
+
+def test_wavlm_static_batch_size_rejects_fast_exact_preset():
+    with pytest.raises(ValueError, match="requires the compiled_static preset"):
+        resolve_wavlm_runtime_settings(
+            preset="fast_exact",
+            device="cuda",
+            autocast_dtype=None,
+            compile_model=False,
+            compile_mode="reduce-overhead",
+            compile_dynamic=False,
+            stream_layer_sum=False,
+            allow_tf32=False,
+            static_batch_size=512,
+        )
+
+
+def test_wavlm_static_batch_size_rejects_granular_knobs():
+    with pytest.raises(ValueError, match="cannot be combined with granular"):
+        resolve_wavlm_runtime_settings(
+            preset=None,
+            device="cuda",
+            autocast_dtype="fp16",
+            compile_model=False,
+            compile_mode="reduce-overhead",
+            compile_dynamic=False,
+            stream_layer_sum=False,
+            allow_tf32=False,
+            static_batch_size=512,
+        )
+
+
+def test_wavlm_static_batch_size_must_be_positive():
+    with pytest.raises(ValueError, match="positive integer"):
+        resolve_wavlm_runtime_settings(
+            preset="compiled_static",
+            device="cuda",
+            autocast_dtype=None,
+            compile_model=False,
+            compile_mode="reduce-overhead",
+            compile_dynamic=False,
+            stream_layer_sum=False,
+            allow_tf32=False,
+            static_batch_size=0,
+        )
+
+
 def test_pad_windows_to_static_batch_uses_raw_zero_rows():
     windows = np.ones((5, 3), dtype=np.float32)
 

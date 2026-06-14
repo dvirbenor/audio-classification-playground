@@ -1,0 +1,201 @@
+# Co-located GPU inference on a SINGLE Blackwell RTX PRO 6000 (96 GB) via CUDA MPS.
+#
+# Why this manifest exists (vs. acoustic-events-inference-cache-workers-optimized.yaml,
+# which runs each GPU task as its own pod/GPU):
+#   On one big GPU, a single small model (WavLM-large / emotion2vec) under-fills the
+#   SM array — spatially (one model's batch doesn't cover all SMs) and temporally
+#   (tensor cores idle during layernorm/softmax/copy phases between GEMMs). The fix is
+#   to run the affect, disfluency and emotion task-fleets as SEPARATE processes
+#   sharing the one GPU via CUDA MPS, so one model's GEMM overlaps another's
+#   memory-bound phase. This is the standard (supported) task-fleet mode — separate
+#   processes claiming distinct per-task lock namespaces under one --output tree — just
+#   co-located on a single GPU. See scripts/run_mps_colocated.sh.
+#
+# VAD is NOT co-located on the GPU: it is CPU-only and must LEAD, producing the `vad/`
+# intervals the GPU tasks gate on. The GPU workers read those intervals from disk and
+# fall back to full-timeline compute when one isn't ready yet (correct, just no
+# speedup) — they never block on VAD. Run the CPU VAD fleet ahead of / alongside this.
+#
+# TESTABILITY: scripts/run_mps_colocated.sh is the per-pod entrypoint AND what you run
+# by hand on a dev GPU pod to validate MPS + batch sizing before a fleet rollout. To
+# test on one pod: exec in, `source env.shared.sh`, export PARQUET/OUTPUT (point at a
+# small parquet subset + scratch output), then `bash scripts/run_mps_colocated.sh`.
+#
+# !!! BEFORE DEPLOYING, set the two cluster-specific values marked "TODO(blackwell)":
+#   1. the Blackwell GPU node selector / instance-type for your cluster, and
+#   2. CPU/memory requests sized to that node (3 co-located prefetch pipelines).
+# Also confirm the container image provides `nvidia-cuda-mps-control` (CUDA toolkit).
+config:
+  namespace: nlp-audio-understanding
+  team: nlp
+  project: audio-understanding
+  image: 690765672468.dkr.ecr.us-east-1.amazonaws.com/ai-content-provenance:latest
+  capacityType: on-demand
+  env:
+    CLEARML_WEB_HOST: http://clearml-webserver.clearml:8080
+    CLEARML_API_HOST: http://clearml-apiserver.clearml:8008
+    CLEARML_FILES_HOST: https://clearml-fileserver.ai-dev.riverside.fm
+    RS_OWNER: dvirbenor
+  ebs:
+    enabled: true
+    size: 1000Gi
+    persistent: false
+    mountPath: /workspace
+  s3Access:
+    enabled: true
+
+experiments:
+  # All three GPU tasks (affect + disfluency + emotion) co-located on ONE Blackwell
+  # GPU, sharing it via CUDA MPS.
+  - name: inference-gpu-mps-colocated
+    category: inference
+    description: Co-located affect+disfluency+emotion inference on one Blackwell RTX PRO 6000 via CUDA MPS
+    image: 690765672468.dkr.ecr.us-east-1.amazonaws.com/ml-dev-containers:gpu-1.0.22
+    nodeSelector:
+      # TODO(blackwell): set to your cluster's Blackwell RTX PRO 6000 node label.
+      node.kubernetes.io/instance-type: REPLACE_WITH_BLACKWELL_INSTANCE_TYPE
+    resources:
+      requests:
+        # TODO(blackwell): size to the Blackwell node — 3 co-located prefetch pipelines.
+        cpu: "24"
+        memory: "150Gi"
+        nvidia.com/gpu: "1"
+      limits:
+        cpu: "28"
+        memory: "170Gi"
+        nvidia.com/gpu: "1"
+    cmd: /bin/bash
+    args:
+      - -lc
+      - |
+        set -euo pipefail
+
+        export RUN_ID="{run_id}"
+        export PYTHONUNBUFFERED=1
+        export UV_LINK_MODE=copy
+        export TMPDIR=/workspace/tmp
+        mkdir -p "$TMPDIR"
+
+        export PARQUET="/efs/dvir/data/magic-clips-research/dataset-reference/all_archives.parquet"
+        export OUTPUT="/efs/dvir/data/magic-clips-research/acoustic-understanding/models-inference"
+        export AUDIO_CACHE="${OUTPUT}/_meta/audio_cache"
+        export CACHE_BYTES=536870912000
+
+        LOG_DIR="${OUTPUT}/job-logs"
+        mkdir -p "$LOG_DIR"
+        LOG_FILE="$LOG_DIR/inference-gpu-mps-colocated-run-${RUN_ID}-${HOSTNAME:-unknown}.log"
+        exec > >(tee -a "$LOG_FILE") 2>&1
+
+        echo "[$(date -Iseconds)] Starting inference-gpu-mps-colocated run ${RUN_ID}"
+        cd /workspace
+
+        mkdir -p /workspace/.ssh
+        cp /mnt/github-ssh/id_ed25519 /workspace/.ssh/id_ed25519
+        cp /mnt/github-ssh/known_hosts /workspace/.ssh/known_hosts
+        chmod 700 /workspace/.ssh
+        chmod 400 /workspace/.ssh/id_ed25519
+        chmod 444 /workspace/.ssh/known_hosts
+        export GIT_SSH_COMMAND="ssh -i /workspace/.ssh/id_ed25519 -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=/workspace/.ssh/known_hosts"
+
+        rm -rf audio-classification-playground
+        git clone --branch feature/inference-optimization --single-branch git@github.com:dvirbenor/audio-classification-playground.git
+        cd audio-classification-playground
+        echo "Git commit: $(git rev-parse HEAD)"
+        uv sync --frozen
+        source .venv/bin/activate
+
+        source env.shared.sh
+
+        # Co-location config consumed by scripts/run_mps_colocated.sh.
+        export TASKS="affect disfluency emotion"
+        export WAVLM_RUNTIME_PRESET="compiled_static"
+        # Start at the current default (256), then compare against 512 to measure the
+        # gain on the larger Blackwell SM array. Use scripts/compare_static_batch_throughput.sh
+        # for a controlled A/B; the worker timings record the actual batch size, so
+        # `orchestration timings` can be grouped by it. Sweep WITH MPS on (overlap
+        # fills SMs collectively, so the optimum may be moderate). Excluded from
+        # inference_config_hash, so it never changes artifact identity.
+        export WAVLM_STATIC_BATCH_SIZE="256"
+        export EMOTION_RUNTIME_MODE="optimized"
+        export EMOTION_EXTRA_ARGS="--prefetch-workers 8 --prefetch-lookahead 16 --vad-prefetch-workers 0"
+        export VAD_GATING="1"
+        export ENABLE_MPS="1"
+
+        bash scripts/run_mps_colocated.sh
+
+        echo "[$(date -Iseconds)] Finished inference-gpu-mps-colocated run ${RUN_ID}"
+    grid:
+      run_id: [1]
+
+  # vad PRODUCES the intervals the GPU tasks gate on; it is never gated, and it must
+  # LEAD the GPU pod. Identical to the CPU VAD fleet in the base manifest.
+  - name: inference-vad-cpu-cache
+    category: inference
+    description: Run CPU-only VAD acoustic-event inference with shared decoded-audio cache
+    image: 690765672468.dkr.ecr.us-east-1.amazonaws.com/ml-dev-containers:cpu-1.0.6
+    instanceTypes: ["c6a.4xlarge", "c7a.4xlarge", "c6i.4xlarge", "c7i.4xlarge"]
+    ephemeralStorage: "10Gi"
+    resources:
+      requests:
+        cpu: "13"
+        memory: "24Gi"
+      limits:
+        cpu: "13"
+        memory: "24Gi"
+    cmd: /bin/bash
+    args:
+      - -lc
+      - |
+        set -euo pipefail
+
+        export RUN_ID="{run_id}"
+        export PYTHONUNBUFFERED=1
+        export UV_LINK_MODE=copy
+
+        PARQUET="/efs/dvir/data/magic-clips-research/dataset-reference/all_archives.parquet"
+        OUTPUT="/efs/dvir/data/magic-clips-research/acoustic-understanding/models-inference"
+        AUDIO_CACHE="${OUTPUT}/_meta/audio_cache"
+        CACHE_BYTES=536870912000
+
+        LOG_DIR="${OUTPUT}/job-logs"
+        mkdir -p "$LOG_DIR"
+        LOG_FILE="$LOG_DIR/inference-vad-cpu-cache-run-${RUN_ID}-${HOSTNAME:-unknown}.log"
+        exec > >(tee -a "$LOG_FILE") 2>&1
+
+        echo "[$(date -Iseconds)] Starting inference-vad-cpu-cache run ${RUN_ID}"
+        cd /workspace
+
+        mkdir -p /workspace/.ssh
+        cp /mnt/github-ssh/id_ed25519 /workspace/.ssh/id_ed25519
+        cp /mnt/github-ssh/known_hosts /workspace/.ssh/known_hosts
+        chmod 700 /workspace/.ssh
+        chmod 400 /workspace/.ssh/id_ed25519
+        chmod 444 /workspace/.ssh/known_hosts
+        export GIT_SSH_COMMAND="ssh -i /workspace/.ssh/id_ed25519 -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=/workspace/.ssh/known_hosts"
+
+        rm -rf audio-classification-playground
+        git clone --branch feature/inference-optimization --single-branch git@github.com:dvirbenor/audio-classification-playground.git
+        cd audio-classification-playground
+        echo "Git commit: $(git rev-parse HEAD)"
+        uv sync --frozen
+        source .venv/bin/activate
+
+        source env.shared.sh
+        python -m audio_classification_playground.acoustic_events.orchestration run \
+          --parquet "$PARQUET" \
+          --output "$OUTPUT" \
+          --task-group vad \
+          --completion-policy exists \
+          --affect-backbone wavlm \
+          --disfluency-backbone wavlm \
+          --device cpu \
+          --prefetch-workers 6 \
+          --prefetch-lookahead 12 \
+          --vad-prefetch-workers 1 \
+          --max-retries 3 \
+          --audio-cache-dir "$AUDIO_CACHE" \
+          --max-cache-bytes "$CACHE_BYTES"
+
+        echo "[$(date -Iseconds)] Finished inference-vad-cpu-cache run ${RUN_ID}"
+    grid:
+      run_id: [1]
