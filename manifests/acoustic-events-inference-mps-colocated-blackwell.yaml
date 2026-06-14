@@ -53,7 +53,7 @@ experiments:
     image: 690765672468.dkr.ecr.us-east-1.amazonaws.com/ml-dev-containers:gpu-1.0.22
     nodeSelector:
       # TODO(blackwell): set to your cluster's Blackwell RTX PRO 6000 node label.
-      node.kubernetes.io/instance-type: REPLACE_WITH_BLACKWELL_INSTANCE_TYPE
+      node.kubernetes.io/instance-type: g7e.2xlarge
     resources:
       requests:
         # TODO(blackwell): size to the Blackwell node — 3 co-located prefetch pipelines.
@@ -62,7 +62,7 @@ experiments:
         nvidia.com/gpu: "1"
       limits:
         cpu: "8"
-        memory: "58Gi"
+        memory: "54Gi"
         nvidia.com/gpu: "1"
     tolerations:
       - key: karpenter
