@@ -276,3 +276,4 @@ optimization_research/**/*.json
 #   uv run python scripts/retrieve_benchmark_audio.py --seed 0 --n 5 --out-dir benchmark_audio
 benchmark_audio/*.wav
 benchmark_audio/index.json
+scratch/

@@ -57,13 +57,21 @@ experiments:
     resources:
       requests:
         # TODO(blackwell): size to the Blackwell node — 3 co-located prefetch pipelines.
-        cpu: "24"
-        memory: "150Gi"
+        cpu: "7"
+        memory: "50Gi"
         nvidia.com/gpu: "1"
       limits:
-        cpu: "28"
-        memory: "170Gi"
+        cpu: "8"
+        memory: "58Gi"
         nvidia.com/gpu: "1"
+    tolerations:
+      - key: karpenter
+        operator: Equal
+        value: ai-workers-gpu
+        effect: NoSchedule
+      - key: nvidia.com/gpu
+        operator: Exists
+        effect: NoSchedule
     cmd: /bin/bash
     args:
       - -lc
@@ -109,13 +117,14 @@ experiments:
         # Co-location config consumed by scripts/run_mps_colocated.sh.
         export TASKS="affect disfluency emotion"
         export WAVLM_RUNTIME_PRESET="compiled_static"
-        # Start at the current default (256), then compare against 512 to measure the
-        # gain on the larger Blackwell SM array. Use scripts/compare_static_batch_throughput.sh
-        # for a controlled A/B; the worker timings record the actual batch size, so
-        # `orchestration timings` can be grouped by it. Sweep WITH MPS on (overlap
-        # fills SMs collectively, so the optimum may be moderate). Excluded from
-        # inference_config_hash, so it never changes artifact identity.
-        export WAVLM_STATIC_BATCH_SIZE="256"
+        # 512 is the validated knee on the Blackwell RTX PRO 6000 (96 GB): the controlled
+        # MPS A/B (scripts/compare_static_batch_throughput.sh) showed +16% over 256 in
+        # steady-state throughput, with SMs already saturated (100%) — 768 added no gain
+        # at a risky 95% VRAM, and 1024 OOMs the co-located fleet. 3-way aggregate VRAM at
+        # 512 peaks ~42.6 GiB (44.5%). Excluded from inference_config_hash, so it never
+        # changes artifact identity. Pin ONE size fleet-wide (per-window fp16 kernels
+        # differ slightly per static shape; see MPS_COLOCATION_TESTING.md Level 4).
+        export WAVLM_STATIC_BATCH_SIZE="512"
         export EMOTION_RUNTIME_MODE="optimized"
         export EMOTION_EXTRA_ARGS="--prefetch-workers 8 --prefetch-lookahead 16 --vad-prefetch-workers 0"
         export VAD_GATING="1"
