@@ -33,7 +33,9 @@ Silero intervals, diffs events, and times per task.
 - **disfluency: NOT identical** — 1 dropped event on 2 of 3 archives (+1 label flip, boundary drift up to
   1.75 s). Root cause confirmed: `_support_regions` builds candidate regions over the **full timeline
   before** the speech-support filter ([disfluency/pipeline.py:284](../audio_classification_playground/acoustic_events/producers/disfluency/pipeline.py#L284)),
-  so filled non-speech frames shift region boundaries. → **disfluency excluded from the default gated set.**
+  so filled non-speech frames shift region boundaries. → **disfluency excluded from the default gated set
+  at the time of this A/B.** (Resolved 2026-06-14 by making region detection speech-scoped — see the
+  follow-up in "Decision + remaining" below; re-A/B pending.)
 
 **Speed (GPU compute/archive, speech 21–39%):**
 | config | arch1 | arch2 | arch3 | mean |
@@ -48,10 +50,27 @@ scaling with silence fraction — confirming the lever.
 - **Shipped default = gate affect + emotion** (event-identical, ~1.4× GPU). `VadGating.tasks` defaults to
   `("affect","emotion")`; `--vad-gating` enables it; gating disfluency is an explicit opt-in
   (`--vad-gating-tasks affect disfluency emotion`).
-- **Follow-up to recover disfluency's ~2.5× (→ ~2.3× overall):** make disfluency region detection
-  speech-scoped (mask `p_disfluent` to speech before `_support_regions`). This *changes full-timeline
-  disfluency output* (regions stop leaking into non-speech — arguably more correct), so it needs its own
-  event-A/B and product sign-off; not done here.
+- **Follow-up to recover disfluency's ~2.5× (→ ~2.3× overall): IMPLEMENTED (2026-06-14).** Disfluency
+  region detection is now speech-scoped — `_detect` builds candidate regions over `np.where(speech_mask,
+  p_disfluent, 0.0)` before `_support_regions` ([disfluency/pipeline.py:283](../audio_classification_playground/acoustic_events/producers/disfluency/pipeline.py#L283)),
+  so non-speech frames can neither seed a region nor shoulder-expand a boundary into silence. Two effects:
+  1. **Full-timeline output changes** (region boundaries trim to speech; pure-leak regions shrink/drop) —
+     a deliberate correctness improvement (a disfluency is a speech phenomenon), so it needs a re-baseline
+     + new artifact lineage, *not* a bit-identical guarantee against the old producer.
+  2. **gated == full is restored** by construction: surviving region interiors only span bridged gaps
+     `<= merge_gap_sec (0.5 s) <= bridge_sec (1.5 s)`, so every frame a region reads is one inference
+     *computes* (never filled). Aggregation still reads the real `p_disfluent` at bridged frames.
+  Unit tests updated/added in `test_disfluency_producer.py` (boundary-trims-to-speech, non-speech peak no
+  longer supports, short non-speech gap still bridges); disfluency suite 23 passed.
+  **Re-A/B MEASURED (2026-06-14, A10G, 3 archives, `vad_gating_ab_speechscoped.json`):** gated==full is now
+  **bit-identical for disfluency on all 3** (0 dropped/added, label 1.000, 0 boundary/score drift) —
+  alongside affect and emotion. Disfluency gated speedup 2.53× / 1.74× / 2.98× (scales with silence);
+  GPU-total all-three-gated 2.45× / 1.69× / 2.88×, **mean 2.34×** at mean 28% speech. `event_safe: true`.
+  → **disfluency added to `DEFAULT_GATED_TASKS`** (`vad_gating.py`); `--vad-gating` now gates all three GPU
+  tasks. Manifest `acoustic-events-inference-cache-workers-optimized.yaml` gates the disfluency fleet too.
+  **Still pending (product, not correctness):** sign-off on the full-timeline boundary change vs the *old*
+  producer (speech-tight boundaries; a separate diff from this gated-vs-full A/B), and a corpus-wide
+  re-baseline if the existing un-gated disfluency artifacts should be recomputed under the new producer.
 - Still pending before fleet enable: a **manifest-wide speech-% sample** (3 archives = 21–39%, mean 28%),
   then enable per-fleet for affect + emotion.
 

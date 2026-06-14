@@ -281,7 +281,18 @@ def _extract_events_with_summary(
         )
 
     # --- Candidate regions from model confidence -----------------------------
-    regions = _support_regions(p_disfluent, hop_sec, config)
+    # Disfluency is a speech phenomenon, so region geometry (seed / shoulder /
+    # merge) is built over speech frames only: non-speech frames are zeroed so
+    # they can neither seed a region nor shoulder-expand a boundary into
+    # silence. Region interiors may still span a bridged gap <= merge_gap_sec;
+    # aggregation below intentionally reads the full ``p_disfluent`` there (the
+    # confidence we chose to bridge across). Because merge_gap_sec (0.5s) is
+    # within the VAD-gating bridge window, every frame a surviving region spans
+    # is one inference computes, so gated and full-timeline events are identical.
+    region_signal = p_disfluent
+    if speech_mask is not None:
+        region_signal = np.where(speech_mask, p_disfluent, 0.0)
+    regions = _support_regions(region_signal, hop_sec, config)
     candidate_region_count = len(regions)
 
     # --- Speech-support filter (before type classification) ------------------

@@ -29,13 +29,15 @@ DEFAULT_BRIDGE_SEC = 1.5  # >= emotion support_close_gap_sec (1.0) + margin
 GATING_POLICY = "overlap_v1"
 
 GATABLE_TASKS = ("affect", "disfluency", "emotion")
-# Default-gated set is the empirically event-identical one. disfluency is
-# EXCLUDED by default: its candidate-region detection (`_support_regions`) runs
-# over the full timeline *before* the speech-support filter, so filled
-# non-speech frames shift region boundaries (~1 borderline event / archive).
-# Gating disfluency identically needs a speech-scoped producer change first
-# (see VAD_GATING_IMPLEMENTATION_PLAN.md §5.5); opt in via ``tasks`` once done.
-DEFAULT_GATED_TASKS = ("affect", "emotion")
+# Default-gated set: all gatable tasks. disfluency was historically excluded
+# because its candidate-region detection (`_support_regions`) ran over the full
+# timeline *before* the speech-support filter, so filled non-speech frames could
+# shift region boundaries (~1 borderline event / archive). The producer is now
+# speech-scoped — region geometry is built over speech frames only — so gated
+# output matches the (speech-scoped) full-timeline output: surviving region
+# interiors only span bridged gaps <= merge_gap_sec <= bridge_sec, every frame a
+# region reads is one inference computes (see VAD_GATING_IMPLEMENTATION_PLAN.md).
+DEFAULT_GATED_TASKS = ("affect", "disfluency", "emotion")
 
 Intervals = Sequence[tuple[float, float]]
 

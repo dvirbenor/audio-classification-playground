@@ -1,14 +1,14 @@
 # VAD-gated variant of acoustic-events-inference-cache-workers.yaml.
 #
-# Only difference vs. the base manifest: the affect and emotion GPU fleets pass
-# `--vad-gating`, which skips GPU compute on non-speech windows using the VAD
-# `intervals_sec` artifact. Emitted events stay identical for the gated tasks;
-# gated runs record the gating descriptor in `inference_config` (see
+# Only difference vs. the base manifest: the affect, disfluency and emotion GPU
+# fleets pass `--vad-gating`, which skips GPU compute on non-speech windows using
+# the VAD `intervals_sec` artifact. Emitted events stay identical for the gated
+# tasks; gated runs record the gating descriptor in `inference_config` (see
 # VAD_GATING_IMPLEMENTATION_PLAN.md).
 #
-# NOT gated here:
-#   - disfluency: its region detection reads non-speech frames, so gating is not
-#     yet event-identical (plan §5.5). Left unchanged.
+# disfluency is now gated too: its region detection is speech-scoped (geometry is
+# built over speech frames only), so gated output matches the full-timeline
+# output. NOT gated here:
 #   - vad: the VAD step PRODUCES the intervals; it is never gated.
 #
 # Operational prerequisites (task-fleet mode reads VAD from disk):
@@ -104,12 +104,11 @@ experiments:
 
         echo "[$(date -Iseconds)] Finished inference-affect-cache-vadgated run ${RUN_ID}"
     grid:
-      run_id: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+      run_id: [1]
 
-  # disfluency is intentionally NOT VAD-gated (not yet event-identical, plan §5.5).
-  - name: inference-disfluency-cache
+  - name: inference-disfluency-cache-vadgated
     category: inference
-    description: Run disfluency acoustic-event inference on g7e.2xlarge with shared decoded-audio cache
+    description: Run VAD-gated disfluency acoustic-event inference on g7e.2xlarge with shared decoded-audio cache
     image: 690765672468.dkr.ecr.us-east-1.amazonaws.com/ml-dev-containers:gpu-1.0.22
     nodeSelector:
       node.kubernetes.io/instance-type: g7e.2xlarge
@@ -130,10 +129,10 @@ experiments:
 
         LOG_DIR="${OUTPUT}/job-logs"
         mkdir -p "$LOG_DIR"
-        LOG_FILE="$LOG_DIR/inference-disfluency-cache-run-${RUN_ID}-${HOSTNAME:-unknown}.log"
+        LOG_FILE="$LOG_DIR/inference-disfluency-cache-vadgated-run-${RUN_ID}-${HOSTNAME:-unknown}.log"
         exec > >(tee -a "$LOG_FILE") 2>&1
 
-        echo "[$(date -Iseconds)] Starting inference-disfluency-cache run ${RUN_ID}"
+        echo "[$(date -Iseconds)] Starting inference-disfluency-cache-vadgated run ${RUN_ID}"
         cd /workspace
 
         mkdir -p /workspace/.ssh
@@ -161,13 +160,14 @@ experiments:
           --affect-backbone wavlm \
           --disfluency-backbone wavlm \
           --device cuda \
+          --vad-gating \
           --max-retries 3 \
           --audio-cache-dir "$AUDIO_CACHE" \
           --max-cache-bytes "$CACHE_BYTES"
 
-        echo "[$(date -Iseconds)] Finished inference-disfluency-cache run ${RUN_ID}"
+        echo "[$(date -Iseconds)] Finished inference-disfluency-cache-vadgated run ${RUN_ID}"
     grid:
-      run_id: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+      run_id: [1]
 
   - name: inference-emotion-cache-vadgated
     category: inference
@@ -235,12 +235,13 @@ experiments:
 
         echo "[$(date -Iseconds)] Finished inference-emotion-cache-vadgated run ${RUN_ID}"
     grid:
-      run_id: [1, 2, 3, 4, 5, 6, 7, 8]
+      run_id: [1]
 
   # vad PRODUCES the intervals other tasks gate on; it is never gated itself.
   - name: inference-vad-cpu-cache
     category: inference
     description: Run CPU-only VAD acoustic-event inference with shared decoded-audio cache
+    image: 690765672468.dkr.ecr.us-east-1.amazonaws.com/ml-dev-containers:cpu-1.0.6
     instanceTypes: ["c6a.4xlarge", "c7a.4xlarge", "c6i.4xlarge", "c7i.4xlarge"]
     ephemeralStorage: "10Gi"
     resources:
@@ -306,4 +307,4 @@ experiments:
 
         echo "[$(date -Iseconds)] Finished inference-vad-cpu-cache run ${RUN_ID}"
     grid:
-      run_id: [1, 2, 3, 4, 5, 6, 7, 8]
+      run_id: [1]

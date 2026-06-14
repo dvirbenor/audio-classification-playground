@@ -233,14 +233,16 @@ class VadGatingConfigTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             VadGating(tasks=("affect", "bogus"))
 
-    def test_gates_default_excludes_disfluency(self):
+    def test_gates_default_includes_all_gatable_tasks(self):
         g = VadGating(enabled=True)
         self.assertTrue(g.gates("affect"))
         self.assertTrue(g.gates("emotion"))
-        self.assertFalse(g.gates("disfluency"))  # not event-identical yet
-        # disabled never gates; explicit opt-in works
+        # disfluency region detection is speech-scoped, so gating it is
+        # event-identical and it is gated by default.
+        self.assertTrue(g.gates("disfluency"))
+        # disabled never gates; explicit task subset works
         self.assertFalse(VadGating(enabled=False, tasks=("affect",)).gates("affect"))
-        self.assertTrue(VadGating(enabled=True, tasks=("disfluency",)).gates("disfluency"))
+        self.assertFalse(VadGating(enabled=True, tasks=("affect",)).gates("disfluency"))
 
     def test_intervals_from_array_roundtrip(self):
         arr = np.array([[1.0, 2.0], [3.0, 4.5]], dtype=np.float32)

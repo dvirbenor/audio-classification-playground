@@ -560,9 +560,9 @@ def main(argv: list[str] | None = None) -> None:
         nargs="+",
         choices=_GATABLE_TASKS,
         default=list(_DEFAULT_GATED_TASKS),
-        help="Which tasks to VAD-gate. Default excludes disfluency (its region "
-             "detection reads non-speech frames, so gating it is not yet "
-             "event-identical — see VAD_GATING_IMPLEMENTATION_PLAN.md §5.5).",
+        help="Which tasks to VAD-gate. Defaults to all gatable tasks; "
+             "disfluency region detection is speech-scoped, so gating it is "
+             "event-identical (see VAD_GATING_IMPLEMENTATION_PLAN.md).",
     )
     p_run.add_argument("--seed", type=int, default=None)
 

@@ -480,10 +480,15 @@ class DisfluencyVadGatingTest(unittest.TestCase):
     def test_region_with_insufficient_speech_support_suppressed(self):
         fluency, types = self._two_frame_disfluent()
         # Frame centers: [1.5, 1.75, 2.0, 2.25] (i*0.25 + 1.5)
-        # Region is frames [1,3), centers [1.75, 2.0]
+        # p_disfluent peaks at frames 1 (speech) and 2 (NON-speech).
         # Frame bins: [1.625..1.875, 1.875..2.125]
         # VAD (1.6, 1.87): overlaps frame 1 (1.625<1.87, 1.6<1.875) but
         #   not frame 2 (1.875<2.125 yes, but 1.87>1.875 no → False)
+        # Region geometry is built over speech-masked confidence, so the
+        # non-speech peak at frame 2 is zeroed and never seeds/expands a region.
+        # Only frame 1 survives as a seed (1 frame < min_support_frames=2), so
+        # no candidate region forms at all — suppression happens at the
+        # speech-scoped geometry stage, not the later speech-support filter.
         run, _, events = produce_disfluency_events(
             fluency_logits=fluency,
             disfluency_type_logits=types,
@@ -494,10 +499,10 @@ class DisfluencyVadGatingTest(unittest.TestCase):
         )
 
         self.assertEqual(events, [])
-        self.assertEqual(run.outputs["suppressed_insufficient_speech_count"], 1)
-        self.assertEqual(run.outputs["candidate_region_count"], 1)
+        self.assertEqual(run.outputs["candidate_region_count"], 0)
+        self.assertEqual(run.outputs["suppressed_insufficient_speech_count"], 0)
 
-    def test_region_at_speech_boundary_with_enough_support_passes(self):
+    def test_region_at_speech_boundary_trims_to_speech(self):
         fluency = binary_logits([0.1, 0.8, 0.9, 0.8, 0.1])
         types = type_logits([
             {},
@@ -506,9 +511,13 @@ class DisfluencyVadGatingTest(unittest.TestCase):
             {"Block": 0.9},
             {},
         ])
-        # 3-frame region [1,4), centers [1.75, 2.0, 2.25]
+        # Over the full timeline this region would be frames [1,4) (centers
+        # [1.75, 2.0, 2.25]) — shoulder-expanding into frame 3.
         # Frame bins: [1.625..1.875, 1.875..2.125, 2.125..2.375]
-        # VAD (0.0, 2.1): overlaps frames 1 and 2, not frame 3 (2.1 < 2.125)
+        # VAD (0.0, 2.1): overlaps frames 1 and 2, not frame 3 (2.1 < 2.125).
+        # Geometry is built over speech-masked confidence, so frame 3 is zeroed
+        # and the region trims to [1,3) at the speech boundary instead of
+        # leaking into non-speech: full speech support, no non-speech tail.
         run, _, events = produce_disfluency_events(
             fluency_logits=fluency,
             disfluency_type_logits=types,
@@ -519,8 +528,52 @@ class DisfluencyVadGatingTest(unittest.TestCase):
         )
 
         self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].extra["support_start_frame"], 1)
+        self.assertEqual(events[0].extra["support_end_frame"], 3)
         self.assertEqual(events[0].extra["speech_support_frames"], 2)
-        self.assertAlmostEqual(events[0].extra["speech_ratio"], 2.0 / 3.0, places=5)
+        self.assertAlmostEqual(events[0].extra["speech_ratio"], 1.0)
+
+    def test_short_nonspeech_gap_still_bridges_two_speech_bumps(self):
+        # Two disfluent bumps on speech (frames [1,3) and [4,6)) separated by a
+        # single non-speech frame 3. Speech-scoped geometry zeroes frame 3 so it
+        # neither seeds nor expands, but the index gap (0.25s) is within
+        # merge_gap_sec, so the bumps still merge into one region [1,6).
+        # Aggregation then reads the real (un-masked) confidence at the bridged
+        # frame 3 — the value VAD gating keeps, since merge_gap_sec <= bridge_sec.
+        cfg = DisfluencyConfig(
+            seed_threshold=0.70,
+            shoulder_threshold=0.50,
+            min_support_sec=0.50,
+            merge_gap_sec=0.25,
+            type_threshold=0.70,
+        )
+        fluency = binary_logits([0.1, 0.8, 0.9, 0.1, 0.9, 0.8])
+        types = type_logits([
+            {},
+            {"Block": 0.9},
+            {"Block": 0.9},
+            {},
+            {"Block": 0.9},
+            {"Block": 0.9},
+        ])
+        # VAD covers frames 1,2 and 4,5 but leaves frame 3 (center 2.25,
+        # bin [2.125, 2.375]) non-speech.
+        run, _, events = produce_disfluency_events(
+            fluency_logits=fluency,
+            disfluency_type_logits=types,
+            hop_sec=self.HOP,
+            window_sec=self.WINDOW,
+            vad_intervals=((1.6, 2.12), (2.38, 3.0)),
+            config=cfg,
+        )
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].extra["support_start_frame"], 1)
+        self.assertEqual(events[0].extra["support_end_frame"], 6)
+        # 4 speech frames (1,2,4,5); the bridged non-speech frame 3 is excluded.
+        self.assertEqual(events[0].extra["speech_support_frames"], 4)
+        self.assertAlmostEqual(events[0].extra["speech_ratio"], 4.0 / 5.0)
+        self.assertEqual(run.outputs["candidate_region_count"], 1)
 
     def test_empty_vad_suppresses_even_when_not_required(self):
         fluency, types = self._two_frame_disfluent()
