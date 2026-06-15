@@ -425,6 +425,7 @@ def run_worker(
     vad_gating_enabled: bool = False,
     vad_gating_bridge_sec: float = DEFAULT_BRIDGE_SEC,
     vad_gating_tasks: tuple[str, ...] = DEFAULT_GATED_TASKS,
+    require_precomputed_vad: bool = False,
     seed: int | None = None,
 ) -> None:
     """Entry point for a single worker pod.
@@ -445,6 +446,16 @@ def run_worker(
         raise ValueError("prefetch_lookahead must be >= 1")
     if vad_prefetch_workers < 0:
         raise ValueError("vad_prefetch_workers must be >= 0")
+    enforce_vad_present = require_precomputed_vad and "vad" not in group.tasks
+    if require_precomputed_vad and not enforce_vad_present:
+        LOGGER.warning(
+            "require_precomputed_vad ignored for task-group %r (it produces vad itself)",
+            group.name,
+        )
+    elif enforce_vad_present:
+        LOGGER.info(
+            "require_precomputed_vad enabled: skipping archives without a vad/ artifact",
+        )
     if audio_cache_dir is not None and max_cache_bytes is None:
         raise ValueError("max_cache_bytes is required when audio_cache_dir is set")
     if max_cache_bytes is not None and max_cache_bytes <= 0:
@@ -679,6 +690,7 @@ def run_worker(
 
     processed = 0
     skipped = 0
+    skipped_no_vad = 0
     failed = 0
 
     next_entity_idx = 0
@@ -753,7 +765,7 @@ def run_worker(
         return (sid, aid) if group.name == TASK_GROUP_ALL else (sid, aid, group.name)
 
     def _fill_claimed_queue() -> None:
-        nonlocal next_entity_idx, skipped
+        nonlocal next_entity_idx, skipped, skipped_no_vad
         while (
             not shutdown_event.is_set()
             and len(queued) < prefetch_lookahead
@@ -781,6 +793,15 @@ def run_worker(
             tasks_to_claim = _missing_tasks(sid, aid)
             if not tasks_to_claim:
                 skipped += 1
+                continue
+
+            # Enforce gating: never claim an archive that has no precomputed VAD
+            # artifact to gate against (vs. silently falling back to full-timeline).
+            if enforce_vad_present and not is_task_artifact_complete_for_archive(
+                output_base, sid, aid, "vad"
+            ):
+                skipped += 1
+                skipped_no_vad += 1
                 continue
 
             if not _try_claim(entity, task_names=tasks_to_claim):
@@ -1045,8 +1066,8 @@ def run_worker(
                 processed += 1
                 if processed % 50 == 0:
                     LOGGER.info(
-                        "Progress: processed=%d skipped=%d failed=%d",
-                        processed, skipped, failed,
+                        "Progress: processed=%d skipped=%d (no_vad=%d) failed=%d",
+                        processed, skipped, skipped_no_vad, failed,
                     )
 
             except ShutdownRequested:
@@ -1075,8 +1096,8 @@ def run_worker(
             _release(queued.popleft())
         prefetcher.shutdown()
         LOGGER.info(
-            "Worker finished: processed=%d skipped=%d failed=%d",
-            processed, skipped, failed,
+            "Worker finished: processed=%d skipped=%d (no_vad=%d) failed=%d",
+            processed, skipped, skipped_no_vad, failed,
         )
 
 

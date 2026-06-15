@@ -102,6 +102,68 @@ class WorkerAsyncVadTest(unittest.TestCase):
         self.assertEqual(run_kwargs[0]["emotion_runtime_mode"], "custom")
         self.assertTrue(run_kwargs[0]["allow_tf32"])
 
+    def test_require_precomputed_vad_skips_archives_without_vad(self):
+        # a1 has a vad/ artifact, a2 does not. With --require-precomputed-vad the
+        # worker must process only a1 and never even claim a2.
+        a1 = ArchiveEntity("s1", "a1", "prefix")
+        a2 = ArchiveEntity("s2", "a2", "prefix")
+        claimed: list[str] = []
+
+        def fake_try_claim(output_base, entity, **kwargs):
+            claimed.append(entity.archive_id)
+            return True
+
+        def vad_present(output_base, sid, aid, task):
+            return task == "vad" and aid == "a1"
+
+        with _worker_patches(
+            [a1, a2],
+            try_claim_fn=fake_try_claim,
+            task_complete_fn=vad_present,
+        ):
+            worker.run_worker(
+                parquet_path="manifest.parquet",
+                output_base=tempfile.mkdtemp(),
+                affect_backbone="wavlm",
+                disfluency_backbone="wavlm",
+                task_group="affect",
+                vad_gating_enabled=True,
+                require_precomputed_vad=True,
+                prefetch_lookahead=2,
+                vad_prefetch_workers=0,
+            )
+
+        self.assertEqual(claimed, ["a1"])
+
+    def test_require_precomputed_vad_noop_without_flag(self):
+        # Without the flag, both archives are claimed (full-timeline fallback path).
+        a1 = ArchiveEntity("s1", "a1", "prefix")
+        a2 = ArchiveEntity("s2", "a2", "prefix")
+        claimed: list[str] = []
+
+        def fake_try_claim(output_base, entity, **kwargs):
+            claimed.append(entity.archive_id)
+            return True
+
+        with _worker_patches(
+            [a1, a2],
+            try_claim_fn=fake_try_claim,
+            task_complete_fn=lambda *a, **k: False,  # no vad anywhere
+        ):
+            worker.run_worker(
+                parquet_path="manifest.parquet",
+                output_base=tempfile.mkdtemp(),
+                affect_backbone="wavlm",
+                disfluency_backbone="wavlm",
+                task_group="affect",
+                vad_gating_enabled=True,
+                require_precomputed_vad=False,
+                prefetch_lookahead=2,
+                vad_prefetch_workers=0,
+            )
+
+        self.assertEqual(sorted(claimed), ["a1", "a2"])
+
     def test_orchestration_emotion_batch_defaults_to_64(self):
         entity = ArchiveEntity("s1", "a1", "prefix")
         model_kwargs = []

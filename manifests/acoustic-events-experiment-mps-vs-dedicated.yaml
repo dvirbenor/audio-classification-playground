@@ -1,0 +1,212 @@
+# Controlled experiment: MPS-colocated vs dedicated GPU inference, gated & sustained.
+#
+# WHY: the production cross-pool number (MPS pod vs per-task fleet) is confounded —
+# the pools claim different archives, run different durations, and (the real trap)
+# the existing validation in MPS_COLOCATION_TESTING.md ran only 3 archives on a warmed
+# cache, so it never exposed sustained-load effects. These experiments measure, on the
+# SAME Blackwell GPU and the SAME fixed archive subset, with VAD-gating ENFORCED
+# (--require-precomputed-vad, so no full-timeline fallback ever pollutes the numbers):
+#
+#   1. bench-puregpu   — both arms (dedicated serial vs MPS), warmed cache => pure GPU
+#      time, sustained. Answers: MPS-vs-dedicated per-GPU (the ~1.44x question) AND,
+#      by comparing the MPS arm's per-task rate to the dedicated arm's under SUSTAINED
+#      load, whether co-located efficiency still holds the validated 49-62%-of-solo.
+#
+#   2. bench-e2e-mps   — MPS arm only, COLD cache + live S3, production CPU allocation.
+#      Compared against bench-puregpu's MPS arm, this splits the diagnosis:
+#        * emotion recovers toward ~49% in pure-GPU but stays low here  => PREFETCH/CPU
+#          STARVATION (the GPU is waiting on I/O, not slow).
+#        * emotion is low in BOTH (and nvidia-smi shows SM-clock sagging) => THROTTLING.
+#
+# Each pod runs scripts/benchmark_mps_vs_dedicated.sh, which does the VAD pre-pass,
+# runs the arms, and captures nvidia-smi dmon (SM%, clocks, power, temp) per arm.
+#
+# Launch (Riverside CLI):
+#   experiment-launcher launch manifests/acoustic-events-experiment-mps-vs-dedicated.yaml
+# Runs against a SCRATCH tree only — never the production output tree.
+#
+# !!! Set the Blackwell node selector (TODO(blackwell)) to match the production MPS
+# manifest, so this measures the same silicon (g7e.2xlarge = RTX PRO 6000 here).
+config:
+  namespace: nlp-audio-understanding
+  team: nlp
+  project: audio-understanding
+  image: 690765672468.dkr.ecr.us-east-1.amazonaws.com/ai-content-provenance:latest
+  capacityType: on-demand
+  env:
+    CLEARML_WEB_HOST: http://clearml-webserver.clearml:8080
+    CLEARML_API_HOST: http://clearml-apiserver.clearml:8008
+    CLEARML_FILES_HOST: https://clearml-fileserver.ai-dev.riverside.fm
+    RS_OWNER: dvirbenor
+  ebs:
+    enabled: true
+    size: 1000Gi
+    persistent: false
+    mountPath: /workspace
+  s3Access:
+    enabled: true
+
+experiments:
+  # ---------------------------------------------------------------------------
+  # 1) Pure-GPU: dedicated (serial) vs MPS on one GPU, warmed cache, sustained.
+  # ---------------------------------------------------------------------------
+  - name: bench-mps-vs-dedicated-puregpu
+    category: inference
+    description: Controlled MPS-vs-dedicated A/B on one Blackwell, gated, warmed cache (pure GPU), sustained
+    image: 690765672468.dkr.ecr.us-east-1.amazonaws.com/ml-dev-containers:gpu-1.0.22
+    nodeSelector:
+      # TODO(blackwell): set to your cluster's Blackwell RTX PRO 6000 node label.
+      node.kubernetes.io/instance-type: g7e.2xlarge
+    resources:
+      requests:
+        cpu: "7"
+        memory: "50Gi"
+        nvidia.com/gpu: "1"
+      limits:
+        cpu: "8"
+        memory: "54Gi"
+        nvidia.com/gpu: "1"
+    tolerations:
+      - key: karpenter
+        operator: Equal
+        value: ai-workers-gpu
+        effect: NoSchedule
+      - key: nvidia.com/gpu
+        operator: Exists
+        effect: NoSchedule
+    cmd: /bin/bash
+    args:
+      - -lc
+      - |
+        set -euo pipefail
+        export RUN_ID="{run_id}"
+        export PYTHONUNBUFFERED=1
+        export UV_LINK_MODE=copy
+        export TMPDIR=/workspace/tmp
+        mkdir -p "$TMPDIR"
+
+        ALL_ARCHIVES="/efs/dvir/data/magic-clips-research/dataset-reference/all_archives.parquet"
+        SCRATCH="/efs/dvir/data/magic-clips-research/acoustic-understanding/scratch/mps-bench/puregpu"
+        N_ARCHIVES="${N_ARCHIVES:-40}"
+        mkdir -p "$SCRATCH"
+        LOG_DIR="$SCRATCH/job-logs"; mkdir -p "$LOG_DIR"
+        LOG_FILE="$LOG_DIR/bench-puregpu-${RUN_ID}-${HOSTNAME:-unknown}.log"
+        exec > >(tee -a "$LOG_FILE") 2>&1
+        echo "[$(date -Iseconds)] Starting bench-mps-vs-dedicated-puregpu run ${RUN_ID}"
+        cd /workspace
+
+        mkdir -p /workspace/.ssh
+        cp /mnt/github-ssh/id_ed25519 /workspace/.ssh/id_ed25519
+        cp /mnt/github-ssh/known_hosts /workspace/.ssh/known_hosts
+        chmod 700 /workspace/.ssh
+        chmod 400 /workspace/.ssh/id_ed25519
+        chmod 444 /workspace/.ssh/known_hosts
+        export GIT_SSH_COMMAND="ssh -i /workspace/.ssh/id_ed25519 -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=/workspace/.ssh/known_hosts"
+
+        rm -rf audio-classification-playground
+        git clone --branch feature/inference-optimization --single-branch git@github.com:dvirbenor/audio-classification-playground.git
+        cd audio-classification-playground
+        echo "Git commit: $(git rev-parse HEAD)"
+        uv sync --frozen
+        source .venv/bin/activate
+        source env.shared.sh
+
+        # Fixed subset (first N archives). To force the gated regime on a subset that
+        # already has VAD in prod, add: --vad-present-under <prod_output_base>
+        SUBSET="$SCRATCH/subset_${N_ARCHIVES}.parquet"
+        python scripts/build_subset_parquet.py --parquet "$ALL_ARCHIVES" --out "$SUBSET" --n "$N_ARCHIVES"
+
+        export PARQUET="$SUBSET"
+        export OUTPUT_BASE="$SCRATCH/run"
+        export AUDIO_CACHE="$SCRATCH/audio_cache"
+        export CACHE_BYTES=200000000000
+        export ARMS="dedicated mps"
+        export WARM_CACHE=1                 # pure GPU time => isolates MPS effect + throttling
+        export WAVLM_STATIC_BATCH_SIZE=512  # the validated knee
+        export SMI_INTERVAL=1
+
+        bash scripts/benchmark_mps_vs_dedicated.sh
+        echo "[$(date -Iseconds)] Done. Results + nvidia-smi logs under $OUTPUT_BASE/_bench_results"
+    grid:
+      run_id: [1]
+
+  # ---------------------------------------------------------------------------
+  # 2) End-to-end MPS: cold cache + live S3, production CPU. Exposes starvation.
+  # ---------------------------------------------------------------------------
+  - name: bench-mps-vs-dedicated-e2e
+    category: inference
+    description: MPS arm only, cold cache + live S3 (production-representative) — compare emotion% vs the pure-GPU run to split throttle-vs-starvation
+    image: 690765672468.dkr.ecr.us-east-1.amazonaws.com/ml-dev-containers:gpu-1.0.22
+    nodeSelector:
+      # TODO(blackwell): same Blackwell node label as the pure-GPU experiment.
+      node.kubernetes.io/instance-type: g7e.2xlarge
+    resources:
+      requests:
+        cpu: "7"
+        memory: "50Gi"
+        nvidia.com/gpu: "1"
+      limits:
+        cpu: "8"
+        memory: "54Gi"
+        nvidia.com/gpu: "1"
+    tolerations:
+      - key: karpenter
+        operator: Equal
+        value: ai-workers-gpu
+        effect: NoSchedule
+      - key: nvidia.com/gpu
+        operator: Exists
+        effect: NoSchedule
+    cmd: /bin/bash
+    args:
+      - -lc
+      - |
+        set -euo pipefail
+        export RUN_ID="{run_id}"
+        export PYTHONUNBUFFERED=1
+        export UV_LINK_MODE=copy
+        export TMPDIR=/workspace/tmp
+        mkdir -p "$TMPDIR"
+
+        ALL_ARCHIVES="/efs/dvir/data/magic-clips-research/dataset-reference/all_archives.parquet"
+        SCRATCH="/efs/dvir/data/magic-clips-research/acoustic-understanding/scratch/mps-bench/e2e"
+        N_ARCHIVES="${N_ARCHIVES:-40}"
+        mkdir -p "$SCRATCH"
+        LOG_DIR="$SCRATCH/job-logs"; mkdir -p "$LOG_DIR"
+        LOG_FILE="$LOG_DIR/bench-e2e-${RUN_ID}-${HOSTNAME:-unknown}.log"
+        exec > >(tee -a "$LOG_FILE") 2>&1
+        echo "[$(date -Iseconds)] Starting bench-mps-vs-dedicated-e2e run ${RUN_ID}"
+        cd /workspace
+
+        mkdir -p /workspace/.ssh
+        cp /mnt/github-ssh/id_ed25519 /workspace/.ssh/id_ed25519
+        cp /mnt/github-ssh/known_hosts /workspace/.ssh/known_hosts
+        chmod 700 /workspace/.ssh
+        chmod 400 /workspace/.ssh/id_ed25519
+        chmod 444 /workspace/.ssh/known_hosts
+        export GIT_SSH_COMMAND="ssh -i /workspace/.ssh/id_ed25519 -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=/workspace/.ssh/known_hosts"
+
+        rm -rf audio-classification-playground
+        git clone --branch feature/inference-optimization --single-branch git@github.com:dvirbenor/audio-classification-playground.git
+        cd audio-classification-playground
+        echo "Git commit: $(git rev-parse HEAD)"
+        uv sync --frozen
+        source .venv/bin/activate
+        source env.shared.sh
+
+        SUBSET="$SCRATCH/subset_${N_ARCHIVES}.parquet"
+        python scripts/build_subset_parquet.py --parquet "$ALL_ARCHIVES" --out "$SUBSET" --n "$N_ARCHIVES"
+
+        export PARQUET="$SUBSET"
+        export OUTPUT_BASE="$SCRATCH/run"
+        export AUDIO_CACHE="$SCRATCH/audio_cache"
+        export CACHE_BYTES=200000000000
+        export ARMS="mps"
+        export WARM_CACHE=0                 # cold cache + live S3 => exposes prefetch/CPU starvation
+        export WAVLM_STATIC_BATCH_SIZE=512
+        export SMI_INTERVAL=1
+
+        bash scripts/benchmark_mps_vs_dedicated.sh
+        echo "[$(date -Iseconds)] Done. Compare the MPS emotion inference_sec here vs the puregpu run."
+    grid:
+      run_id: [1]

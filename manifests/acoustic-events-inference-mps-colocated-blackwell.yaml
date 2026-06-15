@@ -128,6 +128,12 @@ experiments:
         export EMOTION_RUNTIME_MODE="optimized"
         export EMOTION_EXTRA_ARGS="--prefetch-workers 8 --prefetch-lookahead 16 --vad-prefetch-workers 0"
         export VAD_GATING="1"
+        # REQUIRE_VAD="1" makes GPU workers SKIP archives without a vad/ artifact instead
+        # of falling back to full-timeline — enforcing that every processed archive is
+        # actually gated. Measured: prod is currently 100% full-timeline (precomputed_vad
+        # False everywhere), so gating's 33-56% speedup is unrealized. Flip to "1" ONLY
+        # once the CPU VAD fleet reliably LEADS this pod; otherwise it stalls (no work).
+        export REQUIRE_VAD="0"
         export ENABLE_MPS="1"
 
         bash scripts/run_mps_colocated.sh

@@ -7,29 +7,37 @@ under-reports a co-located MPS pod ~3x and actively misleads when MPS trades
 per-archive latency for aggregate throughput. The trustworthy signal is
 completions over real elapsed time.
 
-This samples ``_meta/timings/*.jsonl`` line counts twice (``--interval`` apart)
--- exactly the counter behind the dashboard's ``Done`` column, which sums
-correctly across a worker's processes -- and reports archives/hour per worker,
-per task, and per GPU for the MPS pod(s) vs the fleet.
-
   MPS pod  = 1 GPU running affect+disfluency+emotion (3 procs sharing CUDA MPS)
   Fleet    = the same 3 tasks on 3 dedicated GPUs
 VAD is CPU-only and is excluded from the GPU comparison (reported separately).
 
-Done counts are summed per hostname; rates are real deltas / real elapsed, so a
-worker that restarts (new UUID timing file) mid-window is still counted, and a
-pod that just started (or is glacier-stalled with 0 completions) is surfaced as
-stalled rather than silently dropped. Workers idle longer than ``--active-within``
-(dead pods that left stale locks/timing files on the shared tree) are ignored.
+Two modes:
 
-Example:
-    uv run python scripts/mps_vs_fleet_throughput.py \
-        --output /efs/dvir/data/magic-clips-research/acoustic-understanding/models-inference \
-        --interval 300
+* History (default) -- reads the per-completion ``ts`` timestamp already stored
+  in every ``_meta/timings/*.jsonl`` record and buckets completions into
+  ``--window``-sized bins. True throughput = completions-per-real-time, computed
+  from data that already exists, so it works retrospectively (even after the
+  queue drains and the counters stop moving) with no waiting. Emits the
+  MPS-vs-fleet table over the most recent window plus a throughput-over-time
+  curve. Records with no parseable ``ts`` are warned about, never silently
+  dropped.
+* Live (``--live``) -- samples ``_meta/timings/*.jsonl`` line counts ``--interval``
+  apart (exactly the counter behind the dashboard's ``Done`` column) and reports
+  real deltas / real elapsed. Use when you want the rate *right now*, byte-for-byte
+  parity with the dashboard, or immunity to cross-pod clock skew on tight windows.
+  Workers idle longer than ``--active-within`` are ignored; a worker that restarts
+  mid-window is still counted; a stalled pod (locks, 0 completions) is surfaced.
+
+Examples:
+    # Retrospective, no waiting (default):
+    uv run python scripts/mps_vs_fleet_throughput.py --window 5m
+    # Live sampling (watch the counters advance):
+    uv run python scripts/mps_vs_fleet_throughput.py --live --interval 300 --samples 4
 """
 from __future__ import annotations
 
 import argparse
+import bisect
 import json
 import sys
 import time
@@ -74,7 +82,12 @@ def _file_task(task_groups: tuple[str, ...], hostname: str) -> str:
 
 def take_snapshot(output_base: Path) -> dict:
     """One observation: per-file line counts, lock metadata, wall time."""
-    timings = load_recent_timings(output_base, tail=1)  # tail=1: done is a full line count
+    # done is a full line count regardless of tail, but task_group/latest_ts come
+    # from the parsed tail. A single timing record here is ~2 KB (49 fields) and
+    # heartbeat's tail reader only scans the last tail*1024 bytes, so tail=1 (1 KB)
+    # truncates the final JSON line -> it fails to parse -> task_group is lost and
+    # the worker is misbucketed as '?'. Read enough tail to capture whole records.
+    timings = load_recent_timings(output_base, tail=8)
     per_file = {
         wid: {
             "hostname": ti.hostname,
@@ -277,6 +290,214 @@ def report(
 
 
 # ---------------------------------------------------------------------------
+# History mode: reconstruct throughput from per-completion ``ts`` timestamps
+# ---------------------------------------------------------------------------
+
+
+def _parse_duration(text: str) -> float:
+    """Parse ``'300'`` / ``'90s'`` / ``'5m'`` / ``'1h'`` into seconds."""
+    text = str(text).strip().lower()
+    mult = {"s": 1.0, "m": 60.0, "h": 3600.0}
+    if text and text[-1] in mult:
+        return float(text[:-1]) * mult[text[-1]]
+    return float(text)
+
+
+def _parse_ts(ts_str) -> float | None:
+    """Completion timestamp ``"%Y-%m-%dT%H:%M:%SZ"`` -> epoch seconds, or None."""
+    try:
+        return (
+            datetime.strptime(ts_str, "%Y-%m-%dT%H:%M:%SZ")
+            .replace(tzinfo=timezone.utc)
+            .timestamp()
+        )
+    except (ValueError, TypeError):
+        return None
+
+
+def collect_history(output_base: Path, mps_match: str) -> tuple[list[dict], int, int]:
+    """Read every timing record, grouping completion timestamps per worker file.
+
+    Returns ``(workers, n_records, n_untimestamped)`` where each worker is
+    ``{worker_id, hostname, task, is_mps, ts: sorted list[float]}``. ``ts`` is
+    the per-completion wall-clock stamp already stored in each record, so rates
+    are reconstructable for any past window with no live sampling.
+    """
+    timings_dir = output_base / "_meta" / "timings"
+    needle = mps_match.lower()
+    workers: list[dict] = []
+    n_records = 0
+    n_bad = 0
+    for jsonl_path in sorted(timings_dir.iterdir()):
+        if not jsonl_path.name.endswith(".jsonl"):
+            continue
+        worker_id = jsonl_path.stem
+        hostname = worker_id.rsplit("_", 1)[0] if "_" in worker_id else worker_id
+        ts_list: list[float] = []
+        task_groups: set[str] = set()
+        try:
+            with open(jsonl_path, "r", encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    n_records += 1
+                    try:
+                        rec = json.loads(line)
+                    except json.JSONDecodeError:
+                        n_bad += 1
+                        continue
+                    if rec.get("task_group"):
+                        task_groups.add(str(rec["task_group"]))
+                    epoch = _parse_ts(rec.get("ts"))
+                    if epoch is None:
+                        n_bad += 1
+                        continue
+                    ts_list.append(epoch)
+        except OSError:
+            continue
+        if not ts_list:
+            continue
+        ts_list.sort()
+        workers.append({
+            "worker_id": worker_id,
+            "hostname": hostname,
+            "task": _file_task(tuple(sorted(task_groups)), hostname),
+            "is_mps": needle in hostname.lower(),
+            "ts": ts_list,
+        })
+    return workers, n_records, n_bad
+
+
+def _count_in(ts_sorted: list[float], lo: float, hi: float) -> int:
+    """Number of timestamps in the half-open window ``[lo, hi)``."""
+    return bisect.bisect_left(ts_sorted, hi) - bisect.bisect_left(ts_sorted, lo)
+
+
+def run_history(
+    output_base: Path, window_sec: float, max_bins: int, mps_match: str, json_path
+) -> None:
+    workers, n_records, n_bad = collect_history(output_base, mps_match)
+    if not workers:
+        sys.exit("No timestamped completions found in history.")
+
+    t_max = max(w["ts"][-1] for w in workers)
+    t_min = min(w["ts"][0] for w in workers)
+    window_h = window_sec / 3600.0
+
+    print(f"\nMPS-vs-Fleet throughput  [history]  "
+          f"{n_records} records over {(t_max - t_min) / 60.0:.1f} min of data")
+
+    # --- Throughput-over-time curve (most recent max_bins windows) ---
+    span_bins = int((t_max - t_min) // window_sec) + 1
+    nb = max(1, min(max_bins, span_bins))
+    curve: list[tuple] = []  # (window_end_label, mps_rate, fleet_rate)
+    for i in range(nb):
+        hi_b = t_max - i * window_sec
+        lo_b = hi_b - window_sec
+        mps = sum(_count_in(w["ts"], lo_b, hi_b) for w in workers
+                  if w["is_mps"] and w["task"] in GPU_TASKS) / window_h
+        flt = sum(_count_in(w["ts"], lo_b, hi_b) for w in workers
+                  if not w["is_mps"] and w["task"] in GPU_TASKS) / window_h
+        curve.append((datetime.fromtimestamp(hi_b, timezone.utc).strftime("%H:%M:%S"),
+                      mps, flt))
+    curve.reverse()  # chronological
+    print(f"\n== Throughput over time  [{window_sec / 60.0:.1f} min bins, "
+          f"last {nb} of {span_bins}] ==")
+    _print_table(("window end (UTC)", "MPS arc/h", "fleet arc/h"),
+                 [(e, f"{m:.1f}", f"{f:.1f}") for e, m, f in curve])
+
+    # --- Headline over the most recent full window [t_max - window, t_max] ---
+    # Only workers that actually completed something in the window count: stale
+    # timing files left by dead pods (a prior run's drained workers) otherwise
+    # inflate the per-GPU denominator. This is history's analogue of live mode's
+    # --active-within filter.
+    lo, hi = t_max - window_sec, t_max
+    rows = []
+    for w in workers:
+        cnt = _count_in(w["ts"], lo, hi)
+        if cnt == 0:
+            continue
+        rows.append({
+            "worker_id": w["worker_id"],
+            "hostname": w["hostname"],
+            "task": w["task"],
+            "delta": cnt,
+            "rate": cnt / window_h if window_h > 0 else 0.0,
+            "is_mps": w["is_mps"],
+        })
+
+    warnings: list[str] = []
+    if n_bad:
+        warnings.append(
+            f"{n_bad} of {n_records} records had no parseable ts/JSON; "
+            "excluded from history rates"
+        )
+
+    start_s = datetime.fromtimestamp(lo, timezone.utc).strftime("%H:%M:%S")
+    end_s = datetime.fromtimestamp(hi, timezone.utc).strftime("%H:%M:%S")
+    print(f"\n[history] headline window: {start_s} -> {end_s} UTC "
+          f"(last {window_sec / 60.0:.1f} min of data; anchored to latest completion)")
+    result = report(rows, window_sec, {}, warnings)  # {} locks: no live "stalled" notion
+    result["mode"] = "history"
+    result["window_sec"] = window_sec
+    result["data_span_sec"] = t_max - t_min
+    result["curve"] = [
+        {"window_end_utc": e, "mps_arc_h": m, "fleet_arc_h": f} for e, m, f in curve
+    ]
+
+    if json_path:
+        Path(json_path).write_text(json.dumps(result, indent=2, default=str))
+        print(f"\nWrote {json_path}")
+
+
+# ---------------------------------------------------------------------------
+# Live mode: sample the line-count counters over real elapsed wall-clock
+# ---------------------------------------------------------------------------
+
+
+def run_live(
+    output_base: Path, interval: float, samples: int, mps_match: str,
+    within: float | None, json_path,
+) -> None:
+    snaps: list[dict] = []
+    for i in range(samples):
+        snaps.append(take_snapshot(output_base))
+        stamp = datetime.now(timezone.utc).strftime("%H:%M:%S")
+        n_active = len(active_hosts(snaps[-1], within) or snaps[-1]["lock_meta"])
+        print(f"[{stamp}] sample {i + 1}/{samples}  "
+              f"({len(snaps[-1]['per_file'])} timing files, {n_active} active hosts)",
+              flush=True)
+        if i < samples - 1:
+            time.sleep(interval)
+
+    keep = active_hosts(snaps[-1], within)
+
+    # Optional stability series across consecutive intervals.
+    if samples > 2:
+        print("\n== Per-interval aggregate (stability check) ==")
+        series: list[tuple] = []
+        for a, b in zip(snaps, snaps[1:]):
+            rs, _ = compute_deltas(a, b, mps_match, keep)
+            mps = sum(r["rate"] for r in rs if r["is_mps"] and r["task"] in GPU_TASKS)
+            flt = sum(r["rate"] for r in rs if not r["is_mps"] and r["task"] in GPU_TASKS)
+            series.append((f"{(b['ts'] - a['ts']) / 60.0:.1f} min", f"{mps:.1f}", f"{flt:.1f}"))
+        _print_table(("interval", "MPS arc/h", "fleet arc/h"), series)
+
+    rows, warnings = compute_deltas(snaps[0], snaps[-1], mps_match, keep)
+    lock_counts = {
+        h: m["count"] for h, m in snaps[-1]["lock_meta"].items()
+        if keep is None or h in keep
+    }
+    result = report(rows, snaps[-1]["ts"] - snaps[0]["ts"], lock_counts, warnings)
+    result["mode"] = "live"
+
+    if json_path:
+        Path(json_path).write_text(json.dumps(result, indent=2, default=str))
+        print(f"\nWrote {json_path}")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -286,59 +507,43 @@ def main() -> None:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--output", default=DEFAULT_OUTPUT,
                     help="Inference output base (contains _meta/).")
-    ap.add_argument("--interval", type=float, default=300.0,
-                    help="Seconds between samples (default 300).")
-    ap.add_argument("--samples", type=int, default=2,
-                    help="Number of snapshots; headline uses first vs last (default 2).")
+    ap.add_argument("--live", action="store_true",
+                    help="Live sampling (watch counters advance). Default is history mode, "
+                         "which reconstructs throughput from stored ts timestamps without waiting.")
     ap.add_argument("--mps-match", default="mps",
                     help="Substring identifying MPS-colocated hostnames (default 'mps').")
-    ap.add_argument("--active-within", type=float, default=1800.0,
-                    help="Ignore workers idle longer than this many seconds "
-                         "(dead pods with stale locks). Default 1800; 0 = no filter.")
     ap.add_argument("--json", default=None, help="Optional path to dump the result JSON.")
+
+    hist = ap.add_argument_group("history mode (default)")
+    hist.add_argument("--window", default="5m",
+                      help="Analysis/bin window, e.g. 300, 90s, 5m, 1h (default 5m).")
+    hist.add_argument("--max-bins", type=int, default=12,
+                      help="Max windows in the throughput-over-time curve (default 12).")
+
+    live = ap.add_argument_group("live mode (--live)")
+    live.add_argument("--interval", type=float, default=300.0,
+                      help="Seconds between samples (default 300).")
+    live.add_argument("--samples", type=int, default=2,
+                      help="Number of snapshots; headline uses first vs last (default 2).")
+    live.add_argument("--active-within", type=float, default=1800.0,
+                      help="Ignore workers idle longer than this many seconds "
+                           "(dead pods with stale locks). Default 1800; 0 = no filter.")
     args = ap.parse_args()
 
-    if args.samples < 2:
-        ap.error("--samples must be >= 2")
     output_base = Path(args.output)
     if not (output_base / "_meta" / "timings").is_dir():
         ap.error(f"no _meta/timings/ under {output_base}")
-    within = None if args.active_within <= 0 else args.active_within
 
-    snaps: list[dict] = []
-    for i in range(args.samples):
-        snaps.append(take_snapshot(output_base))
-        stamp = datetime.now(timezone.utc).strftime("%H:%M:%S")
-        n_active = len(active_hosts(snaps[-1], within) or snaps[-1]["lock_meta"])
-        print(f"[{stamp}] sample {i + 1}/{args.samples}  "
-              f"({len(snaps[-1]['per_file'])} timing files, {n_active} active hosts)",
-              flush=True)
-        if i < args.samples - 1:
-            time.sleep(args.interval)
-
-    keep = active_hosts(snaps[-1], within)
-
-    # Optional stability series across consecutive intervals.
-    if args.samples > 2:
-        print("\n== Per-interval aggregate (stability check) ==")
-        series: list[tuple] = []
-        for a, b in zip(snaps, snaps[1:]):
-            rs, _ = compute_deltas(a, b, args.mps_match, keep)
-            mps = sum(r["rate"] for r in rs if r["is_mps"] and r["task"] in GPU_TASKS)
-            flt = sum(r["rate"] for r in rs if not r["is_mps"] and r["task"] in GPU_TASKS)
-            series.append((f"{(b['ts'] - a['ts']) / 60.0:.1f} min", f"{mps:.1f}", f"{flt:.1f}"))
-        _print_table(("interval", "MPS arc/h", "fleet arc/h"), series)
-
-    rows, warnings = compute_deltas(snaps[0], snaps[-1], args.mps_match, keep)
-    lock_counts = {
-        h: m["count"] for h, m in snaps[-1]["lock_meta"].items()
-        if keep is None or h in keep
-    }
-    result = report(rows, snaps[-1]["ts"] - snaps[0]["ts"], lock_counts, warnings)
-
-    if args.json:
-        Path(args.json).write_text(json.dumps(result, indent=2, default=str))
-        print(f"\nWrote {args.json}")
+    if args.live:
+        if args.samples < 2:
+            ap.error("--samples must be >= 2")
+        within = None if args.active_within <= 0 else args.active_within
+        run_live(output_base, args.interval, args.samples, args.mps_match, within, args.json)
+    else:
+        window_sec = _parse_duration(args.window)
+        if window_sec <= 0:
+            ap.error("--window must be > 0")
+        run_history(output_base, window_sec, args.max_bins, args.mps_match, args.json)
 
 
 if __name__ == "__main__":

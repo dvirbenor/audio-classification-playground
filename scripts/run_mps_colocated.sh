@@ -30,6 +30,9 @@
 #   WAVLM_STATIC_BATCH_SIZE(optional) override the compiled_static batch dim (default 256)
 #   EMOTION_RUNTIME_MODE   (default "optimized")
 #   VAD_GATING             (default "1"; set "0" to disable --vad-gating)
+#   REQUIRE_VAD            (default "0"; set "1" to add --require-precomputed-vad so
+#                          GPU workers SKIP archives without a vad/ artifact instead
+#                          of falling back to full-timeline — enforces real gating)
 #   MAX_RETRIES            (default "3")
 #   DEVICE                 (default "cuda")
 #   ENABLE_MPS             (default "1"; set "0" to skip the MPS daemon, e.g. a 1-task test)
@@ -52,6 +55,7 @@ DISFLUENCY_BACKBONE="${DISFLUENCY_BACKBONE:-wavlm}"
 WAVLM_RUNTIME_PRESET="${WAVLM_RUNTIME_PRESET:-compiled_static}"
 EMOTION_RUNTIME_MODE="${EMOTION_RUNTIME_MODE:-optimized}"
 VAD_GATING="${VAD_GATING:-1}"
+REQUIRE_VAD="${REQUIRE_VAD:-0}"
 MAX_RETRIES="${MAX_RETRIES:-3}"
 DEVICE="${DEVICE:-cuda}"
 ENABLE_MPS="${ENABLE_MPS:-1}"
@@ -115,6 +119,9 @@ build_worker_argv() {
   fi
   if [ "$VAD_GATING" = "1" ]; then
     WORKER_ARGV+=(--vad-gating)
+  fi
+  if [ "$REQUIRE_VAD" = "1" ]; then
+    WORKER_ARGV+=(--require-precomputed-vad)
   fi
   if [ -n "${AUDIO_CACHE:-}" ]; then
     : "${CACHE_BYTES:?CACHE_BYTES is required when AUDIO_CACHE is set}"

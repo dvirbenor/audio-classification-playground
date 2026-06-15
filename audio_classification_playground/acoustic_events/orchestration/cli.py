@@ -111,6 +111,7 @@ def _cmd_run(args: argparse.Namespace) -> None:
         vad_gating_enabled=args.vad_gating,
         vad_gating_bridge_sec=args.vad_gating_bridge_sec,
         vad_gating_tasks=tuple(args.vad_gating_tasks),
+        require_precomputed_vad=args.require_precomputed_vad,
         seed=args.seed,
     )
 
@@ -575,6 +576,16 @@ def main(argv: list[str] | None = None) -> None:
         help="Which tasks to VAD-gate. Defaults to all gatable tasks; "
              "disfluency region detection is speech-scoped, so gating it is "
              "event-identical (see VAD_GATING_IMPLEMENTATION_PLAN.md).",
+    )
+    p_run.add_argument(
+        "--require-precomputed-vad",
+        action="store_true",
+        help="Only process archives that already have a vad/ artifact; skip (do "
+             "not claim) any archive lacking precomputed VAD instead of falling "
+             "back to full-timeline. Pair with --vad-gating to guarantee every "
+             "processed archive is actually gated (controlled benchmarks / "
+             "enforcing the gating speedup). No effect for task-groups that "
+             "produce vad themselves (all, vad, emotion-vad).",
     )
     p_run.add_argument("--seed", type=int, default=None)
 
