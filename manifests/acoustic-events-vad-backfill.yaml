@@ -16,17 +16,23 @@
 #   2. Keep decode cheap. Decode runs in a separate GIL-releasing thread (~12s vs VAD ~70s),
 #      so PREFETCH_WORKERS=1 + a small lookahead is plenty; a big lookahead pins a 2nd core
 #      per proc AND holds several ~250MB decoded archives resident => OOM at the 24Gi limit.
-# With VAD_PROCS=8 (one VAD core each) a single validation pod measured ~660 arc/h (8 hot
-# threads, ~19GB RSS — well under the 24Gi limit); 20 pods ≈ ~13k/h => the ~526k backlog in
-# ~1.5-2 days. Rate varies with archive length (longer recordings → fewer/h). Do NOT trust
-# the dashboard Pace for VAD; track real progress with `orchestration progress --fast`.
+# With VAD_PROCS=8 (one VAD core each) a single pod measured ~660 arc/h in ISOLATION (8 hot
+# threads, ~19GB RSS, well under 24Gi). But aggregate throughput is EFS-metadata-bound, NOT
+# per-pod-CPU-bound: it does NOT scale linearly with pods. A 20-pod run thrashed EFS to only
+# ~80-110 arc/h/pod (~2k/h aggregate) — far below 20×660 — and OOM-failed. So run only a FEW
+# pods (default 3) near the per-pod ceiling; scale up only if a real throughput measurement
+# (`orchestration progress --fast`) shows EFS headroom. NOTE: the skip-scan of already-done
+# archives is NOT solved by pod count — it's solved by the per-pass undone work-list (the
+# loop below rebuilds a vad-absent manifest and feeds the workers only undone archives), so
+# procs stay compute-bound at any coverage level. Do NOT trust the dashboard Pace for VAD;
+# track real progress with `orchestration progress --fast`.
 #
-# Workers coordinate via per-archive locks + --completion-policy exists, so the 20 pods
+# Workers coordinate via per-archive locks + --completion-policy exists, so the pods
 # never double-process, and a pod that finds everything claimed/done exits cleanly.
 #
-# Topology: this is ONE k8s Job running 20 identical pods (parallelism/completions in
-# the parallel template below), NOT 20 separate Jobs. Pod count lives in the template,
-# not in grid: (which stays at a single entry). Bump parallelism/completions there.
+# Topology: this is ONE k8s Job running N identical pods (parallelism/completions in the
+# parallel template below — currently 3), NOT N separate Jobs. Pod count lives in the
+# template, not in grid: (which stays at a single entry). Bump parallelism/completions there.
 # Launch:  experiment-launcher launch manifests/acoustic-events-vad-backfill.yaml \
 #            --template ./manifests/job-template-vad-backfill-parallel.yaml
 config:
@@ -97,51 +103,67 @@ experiments:
         source .venv/bin/activate
         source env.shared.sh
 
-        # Loop the multi-process VAD launcher until a pass processes zero archives (the
-        # fleet has covered the corpus). Each pass runs VAD_PROCS worker processes (one
-        # per physical core), each doing one pass over the manifest and skipping
-        # already-done/locked archives; we re-scan to mop up anything freed by a peer
-        # that died mid-archive. A non-clean pass (a proc crashed / missing finish line,
-        # launcher reports clean=0) is retried after a short backoff, not mistaken for
-        # completion.
+        # Convergent backfill. Each pass FIRST rebuilds the UNDONE work-list — the archives
+        # still missing a vad/ artifact under $OUTPUT — via a parallel EFS scan, then runs
+        # the VAD workers against ONLY that list. This avoids the skip-scan trap: feeding
+        # all_archives.parquet made every proc stat through the ~100k+ already-done archives
+        # (session-sorted) at ~2% CPU before finding work, and got worse as coverage rose.
+        # Scanning only undone archives gives a ~100% claim hit rate at ANY completion level
+        # (whether 20% or 95% done) and terminates cleanly when the list is empty. The
+        # absence check is the SAME primitive the worker's completion-policy=exists uses, so
+        # filter and workers agree exactly — nothing is wrongly dropped or reprocessed.
+        #
+        # VAD_PROCS=8 → one single-threaded VAD process per physical core (8 on these
+        # 16-vCPU/8-physical 4xlarges); run_vad_multiproc.sh pins OMP/MKL/BLAS=1 so procs
+        # don't fan torch across all cores, shuffles each proc's scan order (anti-herd), and
+        # PREFETCH_WORKERS=1 + small lookahead keeps decode cheap (avoids the 24Gi OOM).
         set +e
+        UNDONE="/workspace/undone_${HOSTNAME:-x}.parquet"
         PASS=0
         while true; do
           PASS=$((PASS + 1))
-          echo "[$(date -Iseconds)] === VAD backfill pass ${PASS} ==="
+          echo "[$(date -Iseconds)] === VAD backfill pass ${PASS}: rebuilding undone work-list ==="
+          BUILD_LOG="$(mktemp)"
+          python scripts/build_subset_parquet.py \
+            --parquet "$PARQUET" --out "$UNDONE" --all \
+            --vad-absent-under "$OUTPUT" 2>&1 | tee "$BUILD_LOG"
+          if [ "${PIPESTATUS[0]}" -ne 0 ]; then
+            echo "[$(date -Iseconds)] pass ${PASS}: undone-scan failed — retrying in 30s"
+            sleep 30; continue
+          fi
+          REMAIN="$(grep -oE 'wrote [0-9]+ archives' "$BUILD_LOG" | grep -oE '[0-9]+' | tail -1)"
+          echo "[$(date -Iseconds)] pass ${PASS}: ${REMAIN:-?} archives still missing vad"
+          if [ "${REMAIN:-0}" -eq 0 ]; then
+            echo "[$(date -Iseconds)] No undone archives — corpus covered. Exiting 0."
+            break
+          fi
+
           PASS_LOG="$(mktemp)"
-          # VAD_PROCS=8 → one single-threaded VAD process per physical core (8 on these
-          # 16-vCPU/8-physical 4xlarges); run_vad_multiproc.sh pins OMP/MKL/BLAS=1 so the
-          # procs don't fan torch across all cores. PREFETCH_WORKERS=1 + small lookahead:
-          # decode (~12s) is far cheaper than VAD (~70s), so one bursty decode thread per
-          # proc keeps archives ready without pinning a 2nd core or holding many ~250MB
-          # decoded buffers resident (the prior 2×lookahead=4 config OOM'd the 24Gi limit).
           VAD_PROCS=8 \
           PREFETCH_WORKERS=1 \
           PREFETCH_LOOKAHEAD=2 \
           VAD_PREFETCH_WORKERS=1 \
-          PARQUET="$PARQUET" \
+          PARQUET="$UNDONE" \
           OUTPUT="$OUTPUT" \
           bash scripts/run_vad_multiproc.sh 2>&1 | tee "$PASS_LOG"
 
           RESULT="$(grep -oE 'VAD_MULTIPROC total_processed=[0-9]+ clean=[01]' "$PASS_LOG" | tail -1)"
           if [ -z "$RESULT" ]; then
             echo "[$(date -Iseconds)] pass ${PASS}: no result line (crash?) — retrying in 30s"
-            sleep 30
-            continue
+            sleep 30; continue
           fi
           PROC="$(echo "$RESULT" | grep -oE 'total_processed=[0-9]+' | grep -oE '[0-9]+')"
           CLEAN="$(echo "$RESULT" | grep -oE 'clean=[01]' | grep -oE '[01]')"
           echo "[$(date -Iseconds)] pass ${PASS}: processed=${PROC:-0} clean=${CLEAN:-0}"
           if [ "${CLEAN:-0}" -ne 1 ]; then
             echo "[$(date -Iseconds)] pass ${PASS}: a worker crashed — retrying in 30s"
-            sleep 30
-            continue
+            sleep 30; continue
           fi
-          if [ "${PROC:-0}" -eq 0 ]; then
-            echo "[$(date -Iseconds)] No VAD work processed — corpus covered. Exiting 0."
-            break
-          fi
+          # Termination is driven by the undone list being empty (top of loop), NOT by
+          # processed=0: a pass can legitimately process 0 if peers claimed every remaining
+          # archive, while the corpus still isn't covered. If so, pause briefly (mop-up
+          # phase) so we don't spin re-scanning while peers finish.
+          [ "${PROC:-0}" -eq 0 ] && { echo "[$(date -Iseconds)] pass ${PASS}: 0 processed (peers hold the rest) — re-scanning in 60s"; sleep 60; }
         done
         echo "[$(date -Iseconds)] Finished vad-backfill run ${RUN_ID}"
     # Pod count is set by parallelism/completions in the parallel template, NOT here.

@@ -7,8 +7,15 @@
 #
 # Safe for the vad backfill because the workers are interchangeable: they claim
 # archives via per-archive file locks and each loops until no VAD work remains,
-# then exits 0. There is no run_id-based work sharding, so 20 pods under one Job
-# behave exactly like 20 single-pod Jobs — minus 19 Job objects to track.
+# then exits 0. There is no run_id-based work sharding, so N pods under one Job
+# behave exactly like N single-pod Jobs — minus N-1 Job objects to track.
+#
+# POD COUNT = 3 (parallelism/completions below). Deliberately small: VAD throughput
+# is EFS-metadata-bound, not per-pod-CPU-bound, so the aggregate rate plateaus well
+# before 20 pods. A 20-pod run measured only ~80-110 arc/h/pod (~2k/h aggregate, EFS
+# thrash) and OOM-failed, whereas a single pod hit ~660/h in isolation. A few pods
+# stay near the per-pod ceiling without saturating EFS; scale up only if a real
+# throughput measurement shows headroom.
 #
 # Keep the manifest's grid: at a single entry (run_id: [1]) when using this
 # template; pod count is parallelism/completions here, NOT the grid.
@@ -27,8 +34,8 @@ metadata:
   name: template-job
   namespace: default
 spec:
-  parallelism: 20
-  completions: 20
+  parallelism: 3
+  completions: 3
   backoffLimit: 10
   ttlSecondsAfterFinished: 86400
   template:

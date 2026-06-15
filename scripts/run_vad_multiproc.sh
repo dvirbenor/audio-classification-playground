@@ -111,13 +111,23 @@ term_handler() {
 }
 trap term_handler TERM INT
 
+# Per-proc shuffle seed (DISTINCT per process AND per pod). Without --seed the worker
+# scans in deterministic session-sorted order, so every proc on every pod walks the SAME
+# already-done prefix (the leading fleet completed the early sessions), statting ~100k+
+# done archives on EFS and colliding on locks before reaching fresh work — procs sit at
+# ~2% CPU (EFS-stat-bound), not computing. A distinct seed shuffles each proc's order, so
+# with ~80% of the corpus undone it claims fresh work in ~1 try. Pod base from hostname so
+# two pods don't pick the same order. (Backfill has no audio cache, so we lose no
+# session-decode locality by shuffling.)
+SEED_BASE=$(( $(hostname | cksum | cut -d' ' -f1) % 1000000 ))
+
 log "launching $VAD_PROCS VAD worker processes "\
-"(prefetch=$PREFETCH_WORKERS lookahead=$PREFETCH_LOOKAHEAD vad_prefetch=$VAD_PREFETCH_WORKERS)"
+"(prefetch=$PREFETCH_WORKERS lookahead=$PREFETCH_LOOKAHEAD vad_prefetch=$VAD_PREFETCH_WORKERS seed_base=$SEED_BASE)"
 build_worker_argv
 for i in $(seq 1 "$VAD_PROCS"); do
-  "${WORKER_ARGV[@]}" > "$WORK_DIR/proc-$i.log" 2>&1 &
+  "${WORKER_ARGV[@]}" --seed "$(( SEED_BASE + i ))" > "$WORK_DIR/proc-$i.log" 2>&1 &
   pids+=("$!")
-  log "  -> proc $i pid $!"
+  log "  -> proc $i pid $! (seed $(( SEED_BASE + i )))"
 done
 
 # Supervise by polling (bash<4.3 compatible). Unlike the MPS launcher we do NOT tear
