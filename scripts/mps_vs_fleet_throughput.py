@@ -334,6 +334,7 @@ def collect_history(output_base: Path, mps_match: str) -> tuple[list[dict], int,
         worker_id = jsonl_path.stem
         hostname = worker_id.rsplit("_", 1)[0] if "_" in worker_id else worker_id
         ts_list: list[float] = []
+        gated_ts: list[float] = []  # subset of ts where the archive was VAD-gated
         task_groups: set[str] = set()
         try:
             with open(jsonl_path, "r", encoding="utf-8", errors="replace") as fh:
@@ -354,17 +355,23 @@ def collect_history(output_base: Path, mps_match: str) -> tuple[list[dict], int,
                         n_bad += 1
                         continue
                     ts_list.append(epoch)
+                    # Gated == ran against a precomputed/cached VAD artifact (vs.
+                    # full-timeline). precomputed_vad mirrors timings.derive_vad_mode.
+                    if rec.get("precomputed_vad") or rec.get("vad_reused"):
+                        gated_ts.append(epoch)
         except OSError:
             continue
         if not ts_list:
             continue
         ts_list.sort()
+        gated_ts.sort()
         workers.append({
             "worker_id": worker_id,
             "hostname": hostname,
             "task": _file_task(tuple(sorted(task_groups)), hostname),
             "is_mps": needle in hostname.lower(),
             "ts": ts_list,
+            "gated_ts": gated_ts,
         })
     return workers, n_records, n_bad
 
@@ -439,12 +446,40 @@ def run_history(
     print(f"\n[history] headline window: {start_s} -> {end_s} UTC "
           f"(last {window_sec / 60.0:.1f} min of data; anchored to latest completion)")
     result = report(rows, window_sec, {}, warnings)  # {} locks: no live "stalled" notion
+
+    # --- VAD-gating coverage (are archives actually gated, or full-timeline?) ---
+    # Lifetime per GPU worker (not just the headline window): prod running ~100%
+    # ungated means the 33-56% gating speedup is unrealized; this surfaces it.
+    cov_rows: list[tuple] = []
+    coverage: list[dict] = []
+    for w in sorted(workers, key=lambda x: (not x["is_mps"], x["task"], x["hostname"])):
+        if w["task"] not in GPU_TASKS:
+            continue
+        total = len(w["ts"])
+        if total == 0:
+            continue
+        gated = len(w["gated_ts"])
+        pct = 100.0 * gated / total
+        pool = "MPS" if w["is_mps"] else "fleet"
+        cov_rows.append((pool, w["task"], _short(w["hostname"]), str(total),
+                         str(gated), f"{pct:.0f}%"))
+        coverage.append({"pool": pool, "task": w["task"], "hostname": w["hostname"],
+                         "n": total, "gated": gated, "gated_pct": pct})
+    if cov_rows:
+        print("\n== VAD-gating coverage (lifetime, GPU tasks) ==")
+        _print_table(("pool", "task", "worker", "n", "gated", "gated%"), cov_rows)
+        tot = sum(c["n"] for c in coverage)
+        gat = sum(c["gated"] for c in coverage)
+        print(f"  overall: {gat}/{tot} = {100.0 * gat / tot:.0f}% gated "
+              "(0% => gating speedup unrealized; VAD not leading)")
+
     result["mode"] = "history"
     result["window_sec"] = window_sec
     result["data_span_sec"] = t_max - t_min
     result["curve"] = [
         {"window_end_utc": e, "mps_arc_h": m, "fleet_arc_h": f} for e, m, f in curve
     ]
+    result["gating_coverage"] = coverage
 
     if json_path:
         Path(json_path).write_text(json.dumps(result, indent=2, default=str))

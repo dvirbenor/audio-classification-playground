@@ -72,9 +72,9 @@ experiments:
           --affect-backbone wavlm \
           --disfluency-backbone wavlm \
           --device cpu \
-          --prefetch-workers 10 \
+          --prefetch-workers 8 \
           --prefetch-lookahead 24 \
-          --vad-prefetch-workers 1 \
+          --vad-prefetch-workers 8 \
           --max-retries 3
 
         echo "[$(date -Iseconds)] Finished inference-vad-cpu run ${RUN_ID}"

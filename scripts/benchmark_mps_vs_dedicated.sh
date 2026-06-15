@@ -148,12 +148,17 @@ PY
 
 run_vad_prepass() {  # $1 = out dir — populate vad/ for the subset (CPU), so gating can be enforced
   local out="$1"
-  log "VAD pre-pass -> $out (CPU; enables --require-precomputed-vad)"
+  # VAD compute (Silero) is CPU-bound and serial per archive (~70s for a 90-min file),
+  # so it parallelizes linearly ACROSS archives. The production manifest's
+  # --vad-prefetch-workers 1 makes a 13-CPU pod a single serial VAD thread (~30 arc/h);
+  # use VAD_PREFETCH_WORKERS to saturate the cores so the pre-pass isn't a serial slog.
+  log "VAD pre-pass -> $out (CPU; ${VAD_PREFETCH_WORKERS:-8} parallel VAD workers; enables --require-precomputed-vad)"
   python -m "$MODULE" run \
     --parquet "$PARQUET" --output "$out" \
     --task-group vad --completion-policy exists \
     --affect-backbone "$AFFECT_BACKBONE" --disfluency-backbone "$DISFLUENCY_BACKBONE" \
-    --device cpu --prefetch-workers 6 --prefetch-lookahead 12 --vad-prefetch-workers 1 \
+    --device cpu --prefetch-workers 6 --prefetch-lookahead 24 \
+    --vad-prefetch-workers "${VAD_PREFETCH_WORKERS:-8}" \
     --max-retries "$MAX_RETRIES" "${cache_args[@]}" \
     || die "VAD pre-pass failed for $out"
 }
