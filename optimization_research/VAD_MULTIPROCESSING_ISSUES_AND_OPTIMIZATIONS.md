@@ -2,10 +2,20 @@
 
 How the CPU VAD fleet went from ~53 to ~660 archives/h **per pod** (~12×), why the
 naive knobs didn't work, and the supporting fixes (real-throughput status, gating
-enforcement). Investigated 2026-06-15. Two stages: (1) one process per physical core
-(~53→~343/h), then (2) pinning per-process math threads + leaner decode, which fixed a
-20-pod OOM/oversubscription failure and roughly doubled per-pod rate again (~343→~660/h)
-— see [Scale-up to 20 pods](#scale-up-to-20-pods-oversubscription--oom-and-the-real-per-process-fix-2026-06-15).
+enforcement). Investigated 2026-06-15. **Three** stages, each fixing what the prior one
+exposed:
+1. **One process per physical core** (~53→~343/h) — Silero VAD is GIL-bound, so processes
+   not threads. ([The fix](#the-fix-one-process-per-physical-core))
+2. **Pin per-process math threads + leaner decode** (~343→~660/h, fixed a 20-pod
+   OOM/oversubscription failure) — torch fanned intra-op threads across all cores.
+   ([Scale-up to 20 pods](#scale-up-to-20-pods-oversubscription--oom-and-the-real-per-process-fix-2026-06-15))
+3. **Per-pass undone work-list** — the ~660/h was measured on an empty scratch dir; against
+   the partially-done prod tree the workers stat-walked the done-prefix at ~2% CPU. Feed
+   them only vad-absent archives. ([The skip-scan trap](#the-skip-scan-trap-re-scanning-a-partially-done-corpus-2026-06-15-cont))
+
+**Current production state:** 3 pods, compute-bound (~100% CPU/proc), ~1.8–2k arc/h
+aggregate; scaling pods up now scales ~linearly. The TL;DR table below is the *stage-1*
+snapshot — later stages supersede its per-pod and aggregate figures.
 
 ---
 
@@ -136,14 +146,66 @@ was necessary but *not sufficient*):
 | Throughput | ~80 arc/h/pod | **~660 arc/h/pod** (22 archives / 120 s steady-state) |
 
 So the corrected config roughly **doubled** per-pod throughput vs the pre-pinning ~343/h
-*and* fixed the scale-up OOM. **~660/h × 20 pods ≈ ~13k/h → the ~526k backlog in ~1.5–2
-days** (rate drops on longer recordings later in the corpus). This supersedes the ~343/h
-TL;DR figure, which was measured before thread-pinning + the leaner decode.
+*and* fixed the scale-up OOM. ~~`~660/h × 20 pods ≈ ~13k/h → backlog in ~1.5–2 days`~~ —
+**this linear projection did NOT hold against the real corpus** (see next section): that
+~660/h was measured against an *empty scratch* output, which masked a separate skip-scan
+bottleneck that dominates against the partially-done prod tree.
 
 > **Lesson:** when sizing CPU-bound multi-process work, count *all* threads each process can
 > spawn (torch/BLAS intra-op pools), not just the obvious worker thread — and pin them. And
 > validate memory at the per-pod cgroup limit before scaling, since one OOM per pod ×
 > `backoffLimit` fails the entire Job.
+
+## The skip-scan trap: re-scanning a partially-done corpus (2026-06-15, cont.)
+
+With the thread-pin + lean-decode fix in, the backfill **still stalled at ~2% CPU/proc**
+when relaunched against the **prod output tree** — but with *no* OOM this time. Reducing
+20 → 3 pods did **not** help (still ~2%), which **ruled out peer-EFS contention** (3 pods =
+24 procs would have recovered if contention were the cause).
+
+**Root cause — the skip-scan.** The workers run `--completion-policy exists` over
+`all_archives.parquet` in deterministic **session-sorted** order. The leading `vad-cpu`
+fleet had already completed the early sessions, so every proc loads all ~589k entities and
+**stat-walks the ~100k+ already-done prefix on EFS** (one `is_task_artifact_complete_for_archive`
+per archive) before reaching fresh work — EFS-metadata-bound, ~zero compute. Confirmed in
+the run log: `Loaded 589648 unique entities`, then **silent at 2% CPU**. The earlier
+~660/h validation hid this entirely because it used an **empty scratch output** → every
+archive was fresh, no done-prefix to walk. *(Lesson: validate against a representative,
+partially-done output tree, not an empty scratch dir.)*
+
+**Rejected fix — random shuffle seed alone.** Shuffling each proc's scan order helps *only*
+while the corpus is mostly undone (at 80% undone a random draw hits fresh work in ~1 try).
+It **degrades as coverage rises** — at 90% done, 90% of draws hit already-done archives, so
+the skip-scan returns inverted — and it makes "0 processed ⇒ done" termination unreliable.
+It doesn't converge.
+
+**The fix — a per-pass UNDONE work-list.** `build_subset_parquet.py` gained
+`--vad-absent-under <output> --all` (+ a parallel 64-thread EFS scan): it emits **only the
+vad-absent archives**, using the *same* `is_task_artifact_complete_for_archive` primitive
+the worker's `exists` policy uses, so filter and workers agree exactly (nothing wrongly
+dropped). The backfill loop now **rebuilds this work-list each pass** and feeds the workers
+*only undone archives* → a ~**100% claim hit rate at any coverage level** (20% or 95% done),
+and it **terminates** cleanly when the list is empty (robust, vs the flaky `processed=0`
+heuristic). The per-proc shuffle `--seed` is kept purely as **anti-herd** over the
+now-all-undone list (so N procs don't collide on its first rows). The per-pass scan cost
+(~one parallel tree walk) is paid once by one process, vs 24 procs continuously re-statting.
+
+**Measurement gotcha — startup ramp vs steady state.** At multi-pod scale the **first
+~6–10 min is a slow startup**: ~24 procs contend on the shared EFS model-cache + first-S3
+fetches, so they idle at ~2% CPU — measuring *then* reads "broken." A `/proc/<pid>` snapshot
+(one thread already `R`-state at ~66% CPU, no disk-read movement) flagged it as startup, and
+a delayed re-measure confirmed steady state: **8/8 procs at 100–115% CPU** (VAD thread +
+decode core), RSS ~10 GB, compute-bound. **Always distinguish ramp from steady state before
+concluding.**
+
+**Outcome & current config.** Running **3 pods** (deliberately small — "for safety"),
+confirmed compute-bound ≈ **~1.8–2k arc/h aggregate → ~456k backlog in ~9–10 days**. Since
+it is now genuinely compute-bound (NOT EFS-walled), **scaling pods up scales throughput
+~linearly** — the earlier 20-pod collapse was the *pre-fix* code (skip-scan + OOM), not a
+hard EFS ceiling. Bump the template's `parallelism`/`completions` to trade the ~10-day ETA
+down (watch only the one-time startup model-cache contention; steady-state stays per-pod
+compute-bound). Deployed in `scripts/build_subset_parquet.py` +
+`manifests/acoustic-events-vad-backfill.yaml` (commit `d3c9a13`).
 
 ## Supporting fixes
 
