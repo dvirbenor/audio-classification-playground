@@ -46,8 +46,18 @@
 #                          so the only difference is windows processed, not I/O)
 #   TASKS                  (default "affect disfluency emotion")
 #   WAVLM_STATIC_BATCH_SIZE(default 512)  WAVLM_RUNTIME_PRESET (default compiled_static)
+#                          (lever B: lower it, e.g. 256, to make WavLM kernels yield SMs
+#                           more often so emotion2vec interleaves — only affects the mps arm
+#                           contention; both arms use the same value so the A/B stays fair)
+#   {AFFECT,DISFLUENCY,EMOTION}_THREAD_PCT  (optional) per-client MPS SM caps, forwarded to
+#                          the mps arm only (lever A: cap the WavLM aggressors, leave emotion
+#                          uncapped). See optimization_research/MPS_OPTIMIZATION.md.
 #   EMOTION_RUNTIME_MODE   (default optimized)
 #   AFFECT_BACKBONE/DISFLUENCY_BACKBONE (default wavlm)
+#   VAD_PROCS              (optional) VAD worker PROCESSES for the gated pre-pass (via
+#                          run_vad_multiproc.sh; default nproc/2). VAD is GIL-bound so
+#                          processes (not threads) scale it. Excluded from arm timing —
+#                          only affects how fast the gated arms start (iteration speed).
 #   SMI_INTERVAL           (default 1) nvidia-smi dmon sample seconds
 #   CLEAN                  (default 1) rm -rf each arm dir before running
 #   MAX_RETRIES            (default 3)
@@ -148,19 +158,19 @@ PY
 
 run_vad_prepass() {  # $1 = out dir — populate vad/ for the subset (CPU), so gating can be enforced
   local out="$1"
-  # VAD compute (Silero) is CPU-bound and serial per archive (~70s for a 90-min file),
-  # so it parallelizes linearly ACROSS archives. The production manifest's
-  # --vad-prefetch-workers 1 makes a 13-CPU pod a single serial VAD thread (~30 arc/h);
-  # use VAD_PREFETCH_WORKERS to saturate the cores so the pre-pass isn't a serial slog.
-  log "VAD pre-pass -> $out (CPU; ${VAD_PREFETCH_WORKERS:-8} parallel VAD workers; enables --require-precomputed-vad)"
-  python -m "$MODULE" run \
-    --parquet "$PARQUET" --output "$out" \
-    --task-group vad --completion-policy exists \
-    --affect-backbone "$AFFECT_BACKBONE" --disfluency-backbone "$DISFLUENCY_BACKBONE" \
-    --device cpu --prefetch-workers 6 --prefetch-lookahead 24 \
-    --vad-prefetch-workers "${VAD_PREFETCH_WORKERS:-8}" \
-    --max-retries "$MAX_RETRIES" "${cache_args[@]}" \
-    || die "VAD pre-pass failed for $out"
+  # Silero VAD is GIL-bound: get_speech_timestamps is a Python loop over ~30ms windows, so
+  # --vad-prefetch-workers (threads) pins to ~ONE core regardless of thread count — the
+  # prepass was effectively serial. Run N PROCESSES instead (scripts/run_vad_multiproc.sh:
+  # separate GILs => N cores, ~Nx faster) so the gated arms start sooner. This does NOT
+  # change the measured numbers — the prepass runs BEFORE start_smi/arm_start, so it is
+  # excluded from every arm wall and from inference_sec; it's purely iteration speed.
+  log "VAD pre-pass -> $out (CPU; ${VAD_PROCS:-nproc/2} worker PROCESSES via run_vad_multiproc.sh)"
+  env PARQUET="$PARQUET" OUTPUT="$out" \
+    AFFECT_BACKBONE="$AFFECT_BACKBONE" DISFLUENCY_BACKBONE="$DISFLUENCY_BACKBONE" \
+    COMPLETION_POLICY=exists MAX_RETRIES="$MAX_RETRIES" DEVICE=cpu \
+    ${VAD_PROCS:+VAD_PROCS="$VAD_PROCS"} \
+    ${AUDIO_CACHE:+AUDIO_CACHE="$AUDIO_CACHE" CACHE_BYTES="$CACHE_BYTES"} \
+    bash "$HERE/run_vad_multiproc.sh" || die "VAD pre-pass failed for $out"
 }
 
 run_one_gpu_task() {  # $1=task $2=out $3=mode (gated|ungated) — one task alone on the full GPU
@@ -231,6 +241,9 @@ for arm in $ARMS; do
     EMOTION_RUNTIME_MODE="$EMOTION_RUNTIME_MODE" \
     AFFECT_BACKBONE="$AFFECT_BACKBONE" DISFLUENCY_BACKBONE="$DISFLUENCY_BACKBONE" \
     VAD_GATING="$vg" REQUIRE_VAD="$rv" ENABLE_MPS="1" MAX_RETRIES="$MAX_RETRIES" \
+    ${AFFECT_THREAD_PCT:+AFFECT_THREAD_PCT="$AFFECT_THREAD_PCT"} \
+    ${DISFLUENCY_THREAD_PCT:+DISFLUENCY_THREAD_PCT="$DISFLUENCY_THREAD_PCT"} \
+    ${EMOTION_THREAD_PCT:+EMOTION_THREAD_PCT="$EMOTION_THREAD_PCT"} \
     ${AUDIO_CACHE:+AUDIO_CACHE="$AUDIO_CACHE" CACHE_BYTES="$CACHE_BYTES"} \
     bash "$HERE/run_mps_colocated.sh" || log "WARNING: mps/$mode arm exited non-zero"
   else

@@ -40,6 +40,12 @@
 #   CUDA_MPS_LOG_DIRECTORY (default "/tmp/nvidia-log")
 #   <TASK>_EXTRA_ARGS      (optional) extra flags per task, e.g.
 #                          EMOTION_EXTRA_ARGS="--prefetch-workers 8 --prefetch-lookahead 16"
+#   <TASK>_THREAD_PCT      (optional, 1-100) per-client CUDA_MPS_ACTIVE_THREAD_PERCENTAGE
+#                          cap. Bounds the SMs that task's MPS client may span so the big
+#                          WavLM batch-512 GEMMs can't monopolize the array and starve the
+#                          smaller emotion2vec kernels. Cap the AGGRESSORS, leave the VICTIM
+#                          uncapped, e.g. AFFECT_THREAD_PCT=40 DISFLUENCY_THREAD_PCT=40
+#                          (emotion unset). See optimization_research/MPS_OPTIMIZATION.md.
 #
 set -uo pipefail
 
@@ -63,9 +69,13 @@ ENABLE_MPS="${ENABLE_MPS:-1}"
 MODULE="audio_classification_playground.acoustic_events.orchestration"
 
 # --- CUDA MPS daemon ------------------------------------------------------
-# Do NOT set CUDA_MPS_ACTIVE_THREAD_PERCENTAGE: leaving the SM partition
-# unbounded lets the MPS scheduler freely interleave the co-located clients,
-# which is exactly what fills the tensor-core gaps.
+# By DEFAULT the global SM partition is left unbounded (no daemon-level
+# CUDA_MPS_ACTIVE_THREAD_PERCENTAGE): the MPS scheduler freely interleaves the
+# co-located clients, which fills the tensor-core gaps. HOWEVER, the sustained-load
+# bench (optimization_research/MPS_OPTIMIZATION.md) showed two batch-512 WavLM clients
+# monopolize the SM array and starve emotion2vec ~3.9x. To rebalance WITHOUT a hard
+# partition, set per-task <TASK>_THREAD_PCT — applied below as a PER-CLIENT
+# CUDA_MPS_ACTIVE_THREAD_PERCENTAGE on the aggressors only, leaving the victim uncapped.
 mps_started=0
 start_mps() {
   [ "$ENABLE_MPS" = "1" ] || { log "ENABLE_MPS=0 — skipping MPS daemon"; return; }
@@ -96,7 +106,18 @@ stop_mps() {
 # Populates the global WORKER_ARGV array (avoids bash-4 `mapfile`/process subst).
 build_worker_argv() {
   local task="$1"
-  WORKER_ARGV=(
+  WORKER_ARGV=()
+  # Optional per-client MPS SM cap: <TASK>_THREAD_PCT -> the client's
+  # CUDA_MPS_ACTIVE_THREAD_PERCENTAGE (read by the MPS server at connect). Prefix with
+  # `env` so only THIS worker inherits it (the others stay unbounded). Empty => no cap.
+  local pct_var pct
+  pct_var="$(echo "$task" | tr '[:lower:]-' '[:upper:]_')_THREAD_PCT"
+  pct="${!pct_var:-}"
+  if [ -n "$pct" ]; then
+    WORKER_ARGV+=( env "CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=$pct" )
+    log "  $task -> CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=$pct"
+  fi
+  WORKER_ARGV+=(
     python -m "$MODULE" run
       --parquet "$PARQUET"
       --output "$OUTPUT"

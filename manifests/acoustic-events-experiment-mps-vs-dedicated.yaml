@@ -56,7 +56,7 @@ experiments:
   # ---------------------------------------------------------------------------
   - name: bench-mps-vs-dedicated-puregpu
     category: inference
-    description: Controlled MPS-vs-dedicated A/B on one Blackwell, gated, warmed cache (pure GPU), sustained
+    description: Controlled MPS-vs-dedicated A/B on one Blackwell, gated, warmed cache (pure GPU), sustained, 20 archives, emotion-starvation rebalance (WavLM batch 256 + 40% SM caps on affect/disfluency)
     # (image is set at config level — per-experiment image is ignored by the launcher)
     nodeSelector:
       # TODO(blackwell): set to your cluster's Blackwell RTX PRO 6000 node label.
@@ -91,7 +91,7 @@ experiments:
 
         ALL_ARCHIVES="/efs/dvir/data/magic-clips-research/dataset-reference/all_archives.parquet"
         SCRATCH="/efs/dvir/data/magic-clips-research/acoustic-understanding/scratch/mps-bench/puregpu"
-        N_ARCHIVES="${N_ARCHIVES:-40}"
+        N_ARCHIVES="${N_ARCHIVES:-20}"   # 20 is plenty: the first-20 already span 4min..3.2h (18.9h total), so the emotion tail still reproduces — faster iteration
         mkdir -p "$SCRATCH"
         LOG_DIR="$SCRATCH/job-logs"; mkdir -p "$LOG_DIR"
         LOG_FILE="$LOG_DIR/bench-puregpu-${RUN_ID}-${HOSTNAME:-unknown}.log"
@@ -126,7 +126,10 @@ experiments:
         export CACHE_BYTES=200000000000
         export ARMS="dedicated mps"
         export WARM_CACHE=1                 # pure GPU time => isolates MPS effect + throttling
-        export WAVLM_STATIC_BATCH_SIZE=512  # the validated knee
+        # --- emotion-starvation rebalance (see optimization_research/MPS_OPTIMIZATION.md) ---
+        export WAVLM_STATIC_BATCH_SIZE=256  # lever B: 512->256 so WavLM kernels yield SMs more often (both arms, fair A/B)
+        export AFFECT_THREAD_PCT=40         # lever A: cap the WavLM aggressors' per-client MPS SM share
+        export DISFLUENCY_THREAD_PCT=40     #          (emotion left UNCAPPED so it grabs the freed ~20% + interleave gaps)
         export SMI_INTERVAL=1
 
         bash scripts/benchmark_mps_vs_dedicated.sh
@@ -139,7 +142,7 @@ experiments:
   # ---------------------------------------------------------------------------
   - name: bench-mps-vs-dedicated-e2e
     category: inference
-    description: MPS arm only, cold cache + live S3 (production-representative) — compare emotion% vs the pure-GPU run to split throttle-vs-starvation
+    description: MPS arm only, cold cache + live S3 (production-representative), 20 archives, emotion-starvation rebalance (WavLM batch 256 + 40% SM caps on affect/disfluency)
     # (image is set at config level — per-experiment image is ignored by the launcher)
     nodeSelector:
       # TODO(blackwell): same Blackwell node label as the pure-GPU experiment.
@@ -174,7 +177,7 @@ experiments:
 
         ALL_ARCHIVES="/efs/dvir/data/magic-clips-research/dataset-reference/all_archives.parquet"
         SCRATCH="/efs/dvir/data/magic-clips-research/acoustic-understanding/scratch/mps-bench/e2e"
-        N_ARCHIVES="${N_ARCHIVES:-40}"
+        N_ARCHIVES="${N_ARCHIVES:-20}"   # 20 is plenty: the first-20 already span 4min..3.2h (18.9h total), so the emotion tail still reproduces — faster iteration
         mkdir -p "$SCRATCH"
         LOG_DIR="$SCRATCH/job-logs"; mkdir -p "$LOG_DIR"
         LOG_FILE="$LOG_DIR/bench-e2e-${RUN_ID}-${HOSTNAME:-unknown}.log"
@@ -207,7 +210,10 @@ experiments:
         export CACHE_BYTES=200000000000
         export ARMS="mps"
         export WARM_CACHE=0                 # cold cache + live S3 => exposes prefetch/CPU starvation
-        export WAVLM_STATIC_BATCH_SIZE=512
+        # --- emotion-starvation rebalance (see optimization_research/MPS_OPTIMIZATION.md) ---
+        export WAVLM_STATIC_BATCH_SIZE=256  # lever B (match the puregpu arm)
+        export AFFECT_THREAD_PCT=40         # lever A: cap the WavLM aggressors
+        export DISFLUENCY_THREAD_PCT=40     #          (emotion uncapped)
         export SMI_INTERVAL=1
 
         bash scripts/benchmark_mps_vs_dedicated.sh
