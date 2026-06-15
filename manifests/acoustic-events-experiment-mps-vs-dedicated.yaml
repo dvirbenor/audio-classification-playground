@@ -31,7 +31,11 @@ config:
   namespace: nlp-audio-understanding
   team: nlp
   project: audio-understanding
-  image: 690765672468.dkr.ecr.us-east-1.amazonaws.com/ai-content-provenance:latest
+  # MUST be set at config level: experiment-launcher IGNORES per-experiment `image:`
+  # overrides (only config.image / --image take effect). The MPS arm runs
+  # run_mps_colocated.sh, which hard-requires `nvidia-cuda-mps-control` and dies without
+  # it — so both arms need this CUDA-MPS dev image, not ai-content-provenance.
+  image: 690765672468.dkr.ecr.us-east-1.amazonaws.com/ml-dev-containers:gpu-1.0.22
   capacityType: on-demand
   env:
     CLEARML_WEB_HOST: http://clearml-webserver.clearml:8080
@@ -53,7 +57,7 @@ experiments:
   - name: bench-mps-vs-dedicated-puregpu
     category: inference
     description: Controlled MPS-vs-dedicated A/B on one Blackwell, gated, warmed cache (pure GPU), sustained
-    image: 690765672468.dkr.ecr.us-east-1.amazonaws.com/ml-dev-containers:gpu-1.0.22
+    # (image is set at config level — per-experiment image is ignored by the launcher)
     nodeSelector:
       # TODO(blackwell): set to your cluster's Blackwell RTX PRO 6000 node label.
       node.kubernetes.io/instance-type: g7e.2xlarge
@@ -136,7 +140,7 @@ experiments:
   - name: bench-mps-vs-dedicated-e2e
     category: inference
     description: MPS arm only, cold cache + live S3 (production-representative) — compare emotion% vs the pure-GPU run to split throttle-vs-starvation
-    image: 690765672468.dkr.ecr.us-east-1.amazonaws.com/ml-dev-containers:gpu-1.0.22
+    # (image is set at config level — per-experiment image is ignored by the launcher)
     nodeSelector:
       # TODO(blackwell): same Blackwell node label as the pure-GPU experiment.
       node.kubernetes.io/instance-type: g7e.2xlarge

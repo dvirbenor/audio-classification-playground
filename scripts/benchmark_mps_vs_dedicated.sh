@@ -182,8 +182,11 @@ run_one_gpu_task() {  # $1=task $2=out $3=mode (gated|ungated) — one task alon
 # --- optional one-time cache warm (=> pure GPU time, isolates MPS effect) ----------
 if [ "$WARM_CACHE" = "1" ]; then
   log "Warming audio cache (pure-GPU mode) ..."
+  # --once: do a single warm/clean pass and EXIT. Without it the warmer runs as a
+  # continuous service (scan, sleep 60s, rescan, never completing because no inference
+  # fleet advances its frontiers here) and the benchmark hangs forever at this step.
   python -m "$MODULE" warm-cache --parquet "$PARQUET" --output "$OUTPUT_BASE" \
-    "${cache_args[@]}" --warm-workers 8 --s3-max-pool-connections 64 --max-retries "$MAX_RETRIES" \
+    "${cache_args[@]}" --warm-workers 8 --s3-max-pool-connections 64 --max-retries "$MAX_RETRIES" --once \
     || log "WARNING: warm-cache returned non-zero; continuing"
 fi
 
@@ -216,7 +219,12 @@ for arm in $ARMS; do
   elif [ "$arm" = "mps" ]; then
     if [ "$mode" = "gated" ]; then vg=1; rv=1; else vg=0; rv=0; fi
     log "--- mps/$mode: $TASKS co-located via CUDA MPS (vad_gating=$vg require_vad=$rv) ---"
-    PARQUET="$PARQUET" OUTPUT="$out" \
+    # NOTE: must go through `env`. The ${AUDIO_CACHE:+...} below expands to
+    # `AUDIO_CACHE=.. CACHE_BYTES=..` only AFTER word-splitting, and bash does NOT treat
+    # post-expansion VAR=val words as assignment prefixes — it would run the first one
+    # (`AUDIO_CACHE=/path`) as a command ("No such file or directory") and the whole mps
+    # arm exits 0s before any inference. `env` parses those words as real assignments.
+    env PARQUET="$PARQUET" OUTPUT="$out" \
     TASKS="$TASKS" \
     WAVLM_RUNTIME_PRESET="$WAVLM_RUNTIME_PRESET" \
     WAVLM_STATIC_BATCH_SIZE="$WAVLM_STATIC_BATCH_SIZE" \
