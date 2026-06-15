@@ -254,8 +254,14 @@ def load_recent_timings(
 def build_fleet_heartbeat(
     locks: dict[str, list[LockInfo]],
     timings: dict[str, _WorkerTimingInfo],
+    active_within_sec: float | None = None,
 ) -> FleetHeartbeat:
-    """Correlate lock ownership and timing data into a fleet snapshot."""
+    """Correlate lock ownership and timing data into a fleet snapshot.
+
+    When *active_within_sec* is set, workers whose last activity is older than that
+    (dead pods, drained prior runs) are dropped from the rows AND the fleet totals,
+    so the dashboard and the aggregate pace reflect only the live fleet.
+    """
     all_hostnames: set[str] = set(locks.keys())
     for info in timings.values():
         all_hostnames.add(info.hostname)
@@ -358,6 +364,20 @@ def build_fleet_heartbeat(
             pace_per_hour=pace,
             task_groups=tuple(sorted(lock_groups_by_host.get(hostname, set()))),
         ))
+
+    # Drop idle workers (and re-derive totals from the survivors) so dead pods and
+    # drained prior runs don't clutter the rows or inflate the aggregate pace.
+    if active_within_sec is not None:
+        cutoff = datetime.now(timezone.utc).timestamp() - active_within_sec
+        workers = [
+            w for w in workers
+            if w.last_activity_ts is not None and w.last_activity_ts >= cutoff
+        ]
+        fleet_locks = sum(w.locks for w in workers)
+        fleet_done = sum(w.done for w in workers)
+        live_paces = [w.pace_per_hour for w in workers if w.pace_per_hour is not None]
+        fleet_pace_sum = sum(live_paces)
+        fleet_pace_count = len(live_paces)
 
     return FleetHeartbeat(
         workers=workers,

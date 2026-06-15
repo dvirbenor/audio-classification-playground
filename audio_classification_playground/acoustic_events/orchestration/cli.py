@@ -348,6 +348,15 @@ def _cmd_timings(args: argparse.Namespace) -> None:
         _print_group(records, title=f"Timing summary ({len(records)} records)")
 
 
+def _parse_duration_sec(text: str) -> float:
+    """Parse '90s' / '30m' / '2h' / bare seconds ('300') into seconds."""
+    text = str(text).strip().lower()
+    mult = {"s": 1.0, "m": 60.0, "h": 3600.0}
+    if text and text[-1] in mult:
+        return float(text[:-1]) * mult[text[-1]]
+    return float(text)
+
+
 def _cmd_status(args: argparse.Namespace) -> None:
     from .heartbeat import (
         build_fleet_heartbeat,
@@ -360,7 +369,8 @@ def _cmd_status(args: argparse.Namespace) -> None:
     output_base = Path(args.output)
     locks = parse_active_locks(output_base)
     timings = load_recent_timings(output_base, tail=args.tail)
-    heartbeat = build_fleet_heartbeat(locks, timings)
+    active_within_sec = _parse_duration_sec(args.active_within) if args.active_within else None
+    heartbeat = build_fleet_heartbeat(locks, timings, active_within_sec=active_within_sec)
 
     if args.summary:
         from .progress import quick_disk_summary
@@ -637,6 +647,9 @@ def main(argv: list[str] | None = None) -> None:
     p_status.add_argument("--output", required=True, help="EFS output base directory")
     p_status.add_argument("--tail", type=int, default=20,
                           help="Recent timing records per worker for pace calculation")
+    p_status.add_argument("--active-within", default=None,
+                          help="Hide workers idle longer than this (e.g. 30m, 2h, 90s); "
+                               "also excludes them from the fleet totals. Default: show all.")
     p_status.add_argument("--summary", action="store_true",
                           help="Include completed/partial counts (slower, walks output tree)")
 
