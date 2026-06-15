@@ -41,6 +41,9 @@
 #   AUDIO_CACHE/CACHE_BYTES(optional) shared decoded-audio cache; if set, warmed once
 #   WARM_CACHE             (default 1 when AUDIO_CACHE set, else 0) pre-warm => pure GPU
 #   ARMS                   (default "dedicated mps")
+#   GATING_MODES           (default "gated ungated") run each arm both VAD-gated and
+#                          full-timeline => the gating speedup (best with WARM_CACHE=1,
+#                          so the only difference is windows processed, not I/O)
 #   TASKS                  (default "affect disfluency emotion")
 #   WAVLM_STATIC_BATCH_SIZE(default 512)  WAVLM_RUNTIME_PRESET (default compiled_static)
 #   EMOTION_RUNTIME_MODE   (default optimized)
@@ -58,6 +61,7 @@ die() { log "FATAL: $*"; exit 1; }
 : "${OUTPUT_BASE:?OUTPUT_BASE is required (scratch dir)}"
 
 ARMS="${ARMS:-dedicated mps}"
+GATING_MODES="${GATING_MODES:-gated ungated}"
 TASKS="${TASKS:-affect disfluency emotion}"
 WAVLM_STATIC_BATCH_SIZE="${WAVLM_STATIC_BATCH_SIZE:-512}"
 WAVLM_RUNTIME_PRESET="${WAVLM_RUNTIME_PRESET:-compiled_static}"
@@ -154,14 +158,14 @@ run_vad_prepass() {  # $1 = out dir — populate vad/ for the subset (CPU), so g
     || die "VAD pre-pass failed for $out"
 }
 
-run_one_gpu_task() {  # $1=task $2=out  — dedicated: one task alone on the full GPU
-  local task="$1" out="$2"
+run_one_gpu_task() {  # $1=task $2=out $3=mode (gated|ungated) — one task alone on the full GPU
+  local task="$1" out="$2" mode="$3"
   local argv=( python -m "$MODULE" run
     --parquet "$PARQUET" --output "$out"
     --task-group "$task" --completion-policy exists
     --affect-backbone "$AFFECT_BACKBONE" --disfluency-backbone "$DISFLUENCY_BACKBONE"
-    --device cuda --max-retries "$MAX_RETRIES"
-    --vad-gating --require-precomputed-vad )
+    --device cuda --max-retries "$MAX_RETRIES" )
+  [ "$mode" = "gated" ] && argv+=( --vad-gating --require-precomputed-vad )
   if [ "$task" = "affect" ] || [ "$task" = "disfluency" ]; then
     argv+=( --wavlm-runtime-preset "$WAVLM_RUNTIME_PRESET" --wavlm-static-batch-size "$WAVLM_STATIC_BATCH_SIZE" )
   fi
@@ -182,74 +186,90 @@ declare -a SUMMARY=()
 declare -A WALL=()
 
 for arm in $ARMS; do
-  out="$OUTPUT_BASE/$arm"
+ for mode in $GATING_MODES; do
+  tag="${arm}_${mode}"
+  out="$OUTPUT_BASE/$tag"
   [ "$CLEAN" = "1" ] && rm -rf "$out"
   mkdir -p "$out"
-  log "================ ARM: $arm  ->  $out ================"
+  log "================ ARM: $arm  MODE: $mode  ->  $out ================"
 
-  run_vad_prepass "$out"
+  # gated needs vad/ present (and enforces it); ungated ignores VAD entirely.
+  [ "$mode" = "gated" ] && run_vad_prepass "$out"
 
-  start_smi "$arm"
+  start_smi "$tag"
   arm_start=$(date +%s)
 
   if [ "$arm" = "dedicated" ]; then
     for task in $TASKS; do
-      log "--- dedicated: $task (alone on full GPU) ---"
+      log "--- dedicated/$mode: $task (alone on full GPU) ---"
       t0=$(date +%s)
-      run_one_gpu_task "$task" "$out" || log "WARNING: dedicated $task exited non-zero"
+      run_one_gpu_task "$task" "$out" "$mode" || log "WARNING: dedicated/$mode $task exited non-zero"
       t1=$(date +%s)
-      WALL["dedicated/$task"]=$((t1 - t0))
-      log "    dedicated $task wall=${WALL["dedicated/$task"]}s"
+      WALL["$tag/$task"]=$((t1 - t0))
+      log "    dedicated/$mode $task wall=${WALL["$tag/$task"]}s"
     done
   elif [ "$arm" = "mps" ]; then
-    log "--- mps: $TASKS co-located via CUDA MPS, gating enforced ---"
+    if [ "$mode" = "gated" ]; then vg=1; rv=1; else vg=0; rv=0; fi
+    log "--- mps/$mode: $TASKS co-located via CUDA MPS (vad_gating=$vg require_vad=$rv) ---"
     PARQUET="$PARQUET" OUTPUT="$out" \
     TASKS="$TASKS" \
     WAVLM_RUNTIME_PRESET="$WAVLM_RUNTIME_PRESET" \
     WAVLM_STATIC_BATCH_SIZE="$WAVLM_STATIC_BATCH_SIZE" \
     EMOTION_RUNTIME_MODE="$EMOTION_RUNTIME_MODE" \
     AFFECT_BACKBONE="$AFFECT_BACKBONE" DISFLUENCY_BACKBONE="$DISFLUENCY_BACKBONE" \
-    VAD_GATING="1" REQUIRE_VAD="1" ENABLE_MPS="1" MAX_RETRIES="$MAX_RETRIES" \
+    VAD_GATING="$vg" REQUIRE_VAD="$rv" ENABLE_MPS="1" MAX_RETRIES="$MAX_RETRIES" \
     ${AUDIO_CACHE:+AUDIO_CACHE="$AUDIO_CACHE" CACHE_BYTES="$CACHE_BYTES"} \
-    bash "$HERE/run_mps_colocated.sh" || log "WARNING: mps arm exited non-zero"
+    bash "$HERE/run_mps_colocated.sh" || log "WARNING: mps/$mode arm exited non-zero"
   else
     log "WARNING: unknown arm '$arm' — skipping"; continue
   fi
 
   arm_end=$(date +%s)
   stop_smi
-  WALL["$arm"]=$((arm_end - arm_start))
+  WALL["$tag"]=$((arm_end - arm_start))
 
-  log "--- timings ($arm) [per-archive inference_sec, warmup-excluded] ---"
+  log "--- timings ($tag) [per-archive inference_sec, warmup-excluded] ---"
   python -m "$MODULE" timings --output "$out" || true
-  log "--- GPU telemetry ($arm) ---"
-  smi_summary "$arm"
-  SUMMARY+=("arm=$arm wall=${WALL["$arm"]}s output=$out smi=$RESULTS/smi_$arm.log")
+  log "--- GPU telemetry ($tag) ---"
+  smi_summary "$tag"
+  SUMMARY+=("arm=$arm mode=$mode wall=${WALL["$tag"]}s output=$out smi=$RESULTS/smi_$tag.log")
+ done
 done
 
 echo
 log "================ SUMMARY ================"
 for line in "${SUMMARY[@]}"; do log "$line"; done
 
-# Headline ratios (only when both arms ran).
-ded_serial=0; have_ded=0
-for task in $TASKS; do
-  v="${WALL["dedicated/$task"]:-}"
-  [ -n "$v" ] && { ded_serial=$((ded_serial + v)); have_ded=1; }
-done
-mps_w="${WALL["mps"]:-}"
-if [ "$have_ded" = "1" ] && [ -n "$mps_w" ] && [ "$mps_w" -gt 0 ]; then
-  log "Dedicated SERIAL (1 GPU, all tasks back-to-back): ${ded_serial}s"
-  log "MPS co-located    (1 GPU, all tasks concurrent):   ${mps_w}s"
-  ratio="$(python - "$ded_serial" "$mps_w" <<'PY'
+ratio_of() {  # $1=numer $2=denom -> "X.XXx" (NA if denom<=0)
+  python - "$1" "$2" <<'PY'
 import sys
-ded=float(sys.argv[1]); mps=float(sys.argv[2])
-print(f"{ded/mps:.2f}x ({'GAIN' if ded/mps>=1 else 'LOSS'} per GPU)")
+a=float(sys.argv[1]); b=float(sys.argv[2])
+print(f"{a/b:.2f}x" if b > 0 else "NA")
 PY
-)"
-  log "=> MPS speedup vs serial-on-1-GPU: $ratio"
-  log "NOTE: vs a 3-dedicated-GPU fleet, compare MPS wall (${mps_w}s on 1 GPU) to the"
-  log "      SLOWEST single task above (fleet wall on 3 GPUs); per-GPU = archives / (wall x GPUs)."
-fi
+}
+
+# (A) MPS vs dedicated, within each gating mode (the ~1.44x per-GPU question).
+for mode in $GATING_MODES; do
+  ded_serial=0; have_ded=0
+  for task in $TASKS; do
+    v="${WALL["dedicated_${mode}/$task"]:-}"
+    [ -n "$v" ] && { ded_serial=$((ded_serial + v)); have_ded=1; }
+  done
+  mps_w="${WALL["mps_${mode}"]:-}"
+  if [ "$have_ded" = "1" ] && [ -n "$mps_w" ] && [ "$mps_w" -gt 0 ]; then
+    log "[$mode] dedicated serial-on-1-GPU=${ded_serial}s  mps=${mps_w}s  => MPS speedup: $(ratio_of "$ded_serial" "$mps_w")"
+  fi
+done
+
+# (B) VAD-gating speedup, within each arm (ungated wall / gated wall; >1 = gating faster).
+for arm in $ARMS; do
+  g="${WALL["${arm}_gated"]:-}"; u="${WALL["${arm}_ungated"]:-}"
+  if [ -n "$g" ] && [ -n "$u" ] && [ "$g" -gt 0 ]; then
+    log "[$arm] VAD-gating speedup (ungated ${u}s / gated ${g}s): $(ratio_of "$u" "$g")"
+  fi
+done
+
+log "Per-archive inference_sec by mode is in the timings above; the gating gain should"
+log "track the speech fraction (gating to ~p%% of windows => ~p%% of ungated GPU time)."
 log "Raw nvidia-smi dmon logs in $RESULTS/ — inspect SM-clock over time for throttling."
 log "Done."
