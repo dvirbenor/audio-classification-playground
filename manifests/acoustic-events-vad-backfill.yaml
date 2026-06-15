@@ -6,12 +6,15 @@
 # (the steady-state LEADING fleet) in that each pod LOOPS until it finds no more VAD
 # work to claim, then exits 0 — so the k8s jobs complete when the corpus is covered.
 #
-# Throughput note: VAD (Silero) is CPU-bound and serial per archive (~70s for a 90-min
-# file) but parallelizes linearly ACROSS archives, so the lever is --vad-prefetch-workers
-# (NOT pod count). 8 workers on a 13-CPU 4xlarge ≈ 250-400 arc/h/pod; 20 pods ≈ 5-8k/h
-# => the ~526k un-VAD'd backlog in ~3-5 days. Do NOT trust the dashboard Pace for VAD
-# (it reads total_sec ≈ 0.05s, the main-loop slice, not the prefetch-thread compute);
-# track real progress with `orchestration progress --fast` or mps_vs_fleet_throughput.py.
+# Throughput note: VAD (Silero) is CPU-bound and GIL-bound per process —
+# get_speech_timestamps is a Python loop over ~30 ms windows, so --vad-prefetch-workers
+# (a ThreadPoolExecutor) serializes on the GIL and pins ONE worker to ~one core. The
+# lever is therefore MULTIPLE PROCESSES per pod (separate GILs => separate cores):
+# scripts/run_vad_multiproc.sh runs VAD_PROCS workers, each claiming distinct archives.
+# Use one proc per PHYSICAL core — SMT siblings contend for CPU-bound work — so on these
+# 16-vCPU SMT x86 4xlarges that is VAD_PROCS=8. ~8 procs ≈ 8x a single worker's ~60/h
+# => ~500 arc/h/pod; 20 pods ≈ ~10k/h. Do NOT trust the dashboard Pace for VAD; track
+# real progress with `orchestration progress --fast` or mps_vs_fleet_throughput.py.
 #
 # Workers coordinate via per-archive locks + --completion-policy exists, so the 20 pods
 # never double-process, and a pod that finds everything claimed/done exits cleanly.
@@ -82,47 +85,50 @@ experiments:
         export GIT_SSH_COMMAND="ssh -i /workspace/.ssh/id_ed25519 -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=/workspace/.ssh/known_hosts"
 
         rm -rf audio-classification-playground
-        git clone --branch main --single-branch git@github.com:dvirbenor/audio-classification-playground.git
+        git clone --branch feature/inference-optimization --single-branch git@github.com:dvirbenor/audio-classification-playground.git
         cd audio-classification-playground
         echo "Git commit: $(git rev-parse HEAD)"
         uv sync --frozen
         source .venv/bin/activate
         source env.shared.sh
 
-        # Loop the VAD worker until a pass claims zero archives (the fleet has covered
-        # the corpus). Each run_worker call does one pass over the manifest, skipping
+        # Loop the multi-process VAD launcher until a pass processes zero archives (the
+        # fleet has covered the corpus). Each pass runs VAD_PROCS worker processes (one
+        # per physical core), each doing one pass over the manifest and skipping
         # already-done/locked archives; we re-scan to mop up anything freed by a peer
-        # that died mid-archive. A non-clean exit (crash, no "Worker finished" line) is
-        # retried after a short backoff rather than mistaken for completion.
+        # that died mid-archive. A non-clean pass (a proc crashed / missing finish line,
+        # launcher reports clean=0) is retried after a short backoff, not mistaken for
+        # completion.
         set +e
         PASS=0
         while true; do
           PASS=$((PASS + 1))
           echo "[$(date -Iseconds)] === VAD backfill pass ${PASS} ==="
           PASS_LOG="$(mktemp)"
-          python -m audio_classification_playground.acoustic_events.orchestration run \
-            --parquet "$PARQUET" \
-            --output "$OUTPUT" \
-            --task-group vad \
-            --completion-policy exists \
-            --affect-backbone wavlm \
-            --disfluency-backbone wavlm \
-            --device cpu \
-            --prefetch-workers 8 \
-            --prefetch-lookahead 24 \
-            --vad-prefetch-workers 8 \
-            --max-retries 3 2>&1 | tee "$PASS_LOG"
+          VAD_PROCS=8 \
+          PREFETCH_WORKERS=2 \
+          PREFETCH_LOOKAHEAD=4 \
+          VAD_PREFETCH_WORKERS=1 \
+          PARQUET="$PARQUET" \
+          OUTPUT="$OUTPUT" \
+          bash scripts/run_vad_multiproc.sh 2>&1 | tee "$PASS_LOG"
 
-          FIN="$(grep -oE 'Worker finished: processed=[0-9]+' "$PASS_LOG" | tail -1)"
-          if [ -z "$FIN" ]; then
-            echo "[$(date -Iseconds)] pass ${PASS}: no clean finish (crash?) — retrying in 30s"
+          RESULT="$(grep -oE 'VAD_MULTIPROC total_processed=[0-9]+ clean=[01]' "$PASS_LOG" | tail -1)"
+          if [ -z "$RESULT" ]; then
+            echo "[$(date -Iseconds)] pass ${PASS}: no result line (crash?) — retrying in 30s"
             sleep 30
             continue
           fi
-          PROC="$(echo "$FIN" | grep -oE '[0-9]+')"
-          echo "[$(date -Iseconds)] pass ${PASS}: processed=${PROC:-0}"
+          PROC="$(echo "$RESULT" | grep -oE 'total_processed=[0-9]+' | grep -oE '[0-9]+')"
+          CLEAN="$(echo "$RESULT" | grep -oE 'clean=[01]' | grep -oE '[01]')"
+          echo "[$(date -Iseconds)] pass ${PASS}: processed=${PROC:-0} clean=${CLEAN:-0}"
+          if [ "${CLEAN:-0}" -ne 1 ]; then
+            echo "[$(date -Iseconds)] pass ${PASS}: a worker crashed — retrying in 30s"
+            sleep 30
+            continue
+          fi
           if [ "${PROC:-0}" -eq 0 ]; then
-            echo "[$(date -Iseconds)] No VAD work claimed — corpus covered. Exiting 0."
+            echo "[$(date -Iseconds)] No VAD work processed — corpus covered. Exiting 0."
             break
           fi
         done

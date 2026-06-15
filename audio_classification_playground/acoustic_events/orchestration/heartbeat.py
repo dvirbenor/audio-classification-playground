@@ -19,6 +19,11 @@ from .timings import TIMINGS_DIR
 
 LOGGER = logging.getLogger(__name__)
 
+# A host's timing files within this many seconds of its latest activity are
+# treated as concurrently active (e.g. MPS procs) and their paces are pooled;
+# older files are stale restarts and excluded from the pace.
+_ACTIVE_FILE_GAP_SEC = 600.0
+
 
 # ---------------------------------------------------------------------------
 # Data structures
@@ -149,7 +154,10 @@ def _read_tail_lines(path: Path, n: int) -> list[str]:
     if size == 0:
         return []
 
-    block = min(size, n * 1024)
+    # Timing records are ~2 KB each (many fields); read 4 KB/line so tail=n
+    # actually yields n complete records (a 1 KB/line guess returns ~n/2 and
+    # truncates the newest record).
+    block = min(size, n * 4096)
     try:
         with open(path, "rb") as f:
             f.seek(max(0, size - block))
@@ -159,6 +167,21 @@ def _read_tail_lines(path: Path, n: int) -> list[str]:
 
     lines = raw.decode("utf-8", errors="replace").splitlines()
     return [l for l in lines if l.strip()][-n:]
+
+
+def _record_epoch(rec: dict) -> float | None:
+    """Parse a timing record's completion timestamp into epoch seconds."""
+    ts_str = rec.get("ts")
+    if not ts_str:
+        return None
+    try:
+        return (
+            datetime.strptime(ts_str, "%Y-%m-%dT%H:%M:%SZ")
+            .replace(tzinfo=timezone.utc)
+            .timestamp()
+        )
+    except (ValueError, TypeError):
+        return None
 
 
 @dataclass
@@ -205,17 +228,9 @@ def load_recent_timings(
                 records.append(rec)
                 if rec.get("task_group"):
                     task_groups.add(str(rec["task_group"]))
-                ts_str = rec.get("ts")
-                if ts_str:
-                    try:
-                        dt = datetime.strptime(ts_str, "%Y-%m-%dT%H:%M:%SZ").replace(
-                            tzinfo=timezone.utc,
-                        )
-                        epoch = dt.timestamp()
-                        if latest_ts is None or epoch > latest_ts:
-                            latest_ts = epoch
-                    except ValueError:
-                        pass
+                epoch = _record_epoch(rec)
+                if epoch is not None and (latest_ts is None or epoch > latest_ts):
+                    latest_ts = epoch
             except (json.JSONDecodeError, TypeError):
                 continue
 
@@ -285,23 +300,47 @@ def build_fleet_heartbeat(
 
         # A hostname may have multiple timing files when the orchestrator
         # has been restarted (each launch generates a fresh UUID suffix).
-        # Collapse them into one row: sum done counts, derive pace from
-        # the currently-active instance only.
+        # Collapse them into one row: sum done counts across all instances.
         total_done = sum(ti.done for ti in host_timings)
-        active_ti = max(host_timings, key=lambda t: t.latest_ts or 0.0)
 
-        total_secs = [
-            r["total_sec"]
-            for r in active_ti.recent_records
-            if isinstance(r.get("total_sec"), (int, float))
-        ]
-        pace: float | None = None
-        if total_secs:
-            mean_sec = sum(total_secs) / len(total_secs)
-            if mean_sec > 0:
-                pace = 3600.0 / mean_sec
-                fleet_pace_sum += pace
-                fleet_pace_count += 1
+        # Real throughput from completion timestamps — NOT 3600/total_sec. That
+        # per-archive latency misleads for concurrent or short-latency tasks: VAD
+        # records only Silero time, so the latency estimate explodes to tens of
+        # thousands of arc/h. Counting actual completions per real elapsed wall-clock
+        # is correct for every worker type.
+        #
+        # A host may have several timing files: concurrent MPS procs (one per task,
+        # all active — their rates must SUM into the pod's throughput) or stale
+        # restarts (old files, excluded). Among files active within ACTIVE_FILE_GAP
+        # of the host's latest activity, keep the newest per task-group (so a recent
+        # restart of the same task isn't double-counted), then SUM their per-file
+        # rates. Each file's rate = completions / real elapsed span of its tail.
+        host_latest = max(
+            (ti.latest_ts for ti in host_timings if ti.latest_ts is not None),
+            default=None,
+        )
+        active_by_group: dict[tuple, _WorkerTimingInfo] = {}
+        for ti in host_timings:
+            if ti.latest_ts is None:
+                continue
+            if host_latest is not None and host_latest - ti.latest_ts > _ACTIVE_FILE_GAP_SEC:
+                continue
+            key = ti.task_groups or (ti.worker_id,)
+            cur = active_by_group.get(key)
+            if cur is None or ti.latest_ts > (cur.latest_ts or 0.0):
+                active_by_group[key] = ti
+
+        per_file_paces: list[float] = []
+        for ti in active_by_group.values():
+            fts = sorted(
+                t for t in (_record_epoch(r) for r in ti.recent_records) if t is not None
+            )
+            if len(fts) >= 2 and fts[-1] > fts[0]:
+                per_file_paces.append((len(fts) - 1) / (fts[-1] - fts[0]) * 3600.0)
+        pace: float | None = sum(per_file_paces) if per_file_paces else None
+        if pace is not None:
+            fleet_pace_sum += pace
+            fleet_pace_count += 1
 
         all_ts = [ti.latest_ts for ti in host_timings if ti.latest_ts is not None]
         lock_ts = latest_lock_by_host.get(hostname)
