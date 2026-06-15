@@ -11,12 +11,19 @@
 # (multi-proc on one node) but CPU-only and without MPS. Workers coordinate via
 # per-archive locks + --completion-policy exists, so the N procs never double-process.
 #
-# HYPERTHREADING: VAD is CPU-bound, so one process per PHYSICAL core beats one per
-# logical thread — SMT siblings contend for the same execution units. On SMT x86
-# (the c6a/c7a/c6i/c7i instances this backfill targets) physical cores = nproc/2, which
-# is the default here. But `nproc` is unreliable under a cgroup CPU quota (it may report
-# the node, not the pod's allocation), so PIN VAD_PROCS explicitly in the manifest
-# (16-vCPU 4xlarge => VAD_PROCS=8). Non-SMT hosts (Graviton) want VAD_PROCS=nproc.
+# THREAD PINNING (must-have): each worker is pinned to ONE math thread (OMP/MKL/BLAS/
+# numexpr=1, set below) so the N processes don't each fan torch's intra-op pool across all
+# cores. Without this the pod oversubscribes N-way and VAD throughput collapses.
+#
+# HYPERTHREADING: VAD's per-window Python loop is CPU-bound, so one VAD process per PHYSICAL
+# core beats one per logical thread — SMT siblings contend for the same execution units. On
+# SMT x86 (the c6a/c7a/c6i/c7i instances this backfill targets) physical cores = nproc/2.
+# But each process ALSO runs a GIL-releasing decode thread (PREFETCH_WORKERS), which wants
+# cycles too; since decode (~12s) is far cheaper than VAD (~70s), keep PREFETCH_WORKERS=1
+# with a small lookahead so decode stays bursty on the SMT siblings rather than pinning a
+# second full core per proc. `nproc` is unreliable under a cgroup quota, so PIN VAD_PROCS
+# explicitly in the manifest (16-vCPU/8-physical 4xlarge => VAD_PROCS=8). Non-SMT hosts
+# (Graviton) want VAD_PROCS=nproc.
 #
 # Config (env):
 #   PARQUET               (required) all_archives.parquet
@@ -58,6 +65,18 @@ DISFLUENCY_BACKBONE="${DISFLUENCY_BACKBONE:-wavlm}"
 COMPLETION_POLICY="${COMPLETION_POLICY:-exists}"
 MAX_RETRIES="${MAX_RETRIES:-3}"
 DEVICE="${DEVICE:-cpu}"
+
+# CRITICAL: pin each worker to ONE math thread. VAD is Silero-via-torch, and torch (plus
+# OpenMP/MKL/BLAS/numexpr) default their intra-op pools to ALL cores. With VAD_PROCS
+# worker processes each fanning out across every core, you get N×N thread contention —
+# the box thrashes instead of running N clean cores, and per-archive VAD slows ~5x. Our
+# parallelism comes from running multiple PROCESSES (separate GILs), NOT intra-op threads,
+# so cap each worker at a single compute thread. Must be exported BEFORE the python workers
+# start (torch reads OMP_NUM_THREADS at import to set its default intra-op thread count).
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
+export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
+export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-1}"
+export NUMEXPR_NUM_THREADS="${NUMEXPR_NUM_THREADS:-1}"
 
 MODULE="audio_classification_playground.acoustic_events.orchestration"
 WORK_DIR="$(mktemp -d)"
