@@ -8,14 +8,19 @@
 #
 # Throughput note: VAD (Silero) is CPU-bound and serial per archive (~70s for a 90-min
 # file) but parallelizes linearly ACROSS archives, so the lever is --vad-prefetch-workers
-# (NOT pod count). 8 workers on a 13-CPU 4xlarge ≈ 250-400 arc/h/pod; 10 pods ≈ 2-3k/h
-# => the ~526k un-VAD'd backlog in ~7-11 days. Do NOT trust the dashboard Pace for VAD
+# (NOT pod count). 8 workers on a 13-CPU 4xlarge ≈ 250-400 arc/h/pod; 20 pods ≈ 5-8k/h
+# => the ~526k un-VAD'd backlog in ~3-5 days. Do NOT trust the dashboard Pace for VAD
 # (it reads total_sec ≈ 0.05s, the main-loop slice, not the prefetch-thread compute);
 # track real progress with `orchestration progress --fast` or mps_vs_fleet_throughput.py.
 #
-# Workers coordinate via per-archive locks + --completion-policy exists, so the 10 pods
+# Workers coordinate via per-archive locks + --completion-policy exists, so the 20 pods
 # never double-process, and a pod that finds everything claimed/done exits cleanly.
-# Launch:  experiment-launcher launch manifests/acoustic-events-vad-backfill.yaml
+#
+# Topology: this is ONE k8s Job running 20 identical pods (parallelism/completions in
+# the parallel template below), NOT 20 separate Jobs. Pod count lives in the template,
+# not in grid: (which stays at a single entry). Bump parallelism/completions there.
+# Launch:  experiment-launcher launch manifests/acoustic-events-vad-backfill.yaml \
+#            --template ./manifests/job-template-vad-backfill-parallel.yaml
 config:
   namespace: nlp-audio-understanding
   team: nlp
@@ -31,7 +36,7 @@ config:
     RS_OWNER: dvirbenor
   ebs:
     enabled: true
-    size: 1000Gi
+    size: 50Gi
     persistent: false
     mountPath: /workspace
   s3Access:
@@ -122,5 +127,9 @@ experiments:
           fi
         done
         echo "[$(date -Iseconds)] Finished vad-backfill run ${RUN_ID}"
+    # Pod count is set by parallelism/completions in the parallel template, NOT here.
+    # Keep this at a single entry so the launcher emits ONE Job (the template then
+    # runs N pods under it). To change pod count, edit parallelism/completions in
+    # manifests/job-template-vad-backfill-parallel.yaml.
     grid:
-      run_id: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+      run_id: [1]

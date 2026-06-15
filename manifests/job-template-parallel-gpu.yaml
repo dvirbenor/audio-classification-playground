@@ -1,0 +1,82 @@
+# GPU job template as a SINGLE multi-pod Job (sets spec.parallelism/completions).
+#
+# Same idea as job-template-vad-backfill-parallel.yaml but for the GPU inference
+# fleets: ONE Job runs N identical pods instead of the launcher's grid: fanning
+# out N single-pod Jobs. The launcher deep-copies this template and never touches
+# parallelism/completions, so they pass straight through (rs_ai_training/manifest/builder.py).
+#
+# Safe for the inference fleets because the workers are interchangeable: they claim
+# archives via per-archive file locks + --completion-policy exists, and run_id is
+# cosmetic (log filename only — no work sharding). So N pods under one Job behave
+# exactly like N single-pod Jobs.
+#
+# POD COUNT lives HERE (parallelism/completions), NOT in the manifest's grid: (keep
+# that at a single entry). Currently 1 — bump both numbers together to scale a fleet.
+#
+# Launch (example):
+#   experiment-launcher launch manifests/acoustic-events-inference-emotion.yaml \
+#     --template ./manifests/job-template-parallel-gpu.yaml
+#
+# WARNING: when a manifest holds MULTIPLE experiments, this parallelism applies to
+# ALL of them (the template is shared across the launch). Don't mix a converted
+# (grid:[1]) fleet and a still-gridded fleet in one file under this template.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: template-job
+  namespace: default
+spec:
+  parallelism: 1
+  completions: 1
+  backoffLimit: 10
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app: ml-experiment
+    spec:
+      restartPolicy: Never
+      terminationGracePeriodSeconds: 600
+      nodeSelector:
+        karpenter: ai-workers-gpu
+        node.kubernetes.io/instance-type: g5.4xlarge
+        karpenter.sh/capacity-type: on-demand
+      tolerations:
+        - key: karpenter
+          operator: Equal
+          value: ai-workers-gpu
+          effect: NoSchedule
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      initContainers: []
+      containers:
+        - name: experiment-container
+          image: python:3.11-slim
+          imagePullPolicy: IfNotPresent
+          env: []
+          volumeMounts:
+            - name: ai-efs
+              mountPath: /efs
+            - name: shm
+              mountPath: /dev/shm
+            - name: github-ssh
+              mountPath: /mnt/github-ssh
+              readOnly: true
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+              nvidia.com/gpu: "1"
+      volumes:
+        - name: ai-efs
+          persistentVolumeClaim:
+            claimName: ai-efs-pvc
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 200Gi
+        - name: github-ssh
+          secret:
+            secretName: audio-playground-github-ssh
+            defaultMode: 256

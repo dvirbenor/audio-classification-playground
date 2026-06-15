@@ -72,8 +72,10 @@ experiments:
           --vad-gating
 
         echo "[$(date -Iseconds)] Finished inference-affect run ${RUN_ID}"
+    # Pod count is set by parallelism/completions in job-template-parallel-gpu.yaml
+    # (currently 1), NOT here. Keep this at a single entry → one Job per experiment.
     grid:
-      run_id: [1, 2, 3, 4, 5, 6, 7, 8]
+      run_id: [1]
 
   - name: inference-disfluency
     category: inference
@@ -125,8 +127,10 @@ experiments:
           --vad-gating
 
         echo "[$(date -Iseconds)] Finished inference-disfluency run ${RUN_ID}"
+    # Pod count is set by parallelism/completions in job-template-parallel-gpu.yaml
+    # (currently 1), NOT here. Keep this at a single entry → one Job per experiment.
     grid:
-      run_id: [1, 2, 3, 4, 5, 6, 7, 8]
+      run_id: [1]
 
   - name: emotion-vad
     category: inference
@@ -180,5 +184,7 @@ experiments:
           --vad-gating
 
         echo "[$(date -Iseconds)] Finished emotion-vad run ${RUN_ID}"
+    # Pod count is set by parallelism/completions in job-template-parallel-gpu.yaml
+    # (currently 1), NOT here. Keep this at a single entry → one Job per experiment.
     grid:
-      run_id: [1, 2, 3, 4, 5, 6, 7, 8]
+      run_id: [1]

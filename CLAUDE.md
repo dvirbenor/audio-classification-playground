@@ -49,6 +49,23 @@ This project uses **`uv`** (not pip/poetry). A frozen `uv.lock` is committed. Th
 
 When running on a pod, `source env.shared.sh` first so all frameworks resolve weights from the shared EFS model cache (`HF_HOME`, `MODELSCOPE_CACHE`, `TORCH_HOME`).
 
+### Launching Cloud Jobs (`experiment-launcher`)
+
+The `manifests/*.yaml` specs are launched onto the k8s fleet with the Riverside `experiment-launcher` CLI (not `kubectl apply`). Usage:
+
+```
+experiment-launcher launch manifests/<spec>.yaml --template ./manifests/job-template-with-github-ssh.yaml
+```
+
+- **Almost always pass `--template ./manifests/job-template-with-github-ssh.yaml`.** The default template (`rs_ai_training:template.yaml`) does NOT mount the GitHub SSH secret, `/efs`, or `/dev/shm`. Every manifest here clones the repo over SSH (`cp /mnt/github-ssh/id_ed25519 ...` → `git clone git@github.com:...`) and reads/writes `/efs`, so without this template the pod fails instantly — the `cp` of the missing key errors out under `set -euo pipefail`. This silent-looking failure is the #1 reason a launch "doesn't work."
+- **It takes exactly ONE positional argument — the YAML config file.** There is no positional slot for an experiment name. Appending one (e.g. `... <spec>.yaml bench-mps-vs-dedicated-puregpu`) makes argparse reject the command — this is a common mistake. To select which experiment runs, edit the YAML, not the command line.
+- **`launch` runs EVERY entry in the spec's `experiments:` list.** A spec with two experiments launches two sets of pods. To run only one, comment out / delete the other experiment block, or split it into its own file.
+- **Pod count comes from the experiment's `grid:`** — one pod per combination of grid values (e.g. `run_id: [1..20]` → 20 pods). It is not a CLI flag. Note this creates 20 *separate Jobs* (one pod each).
+- **Grid-of-Jobs vs. one multi-pod Job.** The launcher's only built-in fan-out is `grid:` (N Jobs × 1 pod). But it deep-copies the `--template` and never sets `parallelism`/`completions` (see `builder.py`), so those pass through: a template with `spec.parallelism`/`spec.completions` runs N pods under a *single* Job, with `grid:` left at one entry. Prefer this when the pods are **interchangeable workers that coordinate via locks and loop-until-no-work** (e.g. the VAD backfill — see `job-template-vad-backfill-parallel.yaml`): it's one Job to track and tolerates pod death via `backoffLimit`. Use grid-of-Jobs when each pod needs a distinct identity / work shard. Don't add `parallelism` to the shared `job-template-with-github-ssh.yaml` (the GPU experiments reuse it) — make a dedicated template.
+- Useful `launch` flags: `--dry-run` (validate manifests, create nothing — always do this first for a new/edited spec), `--debug-run` (pods sleep so you can `kubectl exec` in), `--namespace`, `--image`, `--context`, `--skip-image-validation`.
+- Other subcommands: `init`, `list-templates`, `list-ebs-volumes`, `create-pvc-from-ebs`, `inspect` (AI-diagnose a Pending pod). See `experiment-launcher <cmd> --help`.
+- **Before launching GPU specs, check the `nodeSelector`** — some manifests carry a `TODO(blackwell)` hardcoded `instance-type` that must match the target cluster's node label, or pods sit Pending.
+
 ### Coding Standards & Preferences
 
 - **Python 3.10–3.13.** Code must run on 3.10 (the `.venv` interpreter is 3.10); avoid syntax newer than that.

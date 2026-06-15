@@ -75,8 +75,10 @@ experiments:
           --max-cache-bytes "$CACHE_BYTES"
 
         echo "[$(date -Iseconds)] Finished inference-affect-cache run ${RUN_ID}"
+    # GPU pod count set by parallelism/completions in job-template-parallel-gpu.yaml
+    # (currently 1), NOT here. Keep at a single entry → one Job.
     grid:
-      run_id: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+      run_id: [1]
 
   - name: inference-disfluency-cache
     category: inference
@@ -135,8 +137,10 @@ experiments:
           --max-cache-bytes "$CACHE_BYTES"
 
         echo "[$(date -Iseconds)] Finished inference-disfluency-cache run ${RUN_ID}"
+    # GPU pod count set by parallelism/completions in job-template-parallel-gpu.yaml
+    # (currently 1), NOT here. Keep at a single entry → one Job.
     grid:
-      run_id: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+      run_id: [1]
 
   - name: inference-emotion-cache
     category: inference
@@ -200,8 +204,10 @@ experiments:
           --max-cache-bytes "$CACHE_BYTES"
 
         echo "[$(date -Iseconds)] Finished inference-emotion-cache run ${RUN_ID}"
+    # GPU pod count set by parallelism/completions in job-template-parallel-gpu.yaml
+    # (currently 1), NOT here. Keep at a single entry → one Job.
     grid:
-      run_id: [1, 2, 3, 4, 5, 6, 7, 8]
+      run_id: [1]
 
   - name: inference-vad-cpu-cache
     category: inference
@@ -270,5 +276,10 @@ experiments:
           --max-cache-bytes "$CACHE_BYTES"
 
         echo "[$(date -Iseconds)] Finished inference-vad-cpu-cache run ${RUN_ID}"
+    # CPU experiment — left as grid-of-Jobs (8 pods). NOTE: this file mixes a
+    # gridded CPU fleet with grid:[1] GPU fleets above. The GPU parallel template's
+    # parallelism applies to EVERY experiment in the launch, so at parallelism=1 this
+    # gives 8 jobs × 1 pod = 8 pods (fine), but bumping the template's parallelism to
+    # scale the GPU fleets would also multiply this one. To scale, split the file.
     grid:
       run_id: [1, 2, 3, 4, 5, 6, 7, 8]
