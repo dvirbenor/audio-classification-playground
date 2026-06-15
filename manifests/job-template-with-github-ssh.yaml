@@ -15,7 +15,7 @@ spec:
       terminationGracePeriodSeconds: 600
       nodeSelector:
         karpenter: ai-workers-gpu
-        node.kubernetes.io/instance-type: g5.4xlarge
+        node.kubernetes.io/instance-type: g7e.2xlarge
         karpenter.sh/capacity-type: on-demand
       tolerations:
         - key: karpenter

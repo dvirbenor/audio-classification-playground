@@ -46,7 +46,7 @@ experiments:
   - name: inference-affect-cache-vadgated
     category: inference
     description: Run VAD-gated affect acoustic-event inference on g7e.2xlarge with shared decoded-audio cache
-    image: 690765672468.dkr.ecr.us-east-1.amazonaws.com/ml-dev-containers:gpu-1.0.22
+    image: 690765672468.dkr.ecr.us-east-1.amazonaws.com/ml-dev-containers:cpu-1.0.5
     nodeSelector:
       node.kubernetes.io/instance-type: g7e.2xlarge
     resources:
