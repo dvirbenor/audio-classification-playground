@@ -16,9 +16,10 @@
 #   2. Keep decode cheap. Decode runs in a separate GIL-releasing thread (~12s vs VAD ~70s),
 #      so PREFETCH_WORKERS=1 + a small lookahead is plenty; a big lookahead pins a 2nd core
 #      per proc AND holds several ~250MB decoded archives resident => OOM at the 24Gi limit.
-# With VAD_PROCS=8 (one VAD core each) expect ~300-400 arc/h/pod; 20 pods ≈ ~6-8k/h. VALIDATE
-# one pod before scaling. Do NOT trust the dashboard Pace for VAD; track real progress with
-# `orchestration progress --fast` or mps_vs_fleet_throughput.py.
+# With VAD_PROCS=8 (one VAD core each) a single validation pod measured ~660 arc/h (8 hot
+# threads, ~19GB RSS — well under the 24Gi limit); 20 pods ≈ ~13k/h => the ~526k backlog in
+# ~1.5-2 days. Rate varies with archive length (longer recordings → fewer/h). Do NOT trust
+# the dashboard Pace for VAD; track real progress with `orchestration progress --fast`.
 #
 # Workers coordinate via per-archive locks + --completion-policy exists, so the 20 pods
 # never double-process, and a pod that finds everything claimed/done exits cleanly.

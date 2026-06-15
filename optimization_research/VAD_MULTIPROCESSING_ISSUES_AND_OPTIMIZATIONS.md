@@ -1,8 +1,11 @@
 # VAD Multiprocessing: Issues & Optimizations
 
-How the CPU VAD fleet went from ~53 to ~343 archives/h **per pod** (~6.5×), why the
+How the CPU VAD fleet went from ~53 to ~660 archives/h **per pod** (~12×), why the
 naive knobs didn't work, and the supporting fixes (real-throughput status, gating
-enforcement). Investigated 2026-06-15.
+enforcement). Investigated 2026-06-15. Two stages: (1) one process per physical core
+(~53→~343/h), then (2) pinning per-process math threads + leaner decode, which fixed a
+20-pod OOM/oversubscription failure and roughly doubled per-pod rate again (~343→~660/h)
+— see [Scale-up to 20 pods](#scale-up-to-20-pods-oversubscription--oom-and-the-real-per-process-fix-2026-06-15).
 
 ---
 
@@ -62,8 +65,12 @@ SMT x86 instances (c6a/c7a/c6i/c7i 4xlarge = 16 vCPU = 8 physical cores) that is
 cgroup CPU quota, so `VAD_PROCS` is pinned in the manifest rather than auto-detected.
 
 Per-process config: `--vad-prefetch-workers 1` (more only GIL-contends within a proc),
-`--prefetch-workers 2` (decode releases the GIL, so a little decode concurrency per proc
-overlaps download/decode with VAD).
+`--prefetch-workers 1` + `--prefetch-lookahead 2` (decode releases the GIL; one bursty
+decode thread overlaps download/decode with VAD without pinning a second core or holding
+OOM-causing buffers). **Plus each worker is pinned to one math thread** (`OMP/MKL/
+OPENBLAS/NUMEXPR=1`) — see the scale-up section below for why this is mandatory, not
+optional. *(The earlier `--prefetch-workers 2` / no-pinning config OOM'd and oversubscribed
+at 20 pods.)*
 
 Deployed in `manifests/acoustic-events-vad-backfill.yaml` (loops the launcher until a
 pass processes zero archives, retrying on a non-clean pass).
@@ -77,6 +84,66 @@ pass processes zero archives, retrying on a non-clean pass).
   Getting 6.5× proves the cores were the constraint (GIL) and the fix addressed it.
 - Verify the launcher engaged: **8 timing files per pod hostname** (8 UUIDs) /
   `[vad-multiproc] launching 8` in the job log / 8 `python` PIDs in htop.
+
+## Scale-up to 20 pods: oversubscription + OOM, and the real per-process fix (2026-06-15)
+
+The single-pod multiproc result above (~343/h) did **not** survive scaling to a 20-pod
+Job. The launch **failed**: Job condition `Failed` / `BackoffLimitExceeded`
+(`completions=20`, `succeeded=0`, **`failed=29`**, `backoffLimit=10`), and Kubernetes
+terminated every still-running pod once failures passed the limit ("pods terminating
+despite still running"). Per-pod throughput had also collapsed to **~70–110 arc/h** — a
+~5× regression vs the single-pod number.
+
+**Diagnosis (htop on a live pod):** `VAD_PROCS=8`, but **~16 CPU-hot threads on 8
+physical cores**, load avg ~9.4. The "extra" rows paired with the 8 workers by
+*byte-identical* RSS (e.g. 2317M↔2317M, 3232M↔3232M) — two real processes would have
+COW-diverged after an hour, so these were **threads of the 8 procs**, not extra procs.
+
+**Two root causes the original multiproc fix missed** ("separate GILs → separate cores"
+was necessary but *not sufficient*):
+
+1. **No math-thread pinning.** Silero VAD is Silero-via-`torch.hub`
+   ([runners.py](../audio_classification_playground/acoustic_events/inference/runners.py));
+   torch (and OpenMP/MKL/OpenBLAS) default their intra-op pools to **all cores**, and
+   those C++ ops run *outside* the GIL. So each of the 8 worker processes fanned threads
+   across all 8 physical cores → **N×N contention**, thrashing instead of 8 clean cores.
+   The GIL argument explains why *Python-thread* VAD workers don't scale; it does not stop
+   torch from over-threading each process.
+2. **Over-aggressive decode prefetch.** `PREFETCH_WORKERS=2 × PREFETCH_LOOKAHEAD=4` kept a
+   second GIL-releasing **decode** core busy per process *and* held several ~250 MB decoded
+   archives resident. Across 8 procs that pushed peak RSS **past the 24 Gi pod limit →
+   OOMKill → non-zero exit → `backoffLimit` → whole Job Failed.** So the throughput
+   regression and the terminations were the *same* root cause (too many threads + too much
+   resident memory per pod).
+
+**Fixes:**
+
+- **Pin each worker to one compute thread** — `scripts/run_vad_multiproc.sh` now exports
+  `OMP_NUM_THREADS=MKL_NUM_THREADS=OPENBLAS_NUM_THREADS=NUMEXPR_NUM_THREADS=1` *before* the
+  python workers start (torch reads `OMP_NUM_THREADS` at import to set its default intra-op
+  count). Now 8 procs = 8 single-threaded VAD cores.
+- **Leaner decode** — manifest `PREFETCH_WORKERS 2→1`, `PREFETCH_LOOKAHEAD 4→2`. Decode
+  (~12 s) is far cheaper than VAD (~70 s), so one bursty decode thread per proc keeps
+  archives ready without pinning a second core or holding OOM-causing buffers.
+
+**Single-pod validation (real `c*.4xlarge`, 16 vCPU / 8 physical, 24 Gi limit):**
+
+| Metric | Broken 20-pod run | After fix |
+|---|---|---|
+| CPU-hot threads (>20%) | ~16 on 8 cores (thrash) | **8** (one VAD/core) |
+| Total RSS | > 24 Gi → **OOMKilled** | **18.9 GB** (~5.5 GB headroom) |
+| Thread pin | none (torch fanned out) | `OMP/MKL/OPENBLAS=1` confirmed in `/proc/<pid>/environ` |
+| Throughput | ~80 arc/h/pod | **~660 arc/h/pod** (22 archives / 120 s steady-state) |
+
+So the corrected config roughly **doubled** per-pod throughput vs the pre-pinning ~343/h
+*and* fixed the scale-up OOM. **~660/h × 20 pods ≈ ~13k/h → the ~526k backlog in ~1.5–2
+days** (rate drops on longer recordings later in the corpus). This supersedes the ~343/h
+TL;DR figure, which was measured before thread-pinning + the leaner decode.
+
+> **Lesson:** when sizing CPU-bound multi-process work, count *all* threads each process can
+> spawn (torch/BLAS intra-op pools), not just the obvious worker thread — and pin them. And
+> validate memory at the per-pod cgroup limit before scaling, since one OOM per pod ×
+> `backoffLimit` fails the entire Job.
 
 ## Supporting fixes
 
