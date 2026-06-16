@@ -23,18 +23,18 @@ the gap is explained in [Compound gains](#compound-gains). Per task, the heavy W
 Every GPU lever is **event-safe** — validated by an event-level A/B that requires *zero* events
 added, dropped, or relabelled. No accuracy was traded for speed.
 
-![GPU compound speed-up](report_assets/gpu_compound_speedup.png)
+<img src="report_assets/gpu_compound_speedup.png" alt="GPU compound speed-up" width="720">
 
 Per task (dedicated-GPU-equivalent), the WavLM models compound to **~14×** and emotion to **~9×** — which
 blend to the **~11×** `+GB202` bar in the first chart (job-weighted across all three tasks). MPS then packs
 all three onto one GPU for the **~17×** per-GPU throughput above:
 
-![Per-task compound](report_assets/per_task_compound.png)
+<img src="report_assets/per_task_compound.png" alt="Per-task compound" width="720">
 
 On the CPU side, the VAD backfill went **~12.5× per pod** (53 → 660 archives/h) — the lever that unlocked
 gating coverage for the GPU fleet:
 
-![VAD multiprocessing ramp](report_assets/vad_multiproc_ramp.png)
+<img src="report_assets/vad_multiproc_ramp.png" alt="VAD multiprocessing ramp" width="720">
 
 ---
 
@@ -113,7 +113,7 @@ dropped "~21×".)
 GB202 costs 2.07× the A10G per hour but does 3.6× the work, so it's **1.73× cheaper per unit of work** —
 the clearest single cost lever we have.
 
-![Hardware price/performance](report_assets/gpu_hardware_priceperf.png)
+<img src="report_assets/gpu_hardware_priceperf.png" alt="Hardware price/performance" width="720">
 
 **Full-corpus estimate (≈590k archives, all 3 tasks).** Order-of-magnitude — the GPU-hour base comes from
 5 sampled archive durations, so treat the *ratios* as firm and the absolute dollars as indicative:
@@ -161,7 +161,7 @@ vs the old fleet's **~56/GPU/h** (steady-state, CURRENT ≈ lifetime). Per task 
 The 23× was also composed from peak (WavLM-favorable) single-archive multipliers, so it was always the
 ceiling, not the expectation. Per-lever contributions:
 
-![Per-task levers](report_assets/per_task_levers.png)
+<img src="report_assets/per_task_levers.png" alt="Per-task levers" width="720">
 
 > Quote the **measured ~17× per GPU** (steady-state). ~23× is the clean-benchmark ceiling; the gap is the
 > emotion mix + ragged-batch occupancy + orchestration overhead. The earlier "~21×" multiplied a
