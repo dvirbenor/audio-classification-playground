@@ -1,5 +1,11 @@
 # MPS Co-Location — Sustained-Load Benchmark Findings & Optimization
 
+> **Result (2026-06-15):** sustained load exposed emotion2vec being SM-starved by the
+> batch-512 WavLM clients (MPS gated only 1.32×, emotion inflated 3.9×). Fix = cap the
+> WavLM clients' MPS SM share (40% each, emotion uncapped) + WavLM batch 512→256. **Validated:
+> MPS gated 1.32×→1.49×, emotion inflation 3.9×→1.87× (tail gone), no cost to affect/disfluency.**
+> Details in §6. This is the keeper config for the single-GPU production path.
+
 Controlled A/B of **MPS-colocated vs dedicated** GPU inference on **one** Blackwell
 RTX PRO 6000 (96 GB), under sustained load. This is the follow-up to the optimistic
 3-archive warm validation in [MPS_COLOCATION_TESTING.md](../MPS_COLOCATION_TESTING.md),
@@ -130,6 +136,43 @@ Goal/target: emotion sum (~628 s) currently ≈ the MPS wall (658 s). If we cut 
 inflation from 3.9× toward ~2×, emotion sum drops to ~320 s — below affect's 552 s sum —
 so **affect becomes the wall** and MPS gated could fall from 658 s toward ~560–580 s,
 lifting the speedup from 1.32× toward ~1.5×. That is the prize and the A/B success metric.
+
+### ✅ VALIDATED (2026-06-15, A+B run: 40% caps on affect/disfluency + WavLM batch 256, 20 archives)
+
+Applied lever A (`AFFECT_THREAD_PCT=40 DISFLUENCY_THREAD_PCT=40`, emotion uncapped) **and**
+lever B (`WAVLM_STATIC_BATCH_SIZE=256`) together. The prediction held almost exactly.
+
+| metric | baseline (no caps, b512, 40 arc) | **A+B (40/40 caps, b256, 20 arc)** |
+|---|---|---|
+| MPS speedup, **gated** | 1.32× | **1.49×** |
+| MPS speedup, ungated | 1.10× | 1.09× (unchanged) |
+| MPS VAD-gating speedup | 1.81× | 1.93× |
+
+Per-archive `inference_sec`, MPS **gated** arm, with the dedicated (contention-free) reference
+on the same archives (N changed 40→20, so compare **inflation**, not raw walls):
+
+| task | baseline mean (max) | **A+B mean (max)** | inflation: was → now |
+|---|---|---|---|
+| affect | 13.8 | 13.8 (37.2) | 1.8× → 2.17× |
+| disfluency | 13.4 | 12.3 (29.2) | 2.0× → 2.25× |
+| **emotion** | **15.7 (75.7)** | **6.8 (14.9)** | **3.9× → 1.87×** |
+
+- **Emotion de-starved:** mean halved (15.7→6.8 s) and the long-archive tail collapsed
+  (max 75.7→14.9 s). e2e agrees (emotion gated mean 7.3 s) — holds under the live pipeline.
+- **Wall now affect-bound, as predicted:** emotion sum ≈136 s (6.8×20) is no longer the
+  bottleneck; affect (13.8×20 ≈ 276 s) ≈ the 290 s MPS gated wall.
+- **Capping cost ≈ nil:** affect's absolute MPS time is unchanged (13.8 s) and disfluency
+  improved (13.4→12.3 s) — the caps bound the WavLM SM footprint without slowing tasks that
+  were already contended. (The rising inflation *ratio* is the dedicated baseline getting
+  faster at b256 + a shorter-archive mix, not MPS regressing.)
+- **No throttling:** under MPS load clocks held 2330–2337 / 2430 MHz, ≤73 °C, ≤606 W.
+- **Ungated unchanged (1.09×):** on the full timeline each WavLM task already saturates the
+  SMs, so caps just time-slice — emotion ungated still improved (29.1→13.7 s) but isn't the wall.
+
+**Decision:** batch 256 + 40/40 caps (emotion uncapped) is the keeper for the single-GPU
+production path. The fallback (dedicated GPU for emotion) is no longer needed. Next tuning
+lever, if chasing >1.49×: emotion now has slack, so **loosen the caps to 45–50%** to let
+affect (the new wall) run faster.
 
 ### Recommended (keep everything on one GPU) — try in this order
 
