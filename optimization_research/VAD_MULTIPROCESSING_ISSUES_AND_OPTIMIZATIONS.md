@@ -239,7 +239,12 @@ Track realization via the **VAD-gating coverage** section of
 ## How to monitor
 
 ```bash
-# real per-worker VAD rate (ignore the noisy Pace for fresh workers)
+# SIMPLE post-hoc VAD rate from stored _meta/timings ts — instant, no sampling, no MPS
+# clutter. CURRENT (last bin) + per-pod + over-time curve. THE go-to for "what's the rate".
+uv run python scripts/throughput_history.py --task vad --last 3h --bin 30m
+#   -> CURRENT: ~2,012 arc/h ; per pod ~660/h (3 pods). --last scopes out long-dead workers.
+
+# MPS-vs-fleet GPU comparison (VAD only in the "Other" line — shaped for the GPU question)
 uv run python scripts/mps_vs_fleet_throughput.py --window 10m     # Other (CPU/VAD) section
 
 # clean dashboard (live workers only) + correct fleet pace
