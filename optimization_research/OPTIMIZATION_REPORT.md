@@ -124,11 +124,14 @@ the clearest single cost lever we have.
 | A10G · **+ FP16 + VAD gating** (software only) | ~11,000 | ~$18,000 |
 | **GB202 · + FP16 + gating + MPS** *(today, measured ~17×/GPU)* | ~2,200 | **~$7,300** |
 
-→ **~8× cheaper** to process the corpus end-to-end (tracks the measured ~17× per-GPU throughput). The
-software levers cut it ~3× on any GPU; GB202 (1.73× price/perf) + MPS packing take it the rest of the way.
+→ **~8× cheaper, not 17×** — and the gap is just the hardware price premium. The **17× is throughput per
+GPU**, but a GB202 costs **2.07× more per hour** than an A10G, so cost falls by **17 ÷ 2.07 ≈ 8×**.
+Decomposed: software (FP16 + gating, ~3×, free) × MPS packing (~1.5×) × GB202 *price/performance* (1.73×).
+A full 17× cost cut would require the GB202 to be free per hour.
 
-**VAD (CPU):** ~12.5× fewer pod-hours for the same coverage; the backlog that was a ~2-month job at the old
-rate now clears in days and scales linearly with pod count.
+**VAD (CPU): negligible cost.** CPU pods are far cheaper than GPUs and the backfill is a one-time job, so
+VAD's own spend is a rounding error next to the GPU bill. Its value is that it **unlocks the gating** that
+cuts the GPU cost above — the ~12.5×/pod speed-up just cleared the ~474k backlog from ~2 months to days.
 
 ---
 
@@ -159,9 +162,7 @@ vs the old fleet's **~56/GPU/h** (steady-state, CURRENT ≈ lifetime). Per task 
    stat-walk the manifest to find gated work — a small tax, though backfill outpaces GPU so they're not idle.
 
 The 23× was also composed from peak (WavLM-favorable) single-archive multipliers, so it was always the
-ceiling, not the expectation. Per-lever contributions:
-
-<img src="report_assets/per_task_levers.png" alt="Per-task levers" width="720">
+ceiling, not the expectation.
 
 > Quote the **measured ~17× per GPU** (steady-state). ~23× is the clean-benchmark ceiling; the gap is the
 > emotion mix + ragged-batch occupancy + orchestration overhead. The earlier "~21×" multiplied a

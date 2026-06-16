@@ -109,37 +109,8 @@ fig.text(0.5, -0.12, "Silero VAD is GIL-bound -> 1 process per core (not threads
 fig.savefig(f"{OUT}/vad_multiproc_ramp.png")
 plt.close(fig)
 
-# ---------------------------------------------------------------------------
-# Plot 4 — Per-task speed-up by lever (granularity, every per-task step)
-# ---------------------------------------------------------------------------
-tasks = ["affect\n(WavLM)", "disfluency\n(WavLM)", "emotion\n(e2v)"]
-levers = [
-    ("Compile",      [1.17, 1.18, 0.97], GREY),
-    ("FP16",         [1.85, 1.88, 1.40], BLUE),
-    ("VAD gating",   [2.2,  2.3,  2.1],  GREEN),
-    ("GB202 (hw)",   [3.6,  3.6,  3.6],  ORANGE),
-]
-x = range(len(tasks))
-n = len(levers)
-w = 0.20
-fig, ax = plt.subplots(figsize=(11, 5.4))
-for k, (name, vals_, col) in enumerate(levers):
-    off = (k - (n - 1) / 2) * w
-    bars = ax.bar([i + off for i in x], vals_, w, label=name, color=col,
-                  edgecolor="white", linewidth=1.0)
-    annot(ax, bars, dy=0.03)
-ax.set_xticks(list(x))
-ax.set_xticklabels(tasks)
-ax.set_ylabel("speed-up  (x)")
-ax.set_title("Per-task speed-up by lever — each measured independently")
-ax.set_ylim(0, 4.3)
-ax.legend(loc="upper left", ncol=4, fontsize=11)
-ax.axhline(1.0, color="#475569", lw=1, ls="--", alpha=0.6)
-fig.text(0.01, -0.02, "Compile helps WavLM only (emotion ~1.0x); FP16 helps all 3; gating scales with "
-         "silence (mean 2.34x); GB202 is a uniform ~3.6x. MPS co-location (x1.49) is a per-GPU packing "
-         "win, not per-task. All steps event-safe.", fontsize=9, color="#64748b")
-fig.savefig(f"{OUT}/per_task_levers.png")
-plt.close(fig)
+# (Plot 4 — per-task speed-up by lever — removed: redundant with the per-task
+#  compound plot + the "At a glance" table.)
 
 # ---------------------------------------------------------------------------
 # Plot 5 — Per-task COMPOUND (cumulative across levers, measured endpoints)
@@ -174,4 +145,4 @@ fig.text(0.5, -0.05, "Steps 1-3 = validated benchmark multipliers; +GB202 anchor
 fig.savefig(f"{OUT}/per_task_compound.png")
 plt.close(fig)
 
-print("wrote 5 plots to", OUT)
+print("wrote 4 plots to", OUT)
