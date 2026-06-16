@@ -53,6 +53,7 @@ def collect(output_base: Path, tasks: set[str] | None):
     if not timings_dir.is_dir():
         sys.exit(f"No timings dir at {timings_dir}")
     by_host: dict[str, list[float]] = {}
+    by_task: dict[str, list[float]] = {}
     n_records = n_bad = n_filtered = 0
     for p in sorted(timings_dir.iterdir()):
         if not p.name.endswith(".jsonl"):
@@ -70,7 +71,8 @@ def collect(output_base: Path, tasks: set[str] | None):
                     except json.JSONDecodeError:
                         n_bad += 1
                         continue
-                    if tasks is not None and str(rec.get("task_group", "")) not in tasks:
+                    tg = str(rec.get("task_group", "") or "?")
+                    if tasks is not None and tg not in tasks:
                         n_filtered += 1
                         continue
                     epoch = _parse_ts(rec.get("ts"))
@@ -78,11 +80,14 @@ def collect(output_base: Path, tasks: set[str] | None):
                         n_bad += 1
                         continue
                     by_host.setdefault(host, []).append(epoch)
+                    by_task.setdefault(tg, []).append(epoch)
         except OSError:
             continue
     for ts in by_host.values():
         ts.sort()
-    return by_host, n_records, n_bad, n_filtered
+    for ts in by_task.values():
+        ts.sort()
+    return by_host, by_task, n_records, n_bad, n_filtered
 
 
 def _rate(n: int, span: float) -> float:
@@ -105,7 +110,7 @@ def main() -> None:
     args = ap.parse_args()
 
     tasks = {t.strip() for t in args.task.split(",")} if args.task else None
-    by_host, n_records, n_bad, n_filtered = collect(Path(args.output), tasks)
+    by_host, by_task, n_records, n_bad, n_filtered = collect(Path(args.output), tasks)
     if not by_host:
         sys.exit("No timestamped completions found (after filter).")
 
@@ -117,6 +122,8 @@ def main() -> None:
         all_ts = [t for t in all_ts if t >= t_min]
         by_host = {h: [t for t in ts if t >= t_min] for h, ts in by_host.items()}
         by_host = {h: ts for h, ts in by_host.items() if ts}
+        by_task = {k: [t for t in ts if t >= t_min] for k, ts in by_task.items()}
+        by_task = {k: ts for k, ts in by_task.items() if ts}
 
     span = t_max - t_min
     bin_w = _parse_duration(args.bin)
@@ -134,6 +141,13 @@ def main() -> None:
     print(f"  CURRENT:   {_rate(recent_n, bin_w):,.0f} arc/h   (last {args.bin}, {recent_n:,} completions)")
     print(f"  lifetime:  {_rate(len(all_ts), span):,.0f} arc/h   (whole window — diluted by "
           f"dead workers if it spans days; use --last to scope)")
+
+    print(f"\n  per task ({len(by_task)}):   [CURRENT = last {args.bin}]")
+    print(f"    {'task':<14} {'completions':>12} {'CURRENT':>11} {'lifetime':>11}")
+    for tg in sorted(by_task, key=lambda k: -len(by_task[k])):
+        ts = by_task[tg]
+        recent = len(ts) - bisect.bisect_left(ts, t_max - bin_w)
+        print(f"    {tg:<14} {len(ts):>12,} {_rate(recent, bin_w):>8,.0f}/h {_rate(len(ts), ts[-1] - ts[0]):>8,.0f}/h")
 
     print(f"\n  per pod ({len(by_host)}):")
     for host in sorted(by_host, key=lambda h: -len(by_host[h])):
