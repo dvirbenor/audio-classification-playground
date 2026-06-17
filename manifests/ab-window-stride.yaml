@@ -1,0 +1,121 @@
+# A/B test: affect + disfluency window sizes and hop strides.
+#
+# Three pods run in parallel (one per archive). Each pod downloads one random
+# archive (seeded by run_id so they're distinct), runs the baseline
+# (affect 3.5s/0.25s, disfluency 3.0s/0.25s) plus five variants (narrow,
+# wide, coarse, hop_1s, narrow_fast), and writes its JSON report to EFS.
+#
+# Results land at:
+#   /efs/arno/experiments/ab-window-stride/results_run_{1,2,3}.json
+#   /efs/arno/experiments/ab-window-stride/run_{1,2,3}.log
+#
+# Launch:
+#   experiment-launcher launch manifests/ab-window-stride.yaml \
+#       --template ./manifests/job-template-with-github-ssh.yaml
+config:
+  namespace: nlp-audio-understanding
+  team: nlp
+  project: audio-understanding
+  image: 690765672468.dkr.ecr.us-east-1.amazonaws.com/ml-dev-containers:gpu-1.0.22
+  capacityType: on-demand
+  env:
+    CLEARML_WEB_HOST: http://clearml-webserver.clearml:8080
+    CLEARML_API_HOST: http://clearml-apiserver.clearml:8008
+    CLEARML_FILES_HOST: https://clearml-fileserver.ai-dev.riverside.fm
+    RS_OWNER: dvirbenor
+  ebs:
+    enabled: false
+  s3Access:
+    enabled: true
+
+experiments:
+  - name: ab-window-stride
+    category: research
+    description: A/B window/stride experiment for affect and disfluency on 3 archives
+    nodeSelector:
+      node.kubernetes.io/instance-type: g7e.2xlarge
+    resources:
+      requests:
+        cpu: "7"
+        memory: "48Gi"
+        nvidia.com/gpu: "1"
+      limits:
+        cpu: "8"
+        memory: "52Gi"
+        nvidia.com/gpu: "1"
+    tolerations:
+      - key: karpenter
+        operator: Equal
+        value: ai-workers-gpu
+        effect: NoSchedule
+      - key: nvidia.com/gpu
+        operator: Exists
+        effect: NoSchedule
+    cmd: /bin/bash
+    args:
+      - -lc
+      - |
+        set -euo pipefail
+
+        export PYTHONUNBUFFERED=1
+        export UV_LINK_MODE=copy
+        mkdir -p /tmp/workspace
+        export TMPDIR=/tmp/workspace/tmp
+        mkdir -p "$TMPDIR"
+
+        RUN_ID="{run_id}"
+        OUT_DIR="/efs/arno/experiments/ab-window-stride"
+        mkdir -p "$OUT_DIR"
+        LOG_FILE="$OUT_DIR/run_${RUN_ID}.log"
+        exec > >(tee -a "$LOG_FILE") 2>&1
+
+        echo "[$(date -Iseconds)] Starting ab-window-stride run ${RUN_ID} on ${HOSTNAME:-unknown}"
+        cd /tmp/workspace
+
+        mkdir -p /tmp/workspace/.ssh
+        cp /mnt/github-ssh/id_ed25519 /tmp/workspace/.ssh/id_ed25519
+        cp /mnt/github-ssh/known_hosts /tmp/workspace/.ssh/known_hosts
+        chmod 700 /tmp/workspace/.ssh
+        chmod 400 /tmp/workspace/.ssh/id_ed25519
+        chmod 444 /tmp/workspace/.ssh/known_hosts
+        export GIT_SSH_COMMAND="ssh -i /tmp/workspace/.ssh/id_ed25519 -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=/tmp/workspace/.ssh/known_hosts"
+
+        rm -rf audio-classification-playground
+        git clone --branch feature/inference-optimization --single-branch git@github.com:dvirbenor/audio-classification-playground.git
+        cd audio-classification-playground
+        echo "Git commit: $(git rev-parse HEAD)"
+        uv sync --frozen
+        source .venv/bin/activate
+
+        source env.shared.sh
+
+        PARQUET="/efs/dvir/data/magic-clips-research/dataset-reference/all_archives.parquet"
+        AUDIO_DIR="/tmp/workspace/ab_audio"
+
+        echo "[$(date -Iseconds)] Downloading 1 archive from S3 (seed=${RUN_ID})..."
+        python scripts/retrieve_benchmark_audio.py \
+          --parquet "$PARQUET" \
+          --n 1 \
+          --out-dir "$AUDIO_DIR" \
+          --seed "${RUN_ID}"
+
+        AUDIO_FILES=$(python -c "
+        import json, sys
+        entries = json.load(open('$AUDIO_DIR/index.json'))
+        if not entries:
+            print('ERROR: no audio downloaded', file=sys.stderr)
+            sys.exit(1)
+        print(' '.join(e['local_path'] for e in entries))
+        ")
+
+        echo "[$(date -Iseconds)] Running window/stride A/B on: $AUDIO_FILES"
+        python scripts/ab_window_stride.py \
+          --audio $AUDIO_FILES \
+          --device cuda \
+          --batch-size 128 \
+          --max-seconds 600 \
+          --json-out "$OUT_DIR/results_run_${RUN_ID}.json"
+
+        echo "[$(date -Iseconds)] Done. Results at $OUT_DIR/results_run_${RUN_ID}.json"
+    grid:
+      run_id: [1, 2, 3]

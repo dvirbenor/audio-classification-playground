@@ -149,8 +149,9 @@ experiments:
         bash scripts/run_mps_colocated.sh
 
         echo "[$(date -Iseconds)] Finished inference-gpu-mps-colocated run ${RUN_ID}"
+    # One pod (= one Blackwell GPU) per run_id; task-fleet lock namespaces coordinate them.
     grid:
-      run_id: [1]
+      run_id: [1, 2, 3, 4, 5]
 
 #  # vad PRODUCES the intervals the GPU tasks gate on; it is never gated, and it must
 #  # LEAD the GPU pod. Identical to the CPU VAD fleet in the base manifest.

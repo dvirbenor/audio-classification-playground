@@ -25,7 +25,7 @@ def detect_prominence(
         value_for_signal(config.min_duration_sec, signal_name), hop_sec
     )
     merge_gap_frames = max(
-        0, int(round(value_for_signal(config.merge_gap_sec, signal_name) / hop_sec))
+        0, math.ceil(value_for_signal(config.merge_gap_sec, signal_name) / hop_sec)
     )
 
     events: list[dict] = []
