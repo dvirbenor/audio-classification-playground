@@ -148,6 +148,7 @@ def diff_events(base: list, cand: list, *, boundary_tol: float) -> dict:
     cand_s = sorted(cand, key=lambda e: e.start_sec)
     used = [False] * len(cand_s)
     matches = []
+    unmatched_base = []
     for b in base_s:
         best_j, best_iou = -1, 0.0
         for j, c in enumerate(cand_s):
@@ -159,6 +160,8 @@ def diff_events(base: list, cand: list, *, boundary_tol: float) -> dict:
         if best_j >= 0:
             used[best_j] = True
             matches.append((b, cand_s[best_j]))
+        else:
+            unmatched_base.append(b)
 
     n_base, n_cand, n_match = len(base_s), len(cand_s), len(matches)
     dstart = [abs(b.start_sec - c.start_sec) for b, c in matches]
@@ -177,6 +180,32 @@ def diff_events(base: list, cand: list, *, boundary_tol: float) -> dict:
             "p99": float(np.quantile(xs, 0.99)),
             "max": float(np.max(xs)),
         }
+
+    # Score-stratified recall and boundary drift.
+    # Tiers are defined by percentiles of the baseline score distribution so
+    # the split is meaningful regardless of score_name (z-score vs probability).
+    score_tiers = {}
+    if base_s:
+        base_scores = np.array([e.score for e in base_s], dtype=np.float64)
+        p25, p75 = float(np.quantile(base_scores, 0.25)), float(np.quantile(base_scores, 0.75))
+        matched_set = {id(b): (b, c, ds, de) for (b, c), ds, de in zip(matches, dstart, dend)}
+        for tier_name, tier_base in [
+            ("high", [e for e in base_s if e.score >= p75]),
+            ("mid",  [e for e in base_s if p25 <= e.score < p75]),
+            ("low",  [e for e in base_s if e.score < p25]),
+        ]:
+
+            tier_matched = [matched_set[id(b)] for b in tier_base if id(b) in matched_set]
+            tier_dstart = [ds for _, _, ds, _ in tier_matched]
+            tier_dend = [de for _, _, _, de in tier_matched]
+            score_tiers[tier_name] = {
+                "score_threshold": round(p75 if tier_name == "high" else p25, 4),
+                "n_base": len(tier_base),
+                "n_matched": len(tier_matched),
+                "recall": round(len(tier_matched) / max(len(tier_base), 1), 3),
+                "boundary_drift_start_sec": _stat(tier_dstart),
+                "boundary_drift_end_sec": _stat(tier_dend),
+            }
 
     by_type_base: dict[str, int] = {}
     by_type_cand: dict[str, int] = {}
@@ -198,6 +227,7 @@ def diff_events(base: list, cand: list, *, boundary_tol: float) -> dict:
         "exact_match_frac": round(float(np.mean(exact)) if exact else 1.0, 3),
         "boundary_drift_start_sec": _stat(dstart),
         "boundary_drift_end_sec": _stat(dend),
+        "score_tiers": score_tiers,
         "count_by_type_base": by_type_base,
         "count_by_type_cand": by_type_cand,
     }

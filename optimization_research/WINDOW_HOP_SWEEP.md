@@ -5,6 +5,57 @@
 **Script:** `scripts/ab_window_stride.py`
 **Manifest:** `manifests/ab-window-stride.yaml`
 
+## Metrics glossary
+
+### How events are matched
+
+There is no external ground truth. The baseline config is the reference. For each
+variant, candidate events are matched to baseline events using **greedy IoU** (Intersection
+over Union of time intervals), restricted to the same `event_type`. The best-overlapping
+candidate is consumed; unmatched baseline events are "dropped", unmatched candidate events
+are "added".
+
+### Column definitions
+
+**Recall / Precision — event coverage, not timestamp accuracy**
+
+These are not about how precisely a timestamp is reproduced. They answer:
+- **Recall** (`matched / n_base`): of all events the baseline found, what fraction did the
+  variant also find? A recall of 0.835 means the variant missed 1 in 6 baseline events
+  entirely — a reviewer using this config would never see those moments.
+- **Precision** (`matched / n_cand`): of all events the variant emitted, what fraction
+  correspond to a real baseline event? Low precision means the variant adds events that
+  baseline didn't produce — reviewer noise or genuine new detections depending on context.
+
+**Label ag.** — among matched pairs, fraction where both configs assigned the same label
+(e.g. `high_arousal`, `low_valence`, `hesitation`). A matched event with a different label
+is found at the right time but mis-categorised — downstream decoration would attach the
+wrong annotation to the transcript word.
+
+**Exact** — matched AND both start and end boundaries within `boundary_tol` (0.25 s, one
+baseline hop). The most demanding metric: event found, correctly labelled, and placed with
+sub-hop precision.
+
+**Bnd p50 / Bnd p99** — for matched pairs, `|start_cand − start_base|` in seconds.
+This is the **timestamp error**:
+- p50 is the typical (median) start-time error across matched events.
+- p99 is the tail — how bad the worst ~1% of boundary errors are.
+End-boundary drift is tracked separately internally but correlates closely with start drift;
+duration error is approximately `Bnd_start + Bnd_end`.
+
+**Cnt Δ%** — `(n_cand − n_base) / n_base × 100`. A sanity check on overall event volume.
+Large positive values mean the variant hallucinates events; large negative values mean it
+suppresses them wholesale. Should be interpreted alongside recall and precision — a variant
+can have good recall but still inflate count significantly.
+
+**What is not tracked here**
+
+- **Score error** (`|score_cand − score_base|`): the float confidence/magnitude attached to
+  each event. Not shown in this sweep; relevant for downstream ranking or threshold-based
+  filtering. Adding it to `ab_window_stride.py` is straightforward if needed.
+- **Duration error** (`|(end−start)_cand − (end−start)_base|`): correlated with Bnd but
+  measures how much the event length changes, not just its position. Also not shown.
+
 ## Setup
 
 Baseline configuration:

@@ -40,6 +40,9 @@
 #   CUDA_MPS_LOG_DIRECTORY (default "/tmp/nvidia-log")
 #   <TASK>_EXTRA_ARGS      (optional) extra flags per task, e.g.
 #                          EMOTION_EXTRA_ARGS="--prefetch-workers 8 --prefetch-lookahead 16"
+#   HOP_SEC                (default "0.25") affect/disfluency frame hop in seconds;
+#                          0.5 gives 2x throughput with minimal quality loss
+#                          (see optimization_research/WINDOW_HOP_SWEEP.md)
 #   <TASK>_THREAD_PCT      (optional, 1-100) per-client CUDA_MPS_ACTIVE_THREAD_PERCENTAGE
 #                          cap. Bounds the SMs that task's MPS client may span so the big
 #                          WavLM batch-512 GEMMs can't monopolize the array and starve the
@@ -65,6 +68,7 @@ REQUIRE_VAD="${REQUIRE_VAD:-0}"
 MAX_RETRIES="${MAX_RETRIES:-3}"
 DEVICE="${DEVICE:-cuda}"
 ENABLE_MPS="${ENABLE_MPS:-1}"
+HOP_SEC="${HOP_SEC:-0.25}"
 
 MODULE="audio_classification_playground.acoustic_events.orchestration"
 
@@ -131,6 +135,7 @@ build_worker_argv() {
   # WavLM-backed tasks (affect/disfluency) take the runtime preset + optional batch override.
   if [ "$task" = "affect" ] || [ "$task" = "disfluency" ]; then
     WORKER_ARGV+=(--wavlm-runtime-preset "$WAVLM_RUNTIME_PRESET")
+    WORKER_ARGV+=(--hop-sec "$HOP_SEC")
     if [ -n "${WAVLM_STATIC_BATCH_SIZE:-}" ]; then
       WORKER_ARGV+=(--wavlm-static-batch-size "$WAVLM_STATIC_BATCH_SIZE")
     fi

@@ -36,6 +36,49 @@ def _bar(value: float, lo: float = 0.0, hi: float = 1.0, width: int = 10) -> str
     return "█" * filled + "░" * (width - filled)
 
 
+def _collect_variant(archives: list[dict], vname: str, task: str) -> tuple[dict, str]:
+    """Aggregate per-archive dicts for a single variant+task. Returns (means, config_str)."""
+    keys = ["recall", "precision", "label_agreement", "exact_match_frac", "count_delta_pct"]
+    buckets: dict[str, list] = {k: [] for k in keys}
+    bnd_p50, bnd_p99 = [], []
+    tier_data: dict[str, dict[str, list]] = {"high": {}, "mid": {}, "low": {}}
+    config_str = ""
+    for archive in archives:
+        v = next(x for x in archive["variants"] if x["name"] == vname)
+        d = v[task]
+        for k in keys:
+            buckets[k].append(d[k])
+        bnd_p50.append(d["boundary_drift_start_sec"]["p50"])
+        bnd_p99.append(d["boundary_drift_start_sec"]["p99"])
+        w_key = "affect_window" if task == "affect" else "disf_window"
+        h_key = "affect_hop" if task == "affect" else "disf_hop"
+        config_str = f"w={v[w_key]}s h={v[h_key]}s"
+        for tier in ("high", "mid", "low"):
+            if "score_tiers" not in d or tier not in d["score_tiers"]:
+                continue
+            td = d["score_tiers"][tier]
+            tier_data[tier].setdefault("recall", []).append(td["recall"])
+            tier_data[tier].setdefault("n_base", []).append(td["n_base"])
+            tier_data[tier].setdefault("bnd_p50", []).append(td["boundary_drift_start_sec"]["p50"])
+            tier_data[tier].setdefault("bnd_p99", []).append(td["boundary_drift_start_sec"]["p99"])
+
+    mean = lambda xs: sum(xs) / len(xs) if xs else 0.0
+    agg = {k: mean(v) for k, v in buckets.items()}
+    agg["bnd_p50"] = mean(bnd_p50)
+    agg["bnd_p99"] = mean(bnd_p99)
+    agg["tiers"] = {
+        tier: {
+            "recall": mean(tier_data[tier].get("recall", [])),
+            "n_base": mean(tier_data[tier].get("n_base", [])),
+            "bnd_p50": mean(tier_data[tier].get("bnd_p50", [])),
+            "bnd_p99": mean(tier_data[tier].get("bnd_p99", [])),
+        }
+        for tier in ("high", "mid", "low")
+        if tier_data[tier]
+    }
+    return agg, config_str
+
+
 def _print_variant_table(archives: list[dict]) -> None:
     variants = [v["name"] for v in archives[0]["variants"]]
 
@@ -51,36 +94,50 @@ def _print_variant_table(archives: list[dict]) -> None:
         print(f"  {'─' * 92}")
 
         for vname in variants:
-            # Collect per-archive stats for this variant+task
-            recalls, precisions, label_ags, exacts, deltas, p50s, p99s = [], [], [], [], [], [], []
-            configs: list[str] = []
-            for archive in archives:
-                v = next(x for x in archive["variants"] if x["name"] == vname)
-                d = v[task]
-                recalls.append(d["recall"])
-                precisions.append(d["precision"])
-                label_ags.append(d["label_agreement"])
-                exacts.append(d["exact_match_frac"])
-                deltas.append(d["count_delta_pct"])
-                p50s.append(d["boundary_drift_start_sec"]["p50"])
-                p99s.append(d["boundary_drift_start_sec"]["p99"])
-                w_key = "affect_window" if task == "affect" else "disf_window"
-                h_key = "affect_hop" if task == "affect" else "disf_hop"
-                configs.append(f"w={v[w_key]}s h={v[h_key]}s")
-
-            config_str = configs[0]  # same across archives
-            mean = lambda xs: sum(xs) / len(xs)
-
-            r = mean(recalls)
+            agg, config_str = _collect_variant(archives, vname, task)
+            r = agg["recall"]
             print(
                 f"  {vname:<12}  {config_str:<18}  "
-                f"{r:6.3f}  {mean(precisions):6.3f}  "
-                f"{mean(label_ags):8.3f}  {mean(exacts):6.3f}  "
-                f"{mean(deltas):+7.1f}  "
-                f"{mean(p50s):7.3f}  {mean(p99s):7.3f}  "
+                f"{r:6.3f}  {agg['precision']:6.3f}  "
+                f"{agg['label_agreement']:8.3f}  {agg['exact_match_frac']:6.3f}  "
+                f"{agg['count_delta_pct']:+7.1f}  "
+                f"{agg['bnd_p50']:7.3f}  {agg['bnd_p99']:7.3f}  "
                 f"{_bar(r)}"
             )
 
+        print()
+
+        # Score-tier breakdown: recall + boundary drift for high/mid/low confidence events
+        has_tiers = any(
+            "score_tiers" in v[task]
+            for archive in archives
+            for v in archive["variants"]
+            if v["name"] == variants[0]
+        )
+        if not has_tiers:
+            continue
+
+        print(f"  {task.upper()} — by score tier  (high = top 25%, mid = middle 50%, low = bottom 25%)")
+        print(f"  {'─' * 84}")
+        print(
+            f"  {'variant':<12}  {'tier':<5}  "
+            f"{'n_base':>6}  {'recall':>6}  {'bnd_p50':>7}  {'bnd_p99':>7}  {'bars (recall)':<12}"
+        )
+        print(f"  {'─' * 84}")
+        for vname in variants:
+            agg, _ = _collect_variant(archives, vname, task)
+            for tier in ("high", "mid", "low"):
+                if tier not in agg["tiers"]:
+                    continue
+                t = agg["tiers"][tier]
+                r = t["recall"]
+                print(
+                    f"  {vname:<12}  {tier:<5}  "
+                    f"{t['n_base']:6.1f}  {r:6.3f}  "
+                    f"{t['bnd_p50']:7.3f}  {t['bnd_p99']:7.3f}  "
+                    f"{_bar(r)}"
+                )
+            print()
         print()
 
 
