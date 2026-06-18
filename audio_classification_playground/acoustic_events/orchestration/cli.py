@@ -82,6 +82,7 @@ def _cmd_run(args: argparse.Namespace) -> None:
         affect_backbone=args.affect_backbone,
         disfluency_backbone=args.disfluency_backbone,
         batch_size=args.batch_size,
+        hop_sec=args.hop_sec,
         affect_batch_size=args.affect_batch_size,
         disfluency_batch_size=args.disfluency_batch_size,
         emotion_batch_size=args.emotion_batch_size,
@@ -448,6 +449,16 @@ def main(argv: list[str] | None = None) -> None:
     p_run.add_argument("--affect-backbone", required=True, choices=["wavlm", "whisper"])
     p_run.add_argument("--disfluency-backbone", required=True, choices=["wavlm", "whisper"])
     p_run.add_argument("--batch-size", type=int, default=512)
+    p_run.add_argument(
+        "--hop-sec",
+        type=float,
+        default=0.25,
+        help=(
+            "Frame hop size in seconds for affect and disfluency inference "
+            "(default 0.25s; 0.5s gives 2x throughput with minimal quality loss — "
+            "see optimization_research/WINDOW_HOP_SWEEP.md)."
+        ),
+    )
     p_run.add_argument("--affect-batch-size", type=int, default=None)
     p_run.add_argument("--disfluency-batch-size", type=int, default=None)
     p_run.add_argument("--emotion-batch-size", type=int, default=None)
