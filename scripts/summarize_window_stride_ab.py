@@ -61,6 +61,10 @@ def _collect_variant(archives: list[dict], vname: str, task: str) -> tuple[dict,
             tier_data[tier].setdefault("n_base", []).append(td["n_base"])
             tier_data[tier].setdefault("bnd_p50", []).append(td["boundary_drift_start_sec"]["p50"])
             tier_data[tier].setdefault("bnd_p99", []).append(td["boundary_drift_start_sec"]["p99"])
+            if "cand_score_tiers" in d and tier in d["cand_score_tiers"]:
+                ct = d["cand_score_tiers"][tier]
+                tier_data[tier].setdefault("precision", []).append(ct["precision"])
+                tier_data[tier].setdefault("n_cand", []).append(ct["n_cand"])
 
     mean = lambda xs: sum(xs) / len(xs) if xs else 0.0
     agg = {k: mean(v) for k, v in buckets.items()}
@@ -72,6 +76,8 @@ def _collect_variant(archives: list[dict], vname: str, task: str) -> tuple[dict,
             "n_base": mean(tier_data[tier].get("n_base", [])),
             "bnd_p50": mean(tier_data[tier].get("bnd_p50", [])),
             "bnd_p99": mean(tier_data[tier].get("bnd_p99", [])),
+            "precision": mean(tier_data[tier].get("precision", [])),
+            "n_cand": mean(tier_data[tier].get("n_cand", [])),
         }
         for tier in ("high", "mid", "low")
         if tier_data[tier]
@@ -117,25 +123,28 @@ def _print_variant_table(archives: list[dict]) -> None:
         if not has_tiers:
             continue
 
-        print(f"  {task.upper()} — by score tier  (high = top 25%, mid = middle 50%, low = bottom 25%)")
-        print(f"  {'─' * 84}")
+        print(f"  {task.upper()} — by score tier  (high/mid/low = top 25% / middle 50% / bottom 25%)")
+        print(f"  Recall = baseline tier found. Precision = candidate tier that's real.")
+        print(f"  {'─' * 100}")
         print(
             f"  {'variant':<12}  {'tier':<5}  "
-            f"{'n_base':>6}  {'recall':>6}  {'bnd_p50':>7}  {'bnd_p99':>7}  {'bars (recall)':<12}"
+            f"{'n_base':>6}  {'recall':>6}  {'bnd_p50':>7}  {'bnd_p99':>7}  "
+            f"{'n_cand':>6}  {'precis':>6}  {'bars (precis)':<12}"
         )
-        print(f"  {'─' * 84}")
+        print(f"  {'─' * 100}")
         for vname in variants:
             agg, _ = _collect_variant(archives, vname, task)
             for tier in ("high", "mid", "low"):
                 if tier not in agg["tiers"]:
                     continue
                 t = agg["tiers"][tier]
-                r = t["recall"]
+                p = t.get("precision", 0.0)
                 print(
                     f"  {vname:<12}  {tier:<5}  "
-                    f"{t['n_base']:6.1f}  {r:6.3f}  "
+                    f"{t['n_base']:6.1f}  {t['recall']:6.3f}  "
                     f"{t['bnd_p50']:7.3f}  {t['bnd_p99']:7.3f}  "
-                    f"{_bar(r)}"
+                    f"{t.get('n_cand', 0.0):6.1f}  {p:6.3f}  "
+                    f"{_bar(p)}"
                 )
             print()
         print()

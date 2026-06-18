@@ -181,30 +181,50 @@ def diff_events(base: list, cand: list, *, boundary_tol: float) -> dict:
             "max": float(np.max(xs)),
         }
 
-    # Score-stratified recall and boundary drift.
-    # Tiers are defined by percentiles of the baseline score distribution so
-    # the split is meaningful regardless of score_name (z-score vs probability).
-    score_tiers = {}
+    # Score-stratified metrics.
+    # Baseline tiers (for recall): percentiles of baseline scores.
+    # Candidate tiers (for precision): percentiles of candidate scores.
+    # Both use the same tier names but independent thresholds.
+    matched_base_ids = {id(b) for b, _ in matches}
+    matched_cand_ids = {id(c) for _, c in matches}
+    matched_set = {id(b): (b, c, ds, de) for (b, c), ds, de in zip(matches, dstart, dend)}
+
+    score_tiers: dict = {}
     if base_s:
         base_scores = np.array([e.score for e in base_s], dtype=np.float64)
-        p25, p75 = float(np.quantile(base_scores, 0.25)), float(np.quantile(base_scores, 0.75))
-        matched_set = {id(b): (b, c, ds, de) for (b, c), ds, de in zip(matches, dstart, dend)}
+        bp25, bp75 = float(np.quantile(base_scores, 0.25)), float(np.quantile(base_scores, 0.75))
         for tier_name, tier_base in [
-            ("high", [e for e in base_s if e.score >= p75]),
-            ("mid",  [e for e in base_s if p25 <= e.score < p75]),
-            ("low",  [e for e in base_s if e.score < p25]),
+            ("high", [e for e in base_s if e.score >= bp75]),
+            ("mid",  [e for e in base_s if bp25 <= e.score < bp75]),
+            ("low",  [e for e in base_s if e.score < bp25]),
         ]:
-
-            tier_matched = [matched_set[id(b)] for b in tier_base if id(b) in matched_set]
+            tier_matched = [matched_set[id(b)] for b in tier_base if id(b) in matched_base_ids]
             tier_dstart = [ds for _, _, ds, _ in tier_matched]
             tier_dend = [de for _, _, _, de in tier_matched]
             score_tiers[tier_name] = {
-                "score_threshold": round(p75 if tier_name == "high" else p25, 4),
                 "n_base": len(tier_base),
                 "n_matched": len(tier_matched),
                 "recall": round(len(tier_matched) / max(len(tier_base), 1), 3),
                 "boundary_drift_start_sec": _stat(tier_dstart),
                 "boundary_drift_end_sec": _stat(tier_dend),
+            }
+
+    # Precision by candidate score tier: of the events the variant fires at
+    # high/mid/low confidence, what fraction are real (match a baseline event)?
+    cand_score_tiers: dict = {}
+    if cand_s:
+        cand_scores = np.array([e.score for e in cand_s], dtype=np.float64)
+        cp25, cp75 = float(np.quantile(cand_scores, 0.25)), float(np.quantile(cand_scores, 0.75))
+        for tier_name, tier_cand in [
+            ("high", [e for e in cand_s if e.score >= cp75]),
+            ("mid",  [e for e in cand_s if cp25 <= e.score < cp75]),
+            ("low",  [e for e in cand_s if e.score < cp25]),
+        ]:
+            tier_matched = [c for c in tier_cand if id(c) in matched_cand_ids]
+            cand_score_tiers[tier_name] = {
+                "n_cand": len(tier_cand),
+                "n_matched": len(tier_matched),
+                "precision": round(len(tier_matched) / max(len(tier_cand), 1), 3),
             }
 
     by_type_base: dict[str, int] = {}
@@ -228,6 +248,7 @@ def diff_events(base: list, cand: list, *, boundary_tol: float) -> dict:
         "boundary_drift_start_sec": _stat(dstart),
         "boundary_drift_end_sec": _stat(dend),
         "score_tiers": score_tiers,
+        "cand_score_tiers": cand_score_tiers,
         "count_by_type_base": by_type_base,
         "count_by_type_cand": by_type_cand,
     }
