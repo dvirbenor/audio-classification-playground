@@ -41,6 +41,10 @@ dependencies = [
     "torchao>=0.17.0",
     "s5cmd>=0.3.3",
     "s5cmdpy>=0.2.7",
+    "onnxscript>=0.7.0",
+    "onnxmltools>=1.16.0",
+    "onnx>=1.22.0",
+    "onnxruntime-gpu>=1.27.0",
 ]
 
 [tool.hatch.build.targets.wheel]

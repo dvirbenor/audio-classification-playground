@@ -3,29 +3,34 @@
 # Hosts three models on one g7e.2xlarge GPU:
 #   affect      — WavLM ONNX, onnxruntime backend
 #   disfluency  — WavLM ONNX, onnxruntime backend
-#   emotion     — emotion2vec Python backend (FunASR)
+#   emotion     — emotion2vec ONNX, onnxruntime backend
 #
 # Dynamic batching accumulates windows from many concurrent CPU workers,
 # keeping the GPU full without MPS or torch.compile warmup.
 #
+# Models are read directly from S3 (s3://riverside-build-assets/paralinguistics).
+#
 # SETUP (run once before deploying workers):
-#   1. Export ONNX models (on a GPU pod with env.shared.sh sourced):
-#        uv run python scripts/export_models_onnx.py --output /efs/triton-model-repo
-#   2. Copy Triton configs:
-#        cp -r triton/* /efs/triton-model-repo/
-#   3. Apply this file — uses the official Triton image, no custom build needed:
+#   1. Publish the models to S3 (on a GPU pod) — export, then sync the FP16
+#      models + configs (exclude the FP32 reference files):
+#        scripts/export_onnx.sh --output /efs/triton-model-repo
+#        aws s3 sync /efs/triton-model-repo s3://riverside-build-assets/paralinguistics \
+#            --exclude "*model_fp32.onnx" --exclude "*model.onnx.data"
+#   2. Apply this file — uses the official Triton image, no custom build needed.
+#      The pod's ServiceAccount must have S3 read on that prefix (see below):
 #        kubectl apply -f manifests/triton-server-deployment.yaml \
 #            -n nlp-audio-understanding
-#   4. Verify models are loaded:
+#   3. Verify models are loaded:
 #        kubectl exec -n nlp-audio-understanding deploy/triton-inference -- \
 #            curl -s localhost:8000/v2/models | python3 -m json.tool
 #
 # Image note: the official nvcr.io/nvidia/tritonserver image includes the
-# onnxruntime backend for affect/disfluency and the Python backend for emotion.
-# The emotion Python backend installs funasr+modelscope at startup via
-# triton/emotion/1/requirements.txt (takes ~2 min on first pod start).
-# If the emotion ONNX export succeeded, delete triton/emotion/1/model.py and
-# requirements.txt — the Python backend is not needed and startup is instant.
+# onnxruntime backend, which serves all three models — no Python backend or
+# custom build needed (so pod startup is instant; no funasr/modelscope install).
+# The ONNX models are hardware-agnostic, so the same exported model.onnx files
+# run on any GPU — only the server image's CUDA version gates the target GPU.
+# For RTX PRO 6000 Blackwell (sm_120) the image must be >= 25.01 (CUDA 12.8+);
+# see the image tag below.
 #
 # Workers connect via gRPC at:  triton-inference.nlp-audio-understanding:8001
 # Workers connect via HTTP at:  triton-inference.nlp-audio-understanding:8000
@@ -62,18 +67,32 @@ spec:
           operator: Exists
           effect: NoSchedule
       nodeSelector:
-        # TODO(blackwell): update to match your cluster's Blackwell/L4/L40S node label
+        # g7e nodes are Blackwell (sm_120) — the correct target for the
+        # CUDA 12.8+ Triton image above. Do not change to L40S/Ada.
         node.kubernetes.io/instance-type: g7e.2xlarge
+
+      # S3 model repository read access is inherited from the pod's existing AWS
+      # authorization (node instance role / pod identity) — no serviceAccount
+      # override needed. Requires s3:GetObject + s3:ListBucket on
+      # arn:aws:s3:::riverside-build-assets (prefix paralinguistics/*).
 
       containers:
         - name: tritonserver
-          image: nvcr.io/nvidia/tritonserver:24.10-py3
+          # Must be a release built on CUDA 12.8+ for RTX PRO 6000 Blackwell
+          # (sm_120). CUDA 12.8/Blackwell support landed in Triton 25.01; the
+          # 24.x line (CUDA 12.6) has no sm_120 kernels and will fail to launch
+          # on Blackwell. Bump to the latest tag your cluster has validated.
+          image: nvcr.io/nvidia/tritonserver:25.05-py3
           imagePullPolicy: Always
 
           command:
             - tritonserver
           args:
-            - --model-repository=/efs/triton-model-repo
+            # Triton reads the model repository directly from S3: at startup it
+            # copies the whole prefix (~1.7 GB of FP16 model.onnx + configs) into
+            # a local temp dir, then loads. Needs AWS creds (serviceAccount/IRSA
+            # below), AWS_DEFAULT_REGION, and enough ephemeral-storage (below).
+            - --model-repository=s3://riverside-build-assets/paralinguistics
             - --log-verbose=1
             - --grpc-port=8001
             - --http-port=8000
@@ -97,49 +116,42 @@ spec:
               cpu: "6"
               memory: "32Gi"
               nvidia.com/gpu: "1"
+              # Scratch for the localized S3 copy (~1.7 GB) + Triton temp.
+              ephemeral-storage: "4Gi"
             limits:
               cpu: "8"
               memory: "48Gi"
               nvidia.com/gpu: "1"
+              ephemeral-storage: "8Gi"
 
           env:
-            - name: CLEARML_WEB_HOST
-              value: http://clearml-webserver.clearml:8080
-            # Model weights live on EFS — point HF / ModelScope caches there
-            # so the emotion Python backend finds emotion2vec_plus_large at startup.
-            - name: HF_HOME
-              value: /efs/model-cache/huggingface
-            - name: MODELSCOPE_CACHE
-              value: /efs/model-cache/modelscope
-            - name: TORCH_HOME
-              value: /efs/model-cache/torch
+            # Region for the S3 model-repository backend (bucket is us-east-1).
+            - name: AWS_DEFAULT_REGION
+              value: us-east-1
 
           volumeMounts:
-            - name: efs
-              mountPath: /efs
             - name: dshm
               mountPath: /dev/shm
 
-          # Gate traffic until Triton reports all three models ready
+          # Gate traffic until Triton reports all three models ready. Timings
+          # allow for the cold-start S3 download (~1.7 GB) + loading three ONNX
+          # models onto the GPU before liveness can restart the pod.
           readinessProbe:
             httpGet:
               path: /v2/health/ready
               port: 8000
-            initialDelaySeconds: 60
+            initialDelaySeconds: 90
             periodSeconds: 10
-            failureThreshold: 12
+            failureThreshold: 18
           livenessProbe:
             httpGet:
               path: /v2/health/live
               port: 8000
-            initialDelaySeconds: 120
+            initialDelaySeconds: 240
             periodSeconds: 20
             failureThreshold: 6
 
       volumes:
-        - name: efs
-          persistentVolumeClaim:
-            claimName: efs-pvc   # adjust to your cluster's EFS PVC name
         - name: dshm
           emptyDir:
             medium: Memory

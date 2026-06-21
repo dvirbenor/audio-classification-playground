@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Export WavLM affect + disfluency + emotion2vec models to ONNX for Triton.
 
-WavLM models (affect, disfluency) export via torch.onnx.export.
-Emotion2vec uses the Triton Python backend (see triton/emotion/1/model.py) —
-no ONNX export needed for it, but this script exports a probe run to verify
-output shape so the config.pbtxt class count is correct.
+All three export to ONNX via torch.onnx.export and run on the onnxruntime
+backend. Affect/disfluency export the WavLM wrapper directly; emotion exports
+DirectEmotion2vecScorer.core (the extract_features inference path), emitting raw
+EMOTION2VEC_LABELS scores that the producer canonicalizes client-side.
 
 Run on a GPU pod with HF_HOME pointing at the shared EFS model cache:
 
@@ -13,11 +13,12 @@ Run on a GPU pod with HF_HOME pointing at the shared EFS model cache:
         --output /efs/triton-model-repo \\
         [--task affect|disfluency|all] \\
         [--device cuda] \\
-        [--opset 17]
+        [--opset 18]
 
-Then copy config files and start the Triton server:
+Each task's config.pbtxt is copied from triton/ into the output automatically,
+so the output directory is a complete, deploy-ready Triton model directory.
+Then start the Triton server:
 
-    cp -r triton/* /efs/triton-model-repo/
     kubectl apply -f manifests/triton-server-deployment.yaml
 """
 from __future__ import annotations
@@ -109,7 +110,10 @@ def export_disfluency(output_dir: Path, device: str, opset: int) -> None:
     model_id = "tiantiaf/wavlm-large-speech-flow"
     print(f"[disfluency] loading {model_id} on {device} …")
     model = WavLMWrapper.from_pretrained(model_id).to(device).eval()
-    wrapper = _DisfluencyWrapper(model)
+    # .eval() the wrapper too: nn.Module defaults to training=True and that flag
+    # does not propagate to an already-attached child, so without this the
+    # exporter warns it is "exporting a model while it is in training mode".
+    wrapper = _DisfluencyWrapper(model).eval()
 
     dummy = torch.zeros(VALIDATION_BATCH, DISFLUENCY_WINDOW_SAMPLES, device=device)
     with torch.inference_mode():
@@ -134,6 +138,8 @@ def export_disfluency(output_dir: Path, device: str, opset: int) -> None:
         do_constant_folding=True,
     )
     print(f"[disfluency] exported → {out_path}")
+    # disfluency outputs are raw logits (not sigmoid-bounded like affect), so a
+    # pure-atol bound on FP32 kernel noise is too tight; allow a small rtol.
     _validate(
         out_path,
         inputs={"input_values": dummy.cpu().numpy()},
@@ -141,62 +147,37 @@ def export_disfluency(output_dir: Path, device: str, opset: int) -> None:
             "fluency_logits": f_pt.cpu().float().numpy(),
             "disfluency_type_logits": d_pt.cpu().float().numpy(),
         },
+        rtol=1e-3,
     )
     out_path = _convert_fp16(out_path)
     _validate(out_path, inputs={"input_values": dummy.cpu().numpy()}, expected={
         "fluency_logits": f_pt.cpu().float().numpy(),
         "disfluency_type_logits": d_pt.cpu().float().numpy(),
-    }, atol=1e-2)
+    }, atol=1e-2, rtol=1e-3)
 
 
 # ---------------------------------------------------------------------------
 # Emotion — ONNX export attempt with graceful fallback
 # ---------------------------------------------------------------------------
 
-class _EmotionExportWrapper(torch.nn.Module):
-    """Wraps whatever inner module we find so torch.onnx.export sees a clean graph.
-
-    emotion2vec_plus_large in FunASR is typically structured as:
-      auto_model.model               — the top-level nn.Module
-        .frontend (optional)         — CNN feature extractor
-        .encoder                     — transformer backbone
-        .head / .classifier          — linear + softmax
-
-    We try calling model(audio) directly first; if that fails we try the
-    frontend → encoder → head pipeline explicitly.
-    """
-
-    def __init__(self, inner: torch.nn.Module):
-        super().__init__()
-        self.inner = inner
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out = self.inner(x)
-        # FunASR models may return a dict, tuple, or bare tensor.
-        if isinstance(out, dict):
-            # Common keys: "logit", "logits", "score", "hidden_states"
-            for key in ("logit", "logits", "score", "scores"):
-                if key in out:
-                    return out[key]
-            # Fall back to first tensor value
-            for v in out.values():
-                if isinstance(v, torch.Tensor):
-                    return v
-            raise RuntimeError(f"Cannot extract output tensor from dict keys: {list(out.keys())}")
-        if isinstance(out, (tuple, list)):
-            return out[0]
-        return out
-
-
 def export_emotion(output_dir: Path, device: str, opset: int) -> bool:
-    """Attempt to export emotion2vec to ONNX. Returns True on success.
+    """Export emotion2vec to ONNX as a single pure-ONNX model. Returns True.
 
-    On failure, prints diagnostic info and instructions for using the Python
-    backend fallback (triton/emotion/1/model.py) instead.
+    The exportable unit is ``DirectEmotion2vecScorer.core`` — layer-norm +
+    ``extract_features`` + mean-pool + ``proj`` + masked softmax + label select —
+    which maps raw audio windows directly to native per-class scores. (The
+    earlier approach of calling FunASR's ``model.forward`` failed because that is
+    the SSL/masking path; ``extract_features`` is the inference path.)
+
+    The ONNX model emits the raw ``EMOTION2VEC_LABELS`` scores, exactly like the
+    direct fleet path — the producer's ``emotion2vec_scores_to_probabilities()``
+    folds them into CANONICAL_CHANNELS client-side, so no canonicalization is
+    baked into the graph.
     """
     from funasr import AutoModel
     from audio_classification_playground.acoustic_events.inference.emotion2vec import (
-        predict_emotion2vec_scores,
+        EMOTION2VEC_LABELS,
+        make_direct_emotion2vec_scorer,
     )
 
     model_id = "iic/emotion2vec_plus_large"
@@ -209,120 +190,59 @@ def export_emotion(output_dir: Path, device: str, opset: int) -> bool:
         disable_pbar=True,
     )
 
-    # --- get FunASR reference outputs ---
-    dummy_np = np.random.randn(VALIDATION_BATCH, EMOTION_WINDOW_SAMPLES).astype(np.float32)
-    ref_scores, ref_labels = predict_emotion2vec_scores(
-        auto_model,
-        dummy_np,
-        sample_rate=SAMPLE_RATE,
-        batch_size=VALIDATION_BATCH,
+    scorer = make_direct_emotion2vec_scorer(auto_model, sample_rate=SAMPLE_RATE)
+    if scorer is None:
+        print("[emotion] ✗ direct batched scorer unsupported for this FunASR model — "
+              "cannot export to ONNX (no Python backend implemented either).")
+        return False
+
+    # The client (TritonEmotionPredictor) pairs the ONNX scores with the fixed
+    # EMOTION2VEC_LABELS order; fail loudly if the live model no longer matches.
+    # Compare by English suffix ("中立/neutral" -> "neutral") since that is the
+    # only part normalize_label() — and EMOTION2VEC_LABELS — keeps.
+    native_suffixes = tuple(
+        str(label).split("/")[-1].strip().lower() for label in scorer.selected_labels
     )
-    n_classes = ref_scores.shape[1]
-    print(f"[emotion] FunASR reference: scores={ref_scores.shape}  labels={list(ref_labels)}")
-
-    # --- probe internal structure ---
-    print("[emotion] probing FunASR internals …")
-    _probe_attrs = ("model", "encoder", "frontend", "backbone", "net")
-    for attr in _probe_attrs:
-        child = getattr(auto_model, attr, None)
-        if child is not None and isinstance(child, torch.nn.Module):
-            print(f"  auto_model.{attr}: {type(child).__name__}")
-            for sub in ("frontend", "encoder", "head", "classifier", "linear"):
-                s = getattr(child, sub, None)
-                if s is not None and isinstance(s, torch.nn.Module):
-                    print(f"    .{sub}: {type(s).__name__}")
-
-    inner = getattr(auto_model, "model", None)
-    if inner is None or not isinstance(inner, torch.nn.Module):
-        print("[emotion] ✗ auto_model.model not found or not an nn.Module")
-        _print_fallback_instructions()
-        return False
-
-    # --- try a direct forward pass ---
-    wrapper = _EmotionExportWrapper(inner).eval()
-    dummy_t = torch.from_numpy(dummy_np).to(device)
-    print("[emotion] trying wrapper.forward(audio) …")
-    try:
-        with torch.inference_mode():
-            out_t = wrapper(dummy_t)
-        print(f"[emotion] wrapper output: shape={tuple(out_t.shape)} dtype={out_t.dtype}")
-    except Exception as e:
-        print(f"[emotion] ✗ forward pass failed: {e}")
-        _print_fallback_instructions()
-        return False
-
-    # --- check output shape ---
-    if out_t.shape[-1] != n_classes:
-        print(
-            f"[emotion] ✗ wrapper output has {out_t.shape[-1]} classes but FunASR "
-            f"returns {n_classes} — preprocessing is outside the nn.Module boundary."
+    if native_suffixes != EMOTION2VEC_LABELS:
+        raise RuntimeError(
+            "emotion2vec label order changed — update EMOTION2VEC_LABELS in "
+            "inference/emotion2vec.py.\n"
+            f"  expected: {EMOTION2VEC_LABELS}\n"
+            f"  got:      {native_suffixes}"
         )
-        print("[emotion] This is the common case where FunASR's feature extractor")
-        print("  runs before the model. To export it, you'd need to trace the full")
-        print("  pipeline including FunASR's frontend — not straightforward.")
-        _print_fallback_instructions()
-        return False
+    n_classes = len(EMOTION2VEC_LABELS)
+    print(f"[emotion] {n_classes} native classes: {list(EMOTION2VEC_LABELS)}")
 
-    # --- cross-check against FunASR reference ---
-    out_np = out_t.detach().cpu().float().numpy()
-    max_diff = float(np.abs(out_np - ref_scores).max())
-    print(f"[emotion] max diff vs FunASR reference: {max_diff:.4f}")
-    if max_diff > 0.05:
-        print(
-            f"[emotion] ✗ wrapper output diverges from FunASR (max_diff={max_diff:.4f} > 0.05). "
-            "FunASR applies preprocessing outside the nn.Module."
-        )
-        _print_fallback_instructions()
-        return False
-    print("[emotion] ✓ wrapper matches FunASR reference — proceeding with ONNX export")
+    core = scorer.core.eval()
+    dummy_np = np.random.randn(VALIDATION_BATCH, EMOTION_WINDOW_SAMPLES).astype(np.float32)
+    dummy_t = torch.from_numpy(dummy_np).to(scorer.device)
+    with torch.inference_mode():
+        ref = core(dummy_t).detach().cpu().float().numpy()
+    print(f"[emotion] core output: shape={ref.shape}  rows sum to ~{float(ref.sum(axis=1).mean()):.4f}")
 
-    # --- export ---
     out_path = output_dir / "emotion" / "1" / "model.onnx"
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        torch.onnx.export(
-            wrapper,
-            (dummy_t,),
-            str(out_path),
-            input_names=["input_values"],
-            output_names=["scores"],
-            dynamic_axes={
-                "input_values": {0: "batch_size"},
-                "scores": {0: "batch_size"},
-            },
-            opset_version=opset,
-            do_constant_folding=True,
-        )
-    except Exception as e:
-        print(f"[emotion] ✗ torch.onnx.export failed: {e}")
-        _print_fallback_instructions()
-        return False
-
-    print(f"[emotion] exported → {out_path}")
-    _validate(
-        out_path,
-        inputs={"input_values": dummy_np},
-        expected={"scores": ref_scores},
-        atol=1e-3,
+    torch.onnx.export(
+        core,
+        (dummy_t,),
+        str(out_path),
+        input_names=["input_values"],
+        output_names=["scores"],
+        dynamic_axes={
+            "input_values": {0: "batch_size"},
+            "scores": {0: "batch_size"},
+        },
+        opset_version=opset,
+        do_constant_folding=True,
     )
+    print(f"[emotion] exported → {out_path}")
+    _validate(out_path, inputs={"input_values": dummy_np},
+              expected={"scores": ref}, atol=1e-3)
     out_path = _convert_fp16(out_path)
     _validate(out_path, inputs={"input_values": dummy_np},
-              expected={"scores": ref_scores}, atol=5e-2)
-
-    print("\n[emotion] ✓ ONNX export succeeded.")
-    print("  Switch triton/emotion/config.pbtxt to use the ONNX backend:")
-    print('    backend: "onnxruntime"')
-    print(f'    output [{{ name: "scores" data_type: TYPE_FP32 dims: [{n_classes}] }}]')
-    print("  Remove triton/emotion/1/model.py (Python backend no longer needed).")
-    print("  Update TritonEmotionPredictor.output_name from 'probabilities' to 'scores'")
-    print("  and apply emotion2vec_scores_to_probabilities() on the client side.")
+              expected={"scores": ref}, atol=5e-2)
+    print("[emotion] ✓ ONNX export + validation passed.")
     return True
-
-
-def _print_fallback_instructions() -> None:
-    print("[emotion] → Using Python backend fallback (already configured):")
-    print("           triton/emotion/config.pbtxt  +  triton/emotion/1/model.py")
-    print("           No action needed — the Python backend is fully functional.")
 
 
 # ---------------------------------------------------------------------------
@@ -333,29 +253,57 @@ def _convert_fp16(onnx_path: Path) -> Path:
     """Convert an FP32 ONNX model to FP16 in-place (weights only; I/O stays FP32).
 
     Uses keep_io_types=True so Triton configs and client code need no changes.
-    ONNX Runtime automatically falls back to FP32 for numerically sensitive ops
-    (attention softmax, LayerNorm) — unlike TensorRT's indiscriminate cast that
-    caused NaNs.
+    Conv ops are kept in FP32 (added to op_block_list): cuDNN's frontend can
+    fail the heuristic query for WavLM's wide positional conv in pure FP16
+    (HEURISTIC_QUERY_FAILED — a hard error / segfault on some ORT+cuDNN builds),
+    and convs are numerically sensitive anyway. The attention/FFN matmuls — the
+    bulk of the compute — still run on FP16 tensor cores.
 
-    Requires: onnxmltools  (pip install onnxmltools)
+    The float16 converter has moved between packages over time; try the known
+    locations in order (ORT ships its own, which is the most relevant for the
+    CUDA EP target).
     """
     try:
         import onnx
-        from onnxmltools.utils.float16_converter import convert_float_to_float16
     except ImportError:
-        print("  [skip] onnxmltools not installed — skipping FP16 conversion")
-        print("         Install with: pip install onnxmltools onnx")
+        print("  [skip] onnx not installed — skipping FP16 conversion")
         return onnx_path
 
+    convert_float_to_float16 = None
+    for module_path in (
+        "onnxruntime.transformers.float16",
+        "onnxconverter_common.float16",
+        "onnxmltools.utils.float16_converter",
+    ):
+        try:
+            module = __import__(module_path, fromlist=["convert_float_to_float16"])
+            convert_float_to_float16 = module.convert_float_to_float16
+            break
+        except ImportError:
+            continue
+    if convert_float_to_float16 is None:
+        print("  [skip] no float16 converter found — skipping FP16 conversion")
+        print("         Install one of: onnxruntime, onnxconverter-common, onnxmltools")
+        return onnx_path
+
+    # Full FP32 footprint (proto + external-data sidecar, if any) for the report.
+    fp32_bytes = onnx_path.stat().st_size
+    ext_data = onnx_path.parent / (onnx_path.name + ".data")
+    if ext_data.exists():
+        fp32_bytes += ext_data.stat().st_size
+
     model = onnx.load(str(onnx_path))
-    model_fp16 = convert_float_to_float16(model, keep_io_types=True)
+    block_list = list(getattr(module, "DEFAULT_OP_BLOCK_LIST", [])) + ["Conv"]
+    model_fp16 = convert_float_to_float16(
+        model, keep_io_types=True, op_block_list=block_list
+    )
     out_path = onnx_path.parent / "model.onnx"  # overwrite: Triton expects model.onnx
-    # Keep the original as model_fp32.onnx for reference
+    # Keep the original as model_fp32.onnx for reference (its external-data
+    # sidecar keeps its original name and stays referenced by model_fp32.onnx).
     onnx_path.rename(onnx_path.parent / "model_fp32.onnx")
     onnx.save(model_fp16, str(out_path))
-    size_fp32 = (onnx_path.parent / "model_fp32.onnx").stat().st_size / 1e9
     size_fp16 = out_path.stat().st_size / 1e9
-    print(f"  FP16 converted: {size_fp32:.2f} GB → {size_fp16:.2f} GB  ({out_path})")
+    print(f"  FP16 converted: {fp32_bytes / 1e9:.2f} GB → {size_fp16:.2f} GB  ({out_path})")
     return out_path
 
 
@@ -363,7 +311,9 @@ def _convert_fp16(onnx_path: Path) -> Path:
 # ONNX Runtime validation
 # ---------------------------------------------------------------------------
 
-def _validate(onnx_path: Path, inputs: dict, expected: dict, atol: float = ATOL) -> None:
+def _validate(
+    onnx_path: Path, inputs: dict, expected: dict, atol: float = ATOL, rtol: float = 0.0
+) -> None:
     try:
         import onnxruntime as ort
     except ImportError:
@@ -381,7 +331,10 @@ def _validate(onnx_path: Path, inputs: dict, expected: dict, atol: float = ATOL)
     for name, ort_out in zip(out_names, ort_outputs):
         pt_out = expected[name]
         max_diff = float(np.abs(ort_out - pt_out).max())
-        ok = max_diff <= atol
+        # allclose semantics: tolerate atol + rtol*|expected|. rtol matters for
+        # unbounded logit outputs whose magnitude makes a pure-atol bound on
+        # FP32 CUDA-vs-ORT kernel noise unrealistically tight.
+        ok = bool(np.allclose(ort_out, pt_out, atol=atol, rtol=rtol))
         status = "OK  " if ok else "FAIL"
         print(f"  [{status}] {name}: max_diff={max_diff:.2e}")
         if not ok:
@@ -390,7 +343,7 @@ def _validate(onnx_path: Path, inputs: dict, expected: dict, atol: float = ATOL)
     if not all_ok:
         raise RuntimeError(
             f"ONNX validation failed for {onnx_path.name} — "
-            f"outputs exceed atol={atol:.2e}. "
+            f"outputs exceed atol={atol:.2e} rtol={rtol:.2e}. "
             "If this is a precision issue try exporting in FP32 (no autocast)."
         )
     print(f"  validation passed ✓")
@@ -410,27 +363,57 @@ def main() -> None:
         "--task", choices=["affect", "disfluency", "emotion", "all"], default="all",
         help="Which model(s) to export.",
     )
-    ap.add_argument("--opset", type=int, default=17, help="ONNX opset version (default: 17)")
+    ap.add_argument(
+        "--opset", type=int, default=18,
+        help="ONNX opset version (default: 18). The dynamo exporter has opset-18 "
+             "implementations and keeps 18 even if a lower version is requested, "
+             "so 17 only triggers a failed down-convert and a noisy traceback.",
+    )
     ap.add_argument("--device", default="cuda", choices=["cuda", "cpu"])
     args = ap.parse_args()
 
     output_dir = Path(args.output)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    exported: list[str] = []
     if args.task in ("affect", "all"):
         export_affect(output_dir, args.device, args.opset)
+        exported.append("affect")
 
     if args.task in ("disfluency", "all"):
         export_disfluency(output_dir, args.device, args.opset)
+        exported.append("disfluency")
 
     if args.task in ("emotion", "all"):
-        export_emotion(output_dir, args.device, args.opset)
+        if export_emotion(output_dir, args.device, args.opset):
+            exported.append("emotion")
+
+    _install_configs(output_dir, exported)
 
     print("\nNext steps:")
-    print(f"  cp -r triton/* {output_dir}/")
     print(f"  kubectl apply -f manifests/triton-server-deployment.yaml")
     print(f"  experiment-launcher launch manifests/acoustic-events-triton-workers.yaml \\")
     print(f"      --template ./manifests/job-template-with-github-ssh.yaml")
+
+
+def _install_configs(output_dir: Path, tasks: list[str]) -> None:
+    """Copy each exported task's config.pbtxt from the repo's ``triton/`` source
+    into ``output_dir/<task>/``, so the output is a complete, deploy-ready Triton
+    model directory (weights + configs) with no manual ``cp -r triton/*`` step.
+    ``triton/`` stays the single version-controlled source for the configs.
+    """
+    import shutil
+
+    triton_src = Path(__file__).resolve().parent.parent / "triton"
+    for task in tasks:
+        src = triton_src / task / "config.pbtxt"
+        dst = output_dir / task / "config.pbtxt"
+        if not src.exists():
+            print(f"  [warn] no config.pbtxt for {task} at {src}")
+            continue
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(src, dst)
+        print(f"  config installed → {dst}")
 
 
 if __name__ == "__main__":

@@ -17,6 +17,26 @@ from .audio import frame_audio, frame_audio_geometry, writable_contiguous_float3
 
 ProgressFn = Callable[[str], None]
 
+# emotion2vec_plus_large class labels (FunASR "unuse*" tokens removed), in the
+# column order that DirectEmotion2vecScorer.core — and therefore the exported
+# ONNX model — emits. The model's tokenizer labels are bilingual "中文/english";
+# normalize_label() keeps only the English suffix, so we store just that. The
+# ONNX model returns these raw per-class scores and the producer's
+# emotion2vec_scores_to_probabilities() folds them into CANONICAL_CHANNELS
+# ("<unk>" -> "other"). The export checks the live model still matches this
+# (by English suffix) so the order cannot silently drift.
+EMOTION2VEC_LABELS: tuple[str, ...] = (
+    "angry",
+    "disgusted",
+    "fearful",
+    "happy",
+    "neutral",
+    "other",
+    "sad",
+    "surprised",
+    "<unk>",
+)
+
 
 def predict_emotion2vec_scores(
     auto_model,

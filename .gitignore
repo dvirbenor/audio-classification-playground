@@ -277,3 +277,5 @@ optimization_research/**/*.json
 benchmark_audio/*.wav
 benchmark_audio/index.json
 scratch/
+# Generated Triton model directory (ONNX weights + copied configs) — build artifact, never commit
+triton-model-repo/

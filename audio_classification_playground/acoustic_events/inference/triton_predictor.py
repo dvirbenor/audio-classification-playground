@@ -117,15 +117,16 @@ class TritonDisfluencyPredictor:
 
 
 class TritonEmotionPredictor:
-    """Calls the 'emotion' Python-backend model on the Triton server.
+    """Calls the 'emotion' ONNX model on the Triton server.
 
-    The Python backend returns fully-processed probabilities in CANONICAL_CHANNELS
-    order (9 classes). We return them as (probs, CANONICAL_CHANNELS) so the
-    runner's emotion2vec_scores_to_probabilities() receives already-canonical,
-    already-normalized data and its fold+normalise step is a no-op.
+    The ONNX model emits raw per-class softmax scores over the 9 native
+    emotion2vec labels (EMOTION2VEC_LABELS order). We return them as
+    (scores, EMOTION2VEC_LABELS) so the runner's
+    emotion2vec_scores_to_probabilities() folds them into CANONICAL_CHANNELS —
+    exactly the same path as the direct (non-Triton) predictor.
 
     Input:  windows [n, 48000] float32
-    Output: (probabilities [n, 9], canonical_labels tuple[str, ...])
+    Output: (scores [n, 9], EMOTION2VEC_LABELS tuple[str, ...])
     """
 
     def __init__(self, url: str) -> None:
@@ -133,10 +134,10 @@ class TritonEmotionPredictor:
         self._client = grpcclient.InferenceServerClient(url=url)
 
     def __call__(self, windows: np.ndarray) -> tuple[np.ndarray, Sequence[str]]:
-        from ..producers.emotion.config import CANONICAL_CHANNELS
+        from .emotion2vec import EMOTION2VEC_LABELS
         import tritonclient.grpc as grpcclient
 
-        probs_chunks = []
+        score_chunks = []
         for chunk in _chunks(windows, _MAX_CHUNK):
             chunk = np.ascontiguousarray(chunk, dtype=np.float32)
             inp = grpcclient.InferInput("input_values", list(chunk.shape), "FP32")
@@ -144,11 +145,11 @@ class TritonEmotionPredictor:
             result = self._client.infer(
                 "emotion",
                 inputs=[inp],
-                outputs=[grpcclient.InferRequestedOutput("probabilities")],
+                outputs=[grpcclient.InferRequestedOutput("scores")],
             )
-            probs_chunks.append(result.as_numpy("probabilities"))
+            score_chunks.append(result.as_numpy("scores"))
 
-        return np.concatenate(probs_chunks, axis=0), CANONICAL_CHANNELS
+        return np.concatenate(score_chunks, axis=0), EMOTION2VEC_LABELS
 
 
 # ---------------------------------------------------------------------------

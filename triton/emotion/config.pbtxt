@@ -1,15 +1,15 @@
 name: "emotion"
-backend: "python"
+backend: "onnxruntime"
 
-# emotion2vec_plus_large outputs 9 canonical emotion classes.
-# Run `python scripts/export_models_onnx.py --task emotion-probe` to confirm
-# this number if the model version changes.
+# emotion2vec_plus_large, exported as a pure-ONNX model by
+# scripts/export_models_onnx.py (DirectEmotion2vecScorer.core: layer-norm +
+# extract_features + mean-pool + proj + masked softmax + label select).
 max_batch_size: 256
 
 dynamic_batching {
   preferred_batch_size: [64, 128, 256]
-  # Slightly longer delay for emotion — it's less latency-sensitive and the
-  # Python backend benefits more from larger batches than the ONNX models.
+  # Slightly longer delay for emotion — it's less latency-sensitive, so a wider
+  # window to accumulate a larger batch is a good trade.
   max_queue_delay_microseconds: 20000
 }
 
@@ -22,12 +22,15 @@ input [
   }
 ]
 
-# Output: per-window probabilities over the 9 canonical emotion channels,
-# in the order defined by CANONICAL_CHANNELS in producers/emotion/config.py.
-# The Python backend normalises and orders them before returning.
+# Output: raw per-class softmax scores over the 9 native emotion2vec labels,
+# in EMOTION2VEC_LABELS order (see inference/emotion2vec.py). The client
+# (TritonEmotionPredictor) pairs these with EMOTION2VEC_LABELS and the producer's
+# emotion2vec_scores_to_probabilities() folds them into the 8 CANONICAL_CHANNELS
+# ("<unk>" + "其他/other" -> "other"). Canonicalization is intentionally NOT in
+# the graph, matching the direct (non-Triton) fleet path.
 output [
   {
-    name: "probabilities"
+    name: "scores"
     data_type: TYPE_FP32
     dims: [9]
   }
@@ -40,3 +43,17 @@ instance_group [
     gpus: [0]
   }
 ]
+
+# FP16 weights (Conv kept FP32 by the exporter) run on FP16 tensor cores via the
+# ONNX Runtime CUDA EP — same approach as affect/disfluency.
+optimization {
+  execution_accelerators {
+    gpu_execution_accelerator [
+      {
+        name: "cuda"
+        parameters { key: "precision_mode" value: "FP16" }
+        parameters { key: "max_workspace_size_bytes" value: "2147483648" }
+      }
+    ]
+  }
+}

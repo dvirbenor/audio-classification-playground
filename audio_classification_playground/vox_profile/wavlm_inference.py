@@ -3,7 +3,6 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 
-import numpy as np
 from speechbrain.integrations.huggingface import make_padding_masks
 import torch
 import transformers.models.wavlm.modeling_wavlm as wavlm
@@ -23,13 +22,13 @@ def prepare_wavlm_large_inputs(
 
     For fixed 16 kHz waveform windows, ``Wav2Vec2FeatureExtractor`` only
     performs per-row zero-mean/unit-variance normalization before tensor
-    conversion.  The vectorized NumPy implementation below is bit-identical
-    for this fixed-window path and avoids the feature extractor's Python
-    padding/container overhead.
+    conversion.  The vectorized Torch implementation below matches that
+    fixed-window path, avoids the feature extractor's Python padding/container
+    overhead, and stays on-device so it traces cleanly under
+    ``torch.export`` / ``torch.onnx.export`` (a NumPy round-trip cannot).
     """
     target_device = x.device if device is None else device
-    signal_np = _zero_mean_unit_var_norm(x.detach().cpu().numpy())
-    signal = x.new_tensor(signal_np, device=target_device)
+    signal = _zero_mean_unit_var_norm(x).to(device=target_device, dtype=x.dtype)
 
     attention_mask = None
     if length is not None:
@@ -161,12 +160,19 @@ def _stream_encoder_weighted_sum(
     return weighted
 
 
-def _zero_mean_unit_var_norm(values) -> np.ndarray:
-    """Match Wav2Vec2FeatureExtractor zero-mean/unit-var normalization."""
-    array = np.asarray(values, dtype=np.float32)
-    mean = array.mean(axis=1, keepdims=True)
-    var = array.var(axis=1, keepdims=True)
-    return ((array - mean) / np.sqrt(var + 1e-7)).astype(np.float32, copy=False)
+def _zero_mean_unit_var_norm(values: torch.Tensor) -> torch.Tensor:
+    """Match Wav2Vec2FeatureExtractor zero-mean/unit-var normalization.
+
+    Pure Torch so the op traces under ``torch.export``: ``.numpy()`` is not
+    supported on the fake/proxy tensor subclasses the exporter feeds through.
+    Uses population variance (``unbiased=False``, i.e. NumPy's default ddof=0)
+    to stay numerically equivalent to the feature extractor, up to float32
+    reduction-order noise.
+    """
+    array = values.to(torch.float32)
+    mean = array.mean(dim=1, keepdim=True)
+    var = array.var(dim=1, keepdim=True, unbiased=False)
+    return (array - mean) / torch.sqrt(var + 1e-7)
 
 
 def validate_autocast_dtype(autocast_dtype: str | None) -> str | None:
