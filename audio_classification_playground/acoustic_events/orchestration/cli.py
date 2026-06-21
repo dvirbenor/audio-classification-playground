@@ -114,6 +114,7 @@ def _cmd_run(args: argparse.Namespace) -> None:
         vad_gating_tasks=tuple(args.vad_gating_tasks),
         require_precomputed_vad=args.require_precomputed_vad,
         seed=args.seed,
+        triton_url=args.triton_url,
     )
 
 
@@ -463,6 +464,16 @@ def main(argv: list[str] | None = None) -> None:
     p_run.add_argument("--disfluency-batch-size", type=int, default=None)
     p_run.add_argument("--emotion-batch-size", type=int, default=None)
     p_run.add_argument("--device", default=None)
+    p_run.add_argument(
+        "--triton-url",
+        default=None,
+        help=(
+            "gRPC URL of the Triton Inference Server (e.g. triton-inference:8001). "
+            "When set, affect/disfluency/emotion inference is delegated to Triton "
+            "instead of loading models in-process — worker pods can be CPU-only. "
+            "See manifests/triton-server-deployment.yaml and inference/triton_predictor.py."
+        ),
+    )
     p_run.add_argument(
         "--wavlm-autocast-dtype",
         choices=("fp16", "bf16"),

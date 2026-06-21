@@ -1,0 +1,52 @@
+name: "disfluency"
+backend: "onnxruntime"
+
+max_batch_size: 256
+
+dynamic_batching {
+  preferred_batch_size: [128, 256]
+  max_queue_delay_microseconds: 10000
+}
+
+# Input: one pre-segmented audio window, 3.0 s × 16 kHz = 48 000 samples.
+input [
+  {
+    name: "input_values"
+    data_type: TYPE_FP32
+    dims: [48000]
+  }
+]
+
+# Outputs match _DisfluencyWrapper.forward() -> (fluency_logits, disfluency_type_logits).
+output [
+  {
+    name: "fluency_logits"
+    data_type: TYPE_FP32
+    dims: [2]
+  },
+  {
+    name: "disfluency_type_logits"
+    data_type: TYPE_FP32
+    dims: [5]
+  }
+]
+
+instance_group [
+  {
+    kind: KIND_GPU
+    count: 1
+    gpus: [0]
+  }
+]
+
+optimization {
+  execution_accelerators {
+    gpu_execution_accelerator [
+      {
+        name: "cuda"
+        parameters { key: "precision_mode" value: "FP16" }
+        parameters { key: "max_workspace_size_bytes" value: "2147483648" }
+      }
+    ]
+  }
+}

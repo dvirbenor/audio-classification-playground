@@ -1,0 +1,169 @@
+# Triton Inference Server — persistent Deployment + ClusterIP Service.
+#
+# Hosts three models on one g7e.2xlarge GPU:
+#   affect      — WavLM ONNX, onnxruntime backend
+#   disfluency  — WavLM ONNX, onnxruntime backend
+#   emotion     — emotion2vec Python backend (FunASR)
+#
+# Dynamic batching accumulates windows from many concurrent CPU workers,
+# keeping the GPU full without MPS or torch.compile warmup.
+#
+# SETUP (run once before deploying workers):
+#   1. Export ONNX models (on a GPU pod with env.shared.sh sourced):
+#        uv run python scripts/export_models_onnx.py --output /efs/triton-model-repo
+#   2. Copy Triton configs:
+#        cp -r triton/* /efs/triton-model-repo/
+#   3. Apply this file — uses the official Triton image, no custom build needed:
+#        kubectl apply -f manifests/triton-server-deployment.yaml \
+#            -n nlp-audio-understanding
+#   4. Verify models are loaded:
+#        kubectl exec -n nlp-audio-understanding deploy/triton-inference -- \
+#            curl -s localhost:8000/v2/models | python3 -m json.tool
+#
+# Image note: the official nvcr.io/nvidia/tritonserver image includes the
+# onnxruntime backend for affect/disfluency and the Python backend for emotion.
+# The emotion Python backend installs funasr+modelscope at startup via
+# triton/emotion/1/requirements.txt (takes ~2 min on first pod start).
+# If the emotion ONNX export succeeded, delete triton/emotion/1/model.py and
+# requirements.txt — the Python backend is not needed and startup is instant.
+#
+# Workers connect via gRPC at:  triton-inference.nlp-audio-understanding:8001
+# Workers connect via HTTP at:  triton-inference.nlp-audio-understanding:8000
+#
+# Apply with:  kubectl apply -f manifests/triton-server-deployment.yaml -n nlp-audio-understanding
+# Delete with: kubectl delete -f manifests/triton-server-deployment.yaml -n nlp-audio-understanding
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: triton-inference
+  namespace: nlp-audio-understanding
+  labels:
+    app: triton-inference
+    team: nlp
+    project: audio-understanding
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: triton-inference
+  template:
+    metadata:
+      labels:
+        app: triton-inference
+    spec:
+      # Tolerate GPU nodes
+      tolerations:
+        - key: karpenter
+          operator: Equal
+          value: ai-workers-gpu
+          effect: NoSchedule
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      nodeSelector:
+        # TODO(blackwell): update to match your cluster's Blackwell/L4/L40S node label
+        node.kubernetes.io/instance-type: g7e.2xlarge
+
+      containers:
+        - name: tritonserver
+          image: nvcr.io/nvidia/tritonserver:24.10-py3
+          imagePullPolicy: Always
+
+          command:
+            - tritonserver
+          args:
+            - --model-repository=/efs/triton-model-repo
+            - --log-verbose=1
+            - --grpc-port=8001
+            - --http-port=8000
+            - --metrics-port=8002
+            - --allow-grpc=true
+            - --allow-http=true
+            # Let Triton manage model loading; models are ready before the
+            # service endpoint becomes live.
+            - --model-control-mode=none
+
+          ports:
+            - containerPort: 8000  # HTTP
+              name: http
+            - containerPort: 8001  # gRPC — workers connect here
+              name: grpc
+            - containerPort: 8002  # Prometheus metrics
+              name: metrics
+
+          resources:
+            requests:
+              cpu: "6"
+              memory: "32Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "8"
+              memory: "48Gi"
+              nvidia.com/gpu: "1"
+
+          env:
+            - name: CLEARML_WEB_HOST
+              value: http://clearml-webserver.clearml:8080
+            # Model weights live on EFS — point HF / ModelScope caches there
+            # so the emotion Python backend finds emotion2vec_plus_large at startup.
+            - name: HF_HOME
+              value: /efs/model-cache/huggingface
+            - name: MODELSCOPE_CACHE
+              value: /efs/model-cache/modelscope
+            - name: TORCH_HOME
+              value: /efs/model-cache/torch
+
+          volumeMounts:
+            - name: efs
+              mountPath: /efs
+            - name: dshm
+              mountPath: /dev/shm
+
+          # Gate traffic until Triton reports all three models ready
+          readinessProbe:
+            httpGet:
+              path: /v2/health/ready
+              port: 8000
+            initialDelaySeconds: 60
+            periodSeconds: 10
+            failureThreshold: 12
+          livenessProbe:
+            httpGet:
+              path: /v2/health/live
+              port: 8000
+            initialDelaySeconds: 120
+            periodSeconds: 20
+            failureThreshold: 6
+
+      volumes:
+        - name: efs
+          persistentVolumeClaim:
+            claimName: efs-pvc   # adjust to your cluster's EFS PVC name
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Gi
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: triton-inference
+  namespace: nlp-audio-understanding
+  labels:
+    app: triton-inference
+spec:
+  selector:
+    app: triton-inference
+  type: ClusterIP
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+    - name: grpc
+      port: 8001
+      targetPort: 8001
+    - name: metrics
+      port: 8002
+      targetPort: 8002

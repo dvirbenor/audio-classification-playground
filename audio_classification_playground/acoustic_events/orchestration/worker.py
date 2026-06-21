@@ -429,6 +429,7 @@ def run_worker(
     vad_gating_tasks: tuple[str, ...] = DEFAULT_GATED_TASKS,
     require_precomputed_vad: bool = False,
     seed: int | None = None,
+    triton_url: str | None = None,
 ) -> None:
     """Entry point for a single worker pod.
 
@@ -616,36 +617,56 @@ def run_worker(
         LOGGER.info("Shutdown requested before model loading; exiting early")
         return
 
-    LOGGER.info("Loading persistent inference models…")
-    from ..inference.models import ModelSuite
+    if triton_url is not None:
+        import types
+        from ..inference.triton_predictor import (
+            TritonAffectPredictor,
+            TritonDisfluencyPredictor,
+            TritonEmotionPredictor,
+        )
+        LOGGER.info(
+            "Triton mode: delegating affect/disfluency/emotion inference to %s "
+            "(no local GPU models loaded; workers can run on CPU)",
+            triton_url,
+        )
+        gpu_tasks = set(group.tasks) - {"vad"}
+        models = types.SimpleNamespace(
+            affect=TritonAffectPredictor(triton_url) if "affect" in gpu_tasks else None,
+            disfluency=TritonDisfluencyPredictor(triton_url) if "disfluency" in gpu_tasks else None,
+            emotion=TritonEmotionPredictor(triton_url) if "emotion" in gpu_tasks else None,
+            vad=None,  # VAD stays in-process (Silero VAD, CPU)
+        )
+    else:
+        LOGGER.info("Loading persistent inference models…")
+        from ..inference.models import ModelSuite
 
-    models = ModelSuite(
-        affect_backbone=affect_backbone,
-        disfluency_backbone=disfluency_backbone,
-        batch_size=batch_size,
-        affect_batch_size=batches["affect"],
-        disfluency_batch_size=batches["disfluency"],
-        emotion_batch_size=batches["emotion"],
-        device=device,
-        vad_threshold=vad_threshold,
-        vad_min_speech_sec=vad_min_speech_sec,
-        vad_min_silence_sec=vad_min_silence_sec,
-        load_vad=vad_prefetch_workers == 0 and "vad" in group.tasks,
-        tasks_to_load=group.models,
-        wavlm_autocast_dtype=wavlm_settings.autocast_dtype,
-        wavlm_compile=wavlm_settings.compile_model,
-        wavlm_compile_mode=wavlm_settings.compile_mode,
-        wavlm_compile_dynamic=wavlm_settings.compile_dynamic,
-        wavlm_stream_layer_sum=wavlm_settings.stream_layer_sum,
-        wavlm_static_batch=wavlm_settings.static_batch,
-        wavlm_warmup=wavlm_settings.warmup,
-        wavlm_runtime_preset=wavlm_settings.preset,
-        emotion_autocast_dtype=emotion_autocast_dtype,
-        emotion_compile=emotion_compile,
-        emotion_compile_mode=emotion_compile_mode,
-        emotion_runtime_mode=emotion_runtime_mode,
-        allow_tf32=allow_tf32,
-    )
+        models = ModelSuite(
+            affect_backbone=affect_backbone,
+            disfluency_backbone=disfluency_backbone,
+            batch_size=batch_size,
+            affect_batch_size=batches["affect"],
+            disfluency_batch_size=batches["disfluency"],
+            emotion_batch_size=batches["emotion"],
+            device=device,
+            vad_threshold=vad_threshold,
+            vad_min_speech_sec=vad_min_speech_sec,
+            vad_min_silence_sec=vad_min_silence_sec,
+            load_vad=vad_prefetch_workers == 0 and "vad" in group.tasks,
+            tasks_to_load=group.models,
+            wavlm_autocast_dtype=wavlm_settings.autocast_dtype,
+            wavlm_compile=wavlm_settings.compile_model,
+            wavlm_compile_mode=wavlm_settings.compile_mode,
+            wavlm_compile_dynamic=wavlm_settings.compile_dynamic,
+            wavlm_stream_layer_sum=wavlm_settings.stream_layer_sum,
+            wavlm_static_batch=wavlm_settings.static_batch,
+            wavlm_warmup=wavlm_settings.warmup,
+            wavlm_runtime_preset=wavlm_settings.preset,
+            emotion_autocast_dtype=emotion_autocast_dtype,
+            emotion_compile=emotion_compile,
+            emotion_compile_mode=emotion_compile_mode,
+            emotion_runtime_mode=emotion_runtime_mode,
+            allow_tf32=allow_tf32,
+        )
 
     def _new_vad_detector():
         from ..inference.models import VadDetector

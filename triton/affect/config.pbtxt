@@ -1,0 +1,74 @@
+name: "affect"
+backend: "onnxruntime"
+
+# Maximum batch Triton will dispatch to the ONNX model in one shot.
+# Dynamic batching accumulates requests from concurrent workers up to this
+# size (or until max_queue_delay_microseconds elapses), so GPU utilisation
+# is no longer tied to a single archive's frame count.
+max_batch_size: 256
+
+dynamic_batching {
+  # Triton will form a batch as soon as it reaches one of these sizes, or
+  # after max_queue_delay_microseconds, whichever comes first.
+  preferred_batch_size: [128, 256]
+  # 10 ms — enough to accumulate requests from several concurrent workers
+  # without adding perceptible latency to the per-archive pipeline.
+  max_queue_delay_microseconds: 10000
+}
+
+# Input: one pre-segmented audio window, 3.5 s × 16 kHz = 56 000 samples.
+# Batch dimension is implicit (controlled by max_batch_size above).
+input [
+  {
+    name: "input_values"
+    data_type: TYPE_FP32
+    dims: [56000]
+  }
+]
+
+# Outputs match WavLMWrapper.forward() -> (arousal, valence, dominance),
+# each shape [batch, 1] in the ONNX graph.
+output [
+  {
+    name: "arousal"
+    data_type: TYPE_FP32
+    dims: [1]
+  },
+  {
+    name: "valence"
+    data_type: TYPE_FP32
+    dims: [1]
+  },
+  {
+    name: "dominance"
+    data_type: TYPE_FP32
+    dims: [1]
+  }
+]
+
+instance_group [
+  {
+    kind: KIND_GPU
+    count: 1
+    gpus: [0]
+  }
+]
+
+# Use the FP16 model produced by export_models_onnx.py (_fp16.onnx variant).
+# ONNX Runtime's CUDA EP applies mixed precision automatically — numerically
+# sensitive ops (attention softmax, LayerNorm) stay in FP32, everything else
+# runs on FP16 tensor cores. This is NOT the TensorRT path that caused NaNs;
+# ONNX Runtime doesn't cast indiscriminately.
+# Input/output types remain FP32 (keep_io_types=True at conversion) so neither
+# the Triton config nor the client predictors need to change.
+optimization {
+  execution_accelerators {
+    gpu_execution_accelerator [
+      {
+        name: "cuda"
+        parameters { key: "precision_mode" value: "FP16" }
+        parameters { key: "max_workspace_size_bytes" value: "2147483648" }
+      }
+    ]
+  }
+}

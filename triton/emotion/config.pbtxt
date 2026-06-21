@@ -1,0 +1,42 @@
+name: "emotion"
+backend: "python"
+
+# emotion2vec_plus_large outputs 9 canonical emotion classes.
+# Run `python scripts/export_models_onnx.py --task emotion-probe` to confirm
+# this number if the model version changes.
+max_batch_size: 256
+
+dynamic_batching {
+  preferred_batch_size: [64, 128, 256]
+  # Slightly longer delay for emotion — it's less latency-sensitive and the
+  # Python backend benefits more from larger batches than the ONNX models.
+  max_queue_delay_microseconds: 20000
+}
+
+# Input: one pre-segmented audio window, 3.0 s × 16 kHz = 48 000 samples.
+input [
+  {
+    name: "input_values"
+    data_type: TYPE_FP32
+    dims: [48000]
+  }
+]
+
+# Output: per-window probabilities over the 9 canonical emotion channels,
+# in the order defined by CANONICAL_CHANNELS in producers/emotion/config.py.
+# The Python backend normalises and orders them before returning.
+output [
+  {
+    name: "probabilities"
+    data_type: TYPE_FP32
+    dims: [9]
+  }
+]
+
+instance_group [
+  {
+    kind: KIND_GPU
+    count: 1
+    gpus: [0]
+  }
+]
