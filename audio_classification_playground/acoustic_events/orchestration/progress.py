@@ -39,6 +39,108 @@ TASKS = ("vad", "affect", "disfluency", "emotion")
 _TASKS_SET = frozenset(TASKS)
 _COMPLETE_FILES = frozenset({MANIFEST_FILENAME, PREDICTIONS_FILENAME})
 
+# Per-worker completion logs written by workers after each archive completes.
+# One file per worker avoids any concurrent-write races on NFS/EFS
+# (O_APPEND is not atomic on NFS — lseek+write is not a single syscall).
+# Total progress = sum of line counts across all files in this directory.
+COMPLETIONS_DIR = "_meta/progress_completions"
+
+
+def filter_entities_needing_work(
+    output_base: Path,
+    entities: list,
+    required_tasks: tuple[str, ...],
+    require_vad: bool = False,
+    permanent_errors: set | None = None,
+) -> list:
+    """Return the subset of entities that still have work to do.
+
+    Runs a parallel bulk EFS scan (64 threads) once at startup, then filters
+    in memory — far faster than checking each archive sequentially in the
+    main loop when most archives are already done or VAD-less.
+
+    Args:
+        required_tasks: tasks the worker needs to run (e.g. affect/disfluency/emotion).
+        require_vad: if True, drop archives whose vad/ artifact is not complete.
+        permanent_errors: set of (session_id, archive_id) to exclude.
+    """
+    perm = permanent_errors or set()
+    entity_keys = [
+        (e.session_id, e.archive_id)
+        for e in entities
+        if (e.session_id, e.archive_id) not in perm
+    ]
+
+    LOGGER.info(
+        "Pre-scan: checking %d entities (require_vad=%s, tasks=%s) …",
+        len(entity_keys),
+        require_vad,
+        required_tasks,
+    )
+    completed_map = completed_tasks_for_entity_keys(output_base, entity_keys)
+
+    required_set = frozenset(required_tasks)
+    filtered = []
+    skipped_complete = 0
+    skipped_no_vad = 0
+
+    for entity in entities:
+        key = (entity.session_id, entity.archive_id)
+        if key in perm:
+            continue
+        done = completed_map.get(key, frozenset())
+        if require_vad and "vad" not in done:
+            skipped_no_vad += 1
+            continue
+        if required_set <= done:
+            skipped_complete += 1
+            continue
+        filtered.append(entity)
+
+    LOGGER.info(
+        "Pre-scan done: %d need work, %d already complete, %d missing VAD (skipped)",
+        len(filtered),
+        skipped_complete,
+        skipped_no_vad,
+    )
+    return filtered
+
+
+def record_archive_complete(
+    output_base: Path,
+    session_id: str,
+    archive_id: str,
+    tasks: tuple[str, ...],
+    worker_id: str,
+    ts: str,
+) -> None:
+    """Append one completion record to this worker's progress log.
+
+    Each worker writes only to its own file (keyed by worker_id), so no
+    locking or atomic-append guarantees are needed — safe on EFS/NFS.
+    Silently ignores write errors so a blip never kills a worker.
+    """
+    log_path = output_base / COMPLETIONS_DIR / f"{worker_id}.jsonl"
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        line = (
+            json.dumps(
+                {
+                    "session_id": session_id,
+                    "archive_id": archive_id,
+                    "tasks": list(tasks),
+                    "worker_id": worker_id,
+                    "ts": ts,
+                },
+                separators=(",", ":"),
+            )
+            + "\n"
+        )
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(line)
+    except OSError:
+        pass
+
 # ---------------------------------------------------------------------------
 # Dataclasses
 # ---------------------------------------------------------------------------

@@ -72,9 +72,11 @@ from .manifest import ArchiveEntity, load_manifest, sort_manifest_by_session
 from .prefetch import PrefetchResult, Prefetcher
 from .progress import (
     are_tasks_complete_by_artifact,
+    filter_entities_needing_work,
     incomplete_tasks_by_artifact,
     is_task_artifact_complete_for_archive,
     is_task_complete_for_config,
+    record_archive_complete,
 )
 from .task_groups import (
     COMPLETION_POLICY_CONFIG,
@@ -573,6 +575,14 @@ def run_worker(
     LOGGER.info("Loading manifest from %s", parquet_path)
     entities = load_manifest(parquet_path)
     permanent_errors = load_permanent_error_set(output_base)
+    if not force_recompute:
+        entities = filter_entities_needing_work(
+            output_base,
+            entities,
+            required_tasks=group.tasks,
+            require_vad=enforce_vad_present,
+            permanent_errors=permanent_errors,
+        )
     inference_attempts = load_inference_attempt_counts(
         output_base,
         task_group=None if group.name == TASK_GROUP_ALL else group.name,
@@ -1087,6 +1097,10 @@ def run_worker(
 
                 _release(entity)
                 claim_released = True
+                record_archive_complete(
+                    output_base, sid, aid, tasks_to_run, worker_id,
+                    datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                )
                 processed += 1
                 if processed % 50 == 0:
                     LOGGER.info(

@@ -99,9 +99,9 @@ experiments:
         # Verify Triton server is reachable before starting the main loop
         echo "Checking Triton server at ${TRITON_URL} …"
         python - <<'PYEOF'
-        import tritonclient.grpc as grpcclient, sys
+        import tritonclient.grpc as grpcclient, os, sys
         try:
-            c = grpcclient.InferenceServerClient(url="$TRITON_URL", verbose=False)
+            c = grpcclient.InferenceServerClient(url=os.environ["TRITON_URL"], verbose=False)
             if not c.is_server_ready():
                 print("ERROR: Triton server is not ready", file=sys.stderr)
                 sys.exit(1)

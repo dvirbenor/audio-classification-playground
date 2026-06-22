@@ -18,14 +18,14 @@
 #   - VAD already computed for the archives, under the SAME --output tree
 #     (<output>/<session>/<archive>/vad/); archives without vad/ are skipped.
 #
-# Launch:
+# Launch (single Job, N pods — preferred):
 #   experiment-launcher launch manifests/acoustic-events-triton-backfill.yaml \
-#       --template ./manifests/job-template-with-github-ssh.yaml
+#       --template ./manifests/job-template-triton-workers-parallel.yaml
 #
-# Scale by editing grid.run_id (one Job per id). Each pod is an independent
-# worker claiming archives from the shared manifest via lock files; with
-# --completion-policy exists it skips archives that already have all three model
-# artifacts, so re-launching resumes the backfill.
+# Pod count is set in the template (parallelism/completions). Keep grid.run_id
+# at [1] — workers are interchangeable and coordinate via file locks, so no
+# per-pod work sharding is needed. --completion-policy exists makes re-launching
+# resumable: archives that already have all three model artifacts are skipped.
 config:
   namespace: nlp-audio-understanding
   team: nlp
@@ -107,9 +107,9 @@ experiments:
         # Verify Triton server is reachable before starting the main loop
         echo "Checking Triton server at ${TRITON_URL} …"
         python - <<'PYEOF'
-        import tritonclient.grpc as grpcclient, sys
+        import tritonclient.grpc as grpcclient, os, sys
         try:
-            c = grpcclient.InferenceServerClient(url="$TRITON_URL", verbose=False)
+            c = grpcclient.InferenceServerClient(url=os.environ["TRITON_URL"], verbose=False)
             if not c.is_server_ready():
                 print("ERROR: Triton server is not ready", file=sys.stderr)
                 sys.exit(1)
@@ -143,9 +143,6 @@ experiments:
 
         echo "[$(date -Iseconds)] Finished triton-backfill run ${RUN_ID}"
 
-    # Scale to match Triton GPU throughput. A single g7e.2xlarge (Blackwell)
-    # Triton server sustains ~20-30 concurrent CPU workers before the GPU
-    # saturates and Triton's queue grows. Start ~10, watch triton-inference:8002
-    # /metrics (queue + compute time), and scale up.
+    # Single entry — pod count is parallelism/completions in the template.
     grid:
-      run_id: [1, 2]
+      run_id: [1]

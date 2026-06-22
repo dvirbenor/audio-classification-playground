@@ -1,0 +1,67 @@
+# Job template for Triton CPU workers as a SINGLE multi-pod Job.
+#
+# Unlike job-template-with-github-ssh.yaml (one pod per Job, fanned out by
+# grid:), this sets spec.parallelism/completions so ONE Job runs N identical
+# pods. The launcher deep-copies the template without touching these fields.
+#
+# Safe here because workers are interchangeable: they claim archives via
+# per-archive file locks and loop until no work remains. No run_id-based
+# sharding — N pods under one Job behave exactly like N single-pod Jobs,
+# minus N-1 Job objects to track.
+#
+# POD COUNT = parallelism/completions below. Tune to match Triton GPU
+# throughput — a single g7e.2xlarge sustains ~20-30 workers before the GPU
+# saturates. Start at 10, watch triton-inference:8002/metrics, scale up.
+#
+# Keep the manifest's grid: at a single entry (run_id: [1]) when using this
+# template; pod count is controlled by parallelism/completions here.
+#
+# Launch:
+#   experiment-launcher launch manifests/acoustic-events-triton-backfill.yaml \
+#       --template ./manifests/job-template-triton-workers-parallel.yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: template-job
+  namespace: default
+spec:
+  parallelism: 10
+  completions: 10
+  backoffLimit: 20
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app: ml-experiment
+    spec:
+      restartPolicy: Never
+      terminationGracePeriodSeconds: 600
+      containers:
+        - name: experiment-container
+          image: python:3.11-slim
+          imagePullPolicy: IfNotPresent
+          env: []
+          volumeMounts:
+            - name: ai-efs
+              mountPath: /efs
+            - name: shm
+              mountPath: /dev/shm
+            - name: github-ssh
+              mountPath: /mnt/github-ssh
+              readOnly: true
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+      volumes:
+        - name: ai-efs
+          persistentVolumeClaim:
+            claimName: ai-efs-pvc
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 200Gi
+        - name: github-ssh
+          secret:
+            secretName: audio-playground-github-ssh
+            defaultMode: 256
