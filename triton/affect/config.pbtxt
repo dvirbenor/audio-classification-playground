@@ -61,3 +61,29 @@ instance_group [
 # ONNX Runtime doesn't cast indiscriminately.
 # Input/output types remain FP32 (keep_io_types=True at conversion) so neither
 # the Triton config nor the client predictors need to change.
+
+# --- GPU memory fairness ---------------------------------------------------
+# The three models share one 96 GiB GPU. Without bounding it, ONNX Runtime's
+# CUDA EP arena grabs memory greedily (kNextPowerOfTwo, no limit): the first
+# WavLM model to warm to batch 256 takes ~all of it and the other two OOM
+# (measured 2026-06-22 — emotion at batch >=32, disfluency at 256). This is the
+# memory analog of the per-client SM cap in optimization_research/MPS_OPTIMIZATION.md
+# (there the contended resource was SMs, capped at 40% each; here it is memory).
+#   * gpu_mem_limit — hard per-model arena ceiling (30 GiB; affect has the
+#       largest 56 000-sample window). Sum across models < 96 GiB with headroom.
+#   * cudnn_conv_use_max_workspace 0 — stop cuDNN reserving a huge conv
+#       workspace (the ~7.5 GB transient that triggered the OOM).
+#   * arena_extend_strategy kSameAsRequested — grow by exactly what is needed
+#       instead of rounding up to the next power of two.
+optimization {
+  execution_accelerators {
+    gpu_execution_accelerator [
+      {
+        name: "cuda"
+        parameters { key: "gpu_mem_limit" value: "32212254720" }
+        parameters { key: "cudnn_conv_use_max_workspace" value: "0" }
+        parameters { key: "arena_extend_strategy" value: "kSameAsRequested" }
+      }
+    ]
+  }
+}

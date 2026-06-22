@@ -46,3 +46,22 @@ instance_group [
 
 # FP16 weights (Conv kept FP32 by the exporter) run on FP16 tensor cores via the
 # ONNX Runtime CUDA EP — same approach as affect/disfluency.
+
+# --- GPU memory fairness ---------------------------------------------------
+# Per-model ONNX Runtime CUDA arena cap so the three co-hosted models coexist
+# on the shared 96 GiB GPU. See triton/affect/config.pbtxt for the full
+# rationale. 22 GiB — emotion2vec's working set is smaller than the WavLM
+# models', so it gets the smallest budget; the cudnn workspace cap also fixes
+# its Conv-node OOM.
+optimization {
+  execution_accelerators {
+    gpu_execution_accelerator [
+      {
+        name: "cuda"
+        parameters { key: "gpu_mem_limit" value: "23622320128" }
+        parameters { key: "cudnn_conv_use_max_workspace" value: "0" }
+        parameters { key: "arena_extend_strategy" value: "kSameAsRequested" }
+      }
+    ]
+  }
+}

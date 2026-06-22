@@ -39,3 +39,21 @@ instance_group [
   }
 ]
 
+# --- GPU memory fairness ---------------------------------------------------
+# Per-model ONNX Runtime CUDA arena cap so the three co-hosted models coexist
+# on the shared 96 GiB GPU instead of the first WavLM model grabbing it all.
+# See triton/affect/config.pbtxt for the full rationale (memory analog of the
+# MPS per-client SM cap). 28 GiB (48 000-sample window).
+optimization {
+  execution_accelerators {
+    gpu_execution_accelerator [
+      {
+        name: "cuda"
+        parameters { key: "gpu_mem_limit" value: "30064771072" }
+        parameters { key: "cudnn_conv_use_max_workspace" value: "0" }
+        parameters { key: "arena_extend_strategy" value: "kSameAsRequested" }
+      }
+    ]
+  }
+}
+

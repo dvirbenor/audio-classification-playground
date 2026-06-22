@@ -1,0 +1,131 @@
+# One-shot Triton throughput benchmark (CPU pod, single Job).
+#
+# Measures windows/second on the *deployed* Triton server the same way
+# OPTIMIZATION_REPORT.md reports it, but for the hosted path: a CPU client
+# decodes real archives, frames them into windows, and streams them to Triton
+# over gRPC across a concurrency sweep (so Triton's dynamic batcher fills the
+# GPU — the cross-archive batching a single sequential client can't show).
+# Reports client win/s, server-side compute win/s, realized dynamic-batch size
+# and queue delay per task, plus a blended all-three-tasks-at-once run.
+#
+# PREREQUISITES:
+#   - Triton server running with the per-model GPU memory caps (triton/*/config.pbtxt,
+#     published to s3://riverside-build-assets/paralinguistics). Restart the
+#     server after publishing so it picks them up, else the WavLM models OOM.
+#   - scripts/benchmark_triton_throughput.py committed on the cloned branch.
+#
+# Launch:
+#   experiment-launcher launch manifests/acoustic-events-triton-benchmark.yaml \
+#       --template ./manifests/job-template-with-github-ssh.yaml
+#
+# Results print to the pod log and are written to
+#   $OUTPUT/triton-bench/triton_throughput_<run_id>.json on EFS.
+config:
+  namespace: nlp-audio-understanding
+  team: nlp
+  project: audio-understanding
+  image: 690765672468.dkr.ecr.us-east-1.amazonaws.com/ml-dev-containers:cpu-1.0.6
+  capacityType: on-demand
+  env:
+    CLEARML_WEB_HOST: http://clearml-webserver.clearml:8080
+    CLEARML_API_HOST: http://clearml-apiserver.clearml:8008
+    CLEARML_FILES_HOST: https://clearml-fileserver.ai-dev.riverside.fm
+    RS_OWNER: arno
+  ebs:
+    enabled: false
+  s3Access:
+    enabled: true
+
+experiments:
+  - name: inference-triton-benchmark
+    category: inference
+    description: >
+      Windows/second throughput benchmark against the deployed Triton server
+      (triton-inference.nlp-audio-understanding:8001): concurrency sweep per
+      task + blended all-three run, with server-side compute stats.
+    instanceTypes:
+      - c6a.4xlarge
+      - c7a.4xlarge
+      - c6i.4xlarge
+      - c7i.4xlarge
+    ephemeralStorage: "20Gi"
+    resources:
+      requests:
+        cpu: "13"
+        memory: "24Gi"
+      limits:
+        cpu: "14"
+        memory: "28Gi"
+    cmd: /bin/bash
+    args:
+      - -lc
+      - |
+        set -euo pipefail
+
+        export RUN_ID="{run_id}"
+        export PYTHONUNBUFFERED=1
+        export UV_LINK_MODE=copy
+
+        export PARQUET="/efs/dvir/data/magic-clips-research/dataset-reference/all_archives.parquet"
+        export OUTPUT="/efs/dvir/data/magic-clips-research/acoustic-understanding/scratch/triton-bench"
+        export TRITON_URL="triton-inference.nlp-audio-understanding:8001"
+
+        # How much load to apply (override per launch by editing here).
+        export N_ARCHIVES=8
+        export CONCURRENCY="1,4,8,16,24"
+        export WINDOWS_PER_TASK=40000
+
+        mkdir -p "$OUTPUT"
+        LOG_FILE="$OUTPUT/triton-bench-${RUN_ID}-${HOSTNAME:-unknown}.log"
+        exec > >(tee -a "$LOG_FILE") 2>&1
+        echo "[$(date -Iseconds)] Starting triton benchmark run ${RUN_ID}"
+
+        mkdir -p /tmp/workspace/.ssh
+        cp /mnt/github-ssh/id_ed25519 /tmp/workspace/.ssh/id_ed25519
+        cp /mnt/github-ssh/known_hosts /tmp/workspace/.ssh/known_hosts
+        chmod 700 /tmp/workspace/.ssh
+        chmod 400 /tmp/workspace/.ssh/id_ed25519
+        chmod 444 /tmp/workspace/.ssh/known_hosts
+        export GIT_SSH_COMMAND="ssh -i /tmp/workspace/.ssh/id_ed25519 -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=/tmp/workspace/.ssh/known_hosts"
+
+        cd /tmp/workspace
+        rm -rf audio-classification-playground
+        git clone --branch feature/inference-optimization --single-branch \
+            git@github.com:dvirbenor/audio-classification-playground.git
+        cd audio-classification-playground
+        echo "Git commit: $(git rev-parse HEAD)"
+        uv sync --frozen
+        uv pip install 'tritonclient[grpc]'
+        source .venv/bin/activate
+
+        # Verify the server is reachable + all models READY before benchmarking.
+        python - <<'PYEOF'
+        import tritonclient.grpc as g, sys
+        c = g.InferenceServerClient(url="triton-inference.nlp-audio-understanding:8001")
+        if not c.is_server_ready():
+            print("ERROR: Triton not ready", file=sys.stderr); sys.exit(1)
+        print("models:", [m.name for m in c.get_model_repository_index().models])
+        PYEOF
+
+        # Fetch N real archives from the manifest (skips Glacier, retries).
+        python scripts/retrieve_benchmark_audio.py \
+            --parquet "$PARQUET" --n "$N_ARCHIVES" --out-dir benchmark_audio
+
+        # 1) per-task concurrency sweep (isolated)
+        python scripts/benchmark_triton_throughput.py \
+            --url "$TRITON_URL" --index benchmark_audio/index.json \
+            --concurrency "$CONCURRENCY" --windows-per-task "$WINDOWS_PER_TASK" \
+            --json-out "$OUTPUT/triton_throughput_${RUN_ID}.json"
+
+        # 2) blended: all three tasks hammering the one GPU at once
+        python scripts/benchmark_triton_throughput.py \
+            --url "$TRITON_URL" --index benchmark_audio/index.json \
+            --blended --concurrency 8,16 --windows-per-task "$WINDOWS_PER_TASK" \
+            --json-out "$OUTPUT/triton_throughput_blended_${RUN_ID}.json"
+
+        echo "[$(date -Iseconds)] Finished triton benchmark run ${RUN_ID}"
+
+    # One pod is enough to characterize the server (the in-pod concurrency sweep
+    # already drives the dynamic batcher). Raise to launch parallel client pods.
+    grid:
+      run_id: [1]
