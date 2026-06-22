@@ -1,0 +1,138 @@
+# EPHEMERAL Triton server for the throughput speed-test ONLY.
+#
+# A standalone clone of triton-server-deployment.yaml with its own name/Service
+# (triton-bench) so the benchmark runs on a dedicated GPU, isolated from the
+# production server (triton-inference) that the triton-backfill fleet is using.
+# Reading clean numbers off the shared server is impossible while the backfill
+# hammers it — this gives the benchmark its own uncontended GPU.
+#
+# It reads the SAME S3 model repository (s3://riverside-build-assets/paralinguistics),
+# so it picks up the per-model GPU-memory caps. A fresh boot here also validates
+# the cap: idle memory should be LOW (weights + context only), growing to <=80 GiB
+# under the benchmark and never OOMing — unlike the old unbounded arenas.
+#
+# Needs a SECOND g7e.2xlarge GPU (Karpenter provisions one; ~3-5 min). It costs
+# money while up, so TEAR IT DOWN after the test:
+#   kubectl delete -f manifests/triton-bench-deployment.yaml -n nlp-audio-understanding
+#
+# Apply with:  kubectl apply -f manifests/triton-bench-deployment.yaml -n nlp-audio-understanding
+# Workers/benchmark reach it at:  triton-bench.nlp-audio-understanding:8001 (gRPC) / :8000 (HTTP)
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: triton-bench
+  namespace: nlp-audio-understanding
+  labels:
+    app: triton-bench
+    team: nlp
+    project: audio-understanding
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: triton-bench
+  template:
+    metadata:
+      labels:
+        app: triton-bench
+    spec:
+      tolerations:
+        - key: karpenter
+          operator: Equal
+          value: ai-workers-gpu
+          effect: NoSchedule
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      nodeSelector:
+        # g7e nodes are Blackwell (sm_120) — matches the CUDA 12.8+ Triton image.
+        node.kubernetes.io/instance-type: g7e.2xlarge
+
+      containers:
+        - name: tritonserver
+          image: nvcr.io/nvidia/tritonserver:25.05-py3
+          imagePullPolicy: Always
+          command:
+            - tritonserver
+          args:
+            - --model-repository=s3://riverside-build-assets/paralinguistics
+            - --log-verbose=1
+            - --grpc-port=8001
+            - --http-port=8000
+            - --metrics-port=8002
+            - --allow-grpc=true
+            - --allow-http=true
+            - --model-control-mode=none
+
+          ports:
+            - containerPort: 8000
+              name: http
+            - containerPort: 8001
+              name: grpc
+            - containerPort: 8002
+              name: metrics
+
+          resources:
+            requests:
+              cpu: "6"
+              memory: "32Gi"
+              nvidia.com/gpu: "1"
+              ephemeral-storage: "4Gi"
+            limits:
+              cpu: "8"
+              memory: "48Gi"
+              nvidia.com/gpu: "1"
+              ephemeral-storage: "8Gi"
+
+          env:
+            - name: AWS_DEFAULT_REGION
+              value: us-east-1
+
+          volumeMounts:
+            - name: dshm
+              mountPath: /dev/shm
+
+          readinessProbe:
+            httpGet:
+              path: /v2/health/ready
+              port: 8000
+            initialDelaySeconds: 90
+            periodSeconds: 10
+            failureThreshold: 18
+          livenessProbe:
+            httpGet:
+              path: /v2/health/live
+              port: 8000
+            initialDelaySeconds: 240
+            periodSeconds: 20
+            failureThreshold: 6
+
+      volumes:
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Gi
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: triton-bench
+  namespace: nlp-audio-understanding
+  labels:
+    app: triton-bench
+spec:
+  selector:
+    app: triton-bench
+  type: ClusterIP
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+    - name: grpc
+      port: 8001
+      targetPort: 8001
+    - name: metrics
+      port: 8002
+      targetPort: 8002
