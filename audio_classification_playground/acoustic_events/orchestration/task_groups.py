@@ -10,6 +10,7 @@ TASK_GROUP_DISFLUENCY = "disfluency"
 TASK_GROUP_EMOTION = "emotion"
 TASK_GROUP_VAD = "vad"
 TASK_GROUP_EMOTION_VAD = "emotion-vad"
+TASK_GROUP_MODELS = "models"
 
 COMPLETION_POLICY_EXISTS = "exists"
 COMPLETION_POLICY_CONFIG = "config"
@@ -87,6 +88,24 @@ TASK_GROUPS: dict[str, TaskGroup] = {
         prefetch_lookahead=12,
         prefetch_workers=8,
         vad_prefetch_workers=1,
+    ),
+    # All three model tasks WITHOUT computing VAD (no vad task). For backfilling
+    # the model artifacts when a separate VAD fleet has already populated vad/.
+    # Pair with --vad-gating --require-precomputed-vad: inference is gated on the
+    # EXISTING vad/ artifact (run_all_inference reads intervals_sec from disk),
+    # and archives lacking vad/ are skipped. Note require_precomputed_vad is
+    # honored here precisely because this group does not produce vad itself
+    # (unlike "all"). Whole-archive lock like "all"; pair with
+    # --completion-policy exists to skip done archives.
+    TASK_GROUP_MODELS: TaskGroup(
+        name=TASK_GROUP_MODELS,
+        tasks=("affect", "disfluency", "emotion"),
+        models=("affect", "disfluency", "emotion"),
+        lock_namespaces=None,
+        precompute_vad=False,
+        prefetch_lookahead=8,
+        prefetch_workers=8,
+        vad_prefetch_workers=0,
     ),
 }
 
