@@ -39,14 +39,3 @@ instance_group [
   }
 ]
 
-optimization {
-  execution_accelerators {
-    gpu_execution_accelerator [
-      {
-        name: "cuda"
-        parameters { key: "precision_mode" value: "FP16" }
-        parameters { key: "max_workspace_size_bytes" value: "2147483648" }
-      }
-    ]
-  }
-}

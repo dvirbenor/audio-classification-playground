@@ -71,10 +71,10 @@ spec:
         # CUDA 12.8+ Triton image above. Do not change to L40S/Ada.
         node.kubernetes.io/instance-type: g7e.2xlarge
 
-      # S3 model repository read access is inherited from the pod's existing AWS
-      # authorization (node instance role / pod identity) — no serviceAccount
-      # override needed. Requires s3:GetObject + s3:ListBucket on
+      # IRSA credentials for S3 model repository access.
+      # Requires s3:GetObject + s3:ListBucket on
       # arn:aws:s3:::riverside-build-assets (prefix paralinguistics/*).
+      serviceAccountName: ai-dev-common-access
 
       containers:
         - name: tritonserver

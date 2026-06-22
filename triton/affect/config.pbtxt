@@ -61,14 +61,3 @@ instance_group [
 # ONNX Runtime doesn't cast indiscriminately.
 # Input/output types remain FP32 (keep_io_types=True at conversion) so neither
 # the Triton config nor the client predictors need to change.
-optimization {
-  execution_accelerators {
-    gpu_execution_accelerator [
-      {
-        name: "cuda"
-        parameters { key: "precision_mode" value: "FP16" }
-        parameters { key: "max_workspace_size_bytes" value: "2147483648" }
-      }
-    ]
-  }
-}

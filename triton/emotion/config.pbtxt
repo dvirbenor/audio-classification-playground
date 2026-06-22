@@ -46,14 +46,3 @@ instance_group [
 
 # FP16 weights (Conv kept FP32 by the exporter) run on FP16 tensor cores via the
 # ONNX Runtime CUDA EP — same approach as affect/disfluency.
-optimization {
-  execution_accelerators {
-    gpu_execution_accelerator [
-      {
-        name: "cuda"
-        parameters { key: "precision_mode" value: "FP16" }
-        parameters { key: "max_workspace_size_bytes" value: "2147483648" }
-      }
-    ]
-  }
-}
