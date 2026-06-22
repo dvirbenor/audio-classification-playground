@@ -58,7 +58,11 @@ MODEL_SPECS: dict[str, dict] = {
 }
 
 DEFAULT_MODELS = ["affect", "disfluency", "emotion"]
-DEFAULT_BATCHES = [1, 4, 16, 64, 128, 256]
+# Capped at 64: batch=128/256 fills the ONNX BFC arena on the Triton pod and
+# causes subsequent model sessions to OOM, breaking the next model's warmup.
+# The dynamic batcher accumulates cross-worker windows internally; single-request
+# batch size in production is typically 1–16 windows per worker call.
+DEFAULT_BATCHES = [1, 4, 16, 32, 64]
 DEFAULT_WARMUP = 3
 DEFAULT_REPS = 20
 
@@ -121,16 +125,52 @@ def benchmark_model(
         inp.set_data_from_numpy(np.ascontiguousarray(windows))
         outputs = [grpcclient.InferRequestedOutput(o) for o in spec["outputs"]]
 
-        # Warmup — not timed
+        # Warmup — not timed; skip batch if OOM during warmup too
+        warmup_oom = False
         for _ in range(warmup):
-            client.infer(model_name, inputs=[inp], outputs=outputs)
+            try:
+                client.infer(model_name, inputs=[inp], outputs=outputs)
+            except Exception as exc:
+                msg = str(exc)
+                if "Failed to allocate memory" in msg or "StatusCode.INTERNAL" in msg:
+                    warmup_oom = True
+                    break
+                raise
+        if warmup_oom:
+            results.append({
+                "model": model_name, "batch": batch,
+                "mean_ms": None, "p50_ms": None, "p90_ms": None, "p99_ms": None,
+                "windows_per_s": None, "oom": True,
+            })
+            continue
 
         # Timed runs
         latencies_ms = []
+        oom = False
         for _ in range(reps):
             t0 = time.perf_counter()
-            client.infer(model_name, inputs=[inp], outputs=outputs)
+            try:
+                client.infer(model_name, inputs=[inp], outputs=outputs)
+            except Exception as exc:
+                msg = str(exc)
+                if "Failed to allocate memory" in msg or "StatusCode.INTERNAL" in msg:
+                    oom = True
+                    break
+                raise
             latencies_ms.append((time.perf_counter() - t0) * 1000)
+
+        if oom or not latencies_ms:
+            results.append({
+                "model": model_name,
+                "batch": batch,
+                "mean_ms": None,
+                "p50_ms": None,
+                "p90_ms": None,
+                "p99_ms": None,
+                "windows_per_s": None,
+                "oom": True,
+            })
+            continue
 
         p50 = _percentile(latencies_ms, 50)
         p90 = _percentile(latencies_ms, 90)
@@ -146,6 +186,7 @@ def benchmark_model(
             "p90_ms": p90,
             "p99_ms": p99,
             "windows_per_s": windows_per_s,
+            "oom": False,
         })
 
     return results
@@ -160,6 +201,9 @@ def print_results(all_results: list[dict]) -> None:
         if r["model"] != last_model and last_model is not None:
             print()
         last_model = r["model"]
+        if r.get("oom"):
+            print(f"{r['model']:<12} {r['batch']:>5} {'OOM':>9}")
+            continue
         print(
             f"{r['model']:<12} {r['batch']:>5} "
             f"{r['mean_ms']:>9.1f} {r['p50_ms']:>8.1f} "
@@ -234,25 +278,30 @@ def main() -> None:
         print()
 
     all_results: list[dict] = []
-    for model_name in models:
-        if model_name not in MODEL_SPECS:
-            print(f"WARNING: unknown model '{model_name}', skipping")
-            continue
-        spec = MODEL_SPECS[model_name]
-        print(f"Benchmarking {model_name} — {spec['description']}")
-        print(f"  input: [batch, {spec['window_samples']}] float32 — {spec['window_samples']/16000:.2f}s windows")
-        results = benchmark_model(
-            client, grpcclient, model_name, spec, batch_sizes,
-            warmup=args.warmup, reps=args.reps,
-        )
-        all_results.extend(results)
-        for r in results:
-            print(
-                f"  batch={r['batch']:>4}  mean={r['mean_ms']:.1f}ms  "
-                f"p90={r['p90_ms']:.1f}ms  win/s={r['windows_per_s']:.1f}"
+    try:
+        for model_name in models:
+            if model_name not in MODEL_SPECS:
+                print(f"WARNING: unknown model '{model_name}', skipping")
+                continue
+            spec = MODEL_SPECS[model_name]
+            print(f"Benchmarking {model_name} — {spec['description']}")
+            print(f"  input: [batch, {spec['window_samples']}] float32 — {spec['window_samples']/16000:.2f}s windows")
+            results = benchmark_model(
+                client, grpcclient, model_name, spec, batch_sizes,
+                warmup=args.warmup, reps=args.reps,
             )
-
-    print_results(all_results)
+            all_results.extend(results)
+            for r in results:
+                if r.get("oom"):
+                    print(f"  batch={r['batch']:>4}  OOM — server BFC arena exhausted")
+                else:
+                    print(
+                        f"  batch={r['batch']:>4}  mean={r['mean_ms']:.1f}ms  "
+                        f"p90={r['p90_ms']:.1f}ms  win/s={r['windows_per_s']:.1f}"
+                    )
+    finally:
+        if all_results:
+            print_results(all_results)
 
 
 if __name__ == "__main__":
