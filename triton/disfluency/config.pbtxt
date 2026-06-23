@@ -1,10 +1,12 @@
 name: "disfluency"
 backend: "onnxruntime"
 
+# Batch 256 (production target); memory tamed via the optimization block, not by
+# capping the batch — see triton/affect/config.pbtxt.
 max_batch_size: 256
 
 dynamic_batching {
-  preferred_batch_size: [128, 256]
+  preferred_batch_size: [256]
   max_queue_delay_microseconds: 10000
 }
 
@@ -39,21 +41,25 @@ instance_group [
   }
 ]
 
-# --- GPU memory fairness ---------------------------------------------------
-# Per-model ONNX Runtime CUDA arena cap so the three co-hosted models coexist
-# on the shared 96 GiB GPU instead of the first WavLM model grabbing it all.
-# See triton/affect/config.pbtxt for the full rationale (memory analog of the
-# MPS per-client SM cap). 28 GiB (48 000-sample window).
+# --- Tame ONNX Runtime's GPU memory (mem_pattern off + HEURISTIC + single batch
+# shape) so all three models fit at batch 256. See triton/affect/config.pbtxt
+# for the full rationale; gpu_mem_limit / arena_extend_strategy are ignored by
+# this backend, so we shape ORT's allocator behaviour instead.
 optimization {
   execution_accelerators {
     gpu_execution_accelerator [
       {
         name: "cuda"
-        parameters { key: "gpu_mem_limit" value: "30064771072" }
         parameters { key: "cudnn_conv_use_max_workspace" value: "0" }
-        parameters { key: "arena_extend_strategy" value: "kSameAsRequested" }
+        parameters { key: "cudnn_conv_algo_search" value: "HEURISTIC" }
+        parameters { key: "arena_extend_strategy" value: "1" }
       }
     ]
   }
+}
+
+parameters {
+  key: "enable_mem_pattern"
+  value: { string_value: "0" }
 }
 

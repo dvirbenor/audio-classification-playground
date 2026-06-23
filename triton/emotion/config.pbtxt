@@ -4,10 +4,12 @@ backend: "onnxruntime"
 # emotion2vec_plus_large, exported as a pure-ONNX model by
 # scripts/export_models_onnx.py (DirectEmotion2vecScorer.core: layer-norm +
 # extract_features + mean-pool + proj + masked softmax + label select).
+# Batch 256 (production target); memory tamed via the optimization block, not by
+# capping the batch — see triton/affect/config.pbtxt.
 max_batch_size: 256
 
 dynamic_batching {
-  preferred_batch_size: [64, 128, 256]
+  preferred_batch_size: [256]
   # Slightly longer delay for emotion — it's less latency-sensitive, so a wider
   # window to accumulate a larger batch is a good trade.
   max_queue_delay_microseconds: 20000
@@ -47,21 +49,24 @@ instance_group [
 # FP16 weights (Conv kept FP32 by the exporter) run on FP16 tensor cores via the
 # ONNX Runtime CUDA EP — same approach as affect/disfluency.
 
-# --- GPU memory fairness ---------------------------------------------------
-# Per-model ONNX Runtime CUDA arena cap so the three co-hosted models coexist
-# on the shared 96 GiB GPU. See triton/affect/config.pbtxt for the full
-# rationale. 22 GiB — emotion2vec's working set is smaller than the WavLM
-# models', so it gets the smallest budget; the cudnn workspace cap also fixes
-# its Conv-node OOM.
+# --- Tame ONNX Runtime's GPU memory (mem_pattern off + HEURISTIC + single batch
+# shape) so all three models fit at batch 256. See triton/affect/config.pbtxt
+# for the full rationale. cudnn_conv_use_max_workspace 0 also fixes emotion's
+# Conv-node OOM.
 optimization {
   execution_accelerators {
     gpu_execution_accelerator [
       {
         name: "cuda"
-        parameters { key: "gpu_mem_limit" value: "23622320128" }
         parameters { key: "cudnn_conv_use_max_workspace" value: "0" }
-        parameters { key: "arena_extend_strategy" value: "kSameAsRequested" }
+        parameters { key: "cudnn_conv_algo_search" value: "HEURISTIC" }
+        parameters { key: "arena_extend_strategy" value: "1" }
       }
     ]
   }
+}
+
+parameters {
+  key: "enable_mem_pattern"
+  value: { string_value: "0" }
 }

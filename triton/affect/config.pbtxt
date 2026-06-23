@@ -2,15 +2,16 @@ name: "affect"
 backend: "onnxruntime"
 
 # Maximum batch Triton will dispatch to the ONNX model in one shot.
-# Dynamic batching accumulates requests from concurrent workers up to this
-# size (or until max_queue_delay_microseconds elapses), so GPU utilisation
-# is no longer tied to a single archive's frame count.
+# Restored to 256 (production target). Memory is kept in check not by capping
+# the batch but by taming ONNX Runtime's allocator (see the optimization block):
+# mem_pattern off + a single fixed batch shape + HEURISTIC conv search, so ORT
+# sits near its true ~15 GiB working set instead of ballooning to ~85 GiB.
 max_batch_size: 256
 
 dynamic_batching {
-  # Triton will form a batch as soon as it reaches one of these sizes, or
-  # after max_queue_delay_microseconds, whichever comes first.
-  preferred_batch_size: [128, 256]
+  # Single preferred size → bias the batcher toward uniform 256-window batches,
+  # minimising the number of distinct input shapes ORT's arena has to retain.
+  preferred_batch_size: [256]
   # 10 ms — enough to accumulate requests from several concurrent workers
   # without adding perceptible latency to the per-archive pipeline.
   max_queue_delay_microseconds: 10000
@@ -62,28 +63,37 @@ instance_group [
 # Input/output types remain FP32 (keep_io_types=True at conversion) so neither
 # the Triton config nor the client predictors need to change.
 
-# --- GPU memory fairness ---------------------------------------------------
-# The three models share one 96 GiB GPU. Without bounding it, ONNX Runtime's
-# CUDA EP arena grabs memory greedily (kNextPowerOfTwo, no limit): the first
-# WavLM model to warm to batch 256 takes ~all of it and the other two OOM
-# (measured 2026-06-22 — emotion at batch >=32, disfluency at 256). This is the
-# memory analog of the per-client SM cap in optimization_research/MPS_OPTIMIZATION.md
-# (there the contended resource was SMs, capped at 40% each; here it is memory).
-#   * gpu_mem_limit — hard per-model arena ceiling (30 GiB; affect has the
-#       largest 56 000-sample window). Sum across models < 96 GiB with headroom.
-#   * cudnn_conv_use_max_workspace 0 — stop cuDNN reserving a huge conv
-#       workspace (the ~7.5 GB transient that triggered the OOM).
-#   * arena_extend_strategy kSameAsRequested — grow by exactly what is needed
-#       instead of rounding up to the next power of two.
+# --- Tame ONNX Runtime's GPU memory so all three fit at batch 256 -----------
+# ONNX/ORT used ~85 GiB for one batch-256 WavLM forward vs ~15 GiB for the same
+# model in PyTorch (the MPS path) — a serving-allocator problem, not the model.
+# The CUDA BFC arena never releases memory and fragments across the *varying*
+# batch shapes the dynamic batcher produces; mem_pattern pre-allocates a big
+# buffer per shape; and EXHAUSTIVE conv search grabs large workspaces the arena
+# then keeps. gpu_mem_limit / arena_extend_strategy are NOT honored by this
+# backend (25.05) — verified in the verbose startup log — so instead we make ORT
+# behave like the static PyTorch path:
+#   * enable_mem_pattern 0 (session option, below) — no per-shape pre-allocation.
+#   * single preferred_batch_size 256 (above) — minimise distinct input shapes.
+#   * cudnn_conv_algo_search HEURISTIC — skip EXHAUSTIVE's workspace-hungry
+#       search (also removes a slow-first-inference prod anti-pattern).
+#   * cudnn_conv_use_max_workspace 0 — cap the conv workspace (honored).
+#   * arena_extend_strategy 1 — kSameAsRequested retry (harmless if still ignored).
+# Confirm in the log: Session Options should show enable_mem_pattern:0, and the
+# CUDA EP line cudnn_conv_algo_search=HEURISTIC.
 optimization {
   execution_accelerators {
     gpu_execution_accelerator [
       {
         name: "cuda"
-        parameters { key: "gpu_mem_limit" value: "32212254720" }
         parameters { key: "cudnn_conv_use_max_workspace" value: "0" }
-        parameters { key: "arena_extend_strategy" value: "kSameAsRequested" }
+        parameters { key: "cudnn_conv_algo_search" value: "HEURISTIC" }
+        parameters { key: "arena_extend_strategy" value: "1" }
       }
     ]
   }
+}
+
+parameters {
+  key: "enable_mem_pattern"
+  value: { string_value: "0" }
 }

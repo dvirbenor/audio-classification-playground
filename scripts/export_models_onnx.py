@@ -88,6 +88,7 @@ def export_affect(output_dir: Path, device: str, opset: int) -> None:
         "valence": v_pt.cpu().float().numpy(),
         "dominance": d_pt.cpu().float().numpy(),
     }, atol=1e-2)
+    _validate_batch_shapes(out_path, AFFECT_WINDOW_SAMPLES)
 
 
 # ---------------------------------------------------------------------------
@@ -154,11 +155,45 @@ def export_disfluency(output_dir: Path, device: str, opset: int) -> None:
         "fluency_logits": f_pt.cpu().float().numpy(),
         "disfluency_type_logits": d_pt.cpu().float().numpy(),
     }, atol=1e-2, rtol=1e-3)
+    _validate_batch_shapes(out_path, DISFLUENCY_WINDOW_SAMPLES)
 
 
 # ---------------------------------------------------------------------------
 # Emotion — ONNX export attempt with graceful fallback
 # ---------------------------------------------------------------------------
+
+def _make_export_alibi(fold):
+    """Build a cache-free, batch-symbolic replacement for funasr's get_alibi_bias.
+
+    The stock get_alibi_bias (funasr/models/emotion2vec/base.py) caches a
+    ``[heads*batch_size, T, T]`` tensor in a dict and branches on its size. Both
+    bake the trace-time batch (``heads*VALIDATION_BATCH`` = 64) into the graph,
+    and the dict mutation + data-dependent branch are untraceable by torch.export
+    (it raised ConstraintViolationError on batch_size; the legacy tracer baked it).
+    This recomputes the identical bias with no cache and no branch, so
+    ``batch_size`` stays a symbolic dim under the dynamo exporter — which also
+    keeps the attention's ``bsz*num_heads`` reshapes dynamic.
+
+    ``fold`` is the pre-clamped ``alibi_scale.squeeze(0)`` (or None). When set, it
+    is multiplied into the bias here so the caller's ``alibi_scale.clamp_min(0)``
+    branch can be disabled — that ``clamp_min`` crashes torch.onnx's type-promotion
+    pass. Folding it in is exactly what contextualized_features does in the
+    ``alibi_scale.size(0) == 1`` path (which then sets ``alibi_scale = None``), so
+    the result is numerically identical.
+    """
+    from funasr.models.emotion2vec.base import get_alibi
+
+    def _alibi(batch_size, time_steps, heads, dtype, device, dims=1, distance="manhattan"):
+        base = get_alibi(time_steps, heads, dims=dims, distance=distance).to(
+            dtype=dtype, device=device
+        )
+        out = base.repeat(batch_size, 1, 1).view(batch_size, heads, time_steps, time_steps)
+        if fold is not None:
+            out = out * fold.to(dtype=out.dtype, device=out.device)
+        return out
+
+    return _alibi
+
 
 def export_emotion(output_dir: Path, device: str, opset: int) -> bool:
     """Export emotion2vec to ONNX as a single pure-ONNX model. Returns True.
@@ -216,24 +251,57 @@ def export_emotion(output_dir: Path, device: str, opset: int) -> bool:
     core = scorer.core.eval()
     dummy_np = np.random.randn(VALIDATION_BATCH, EMOTION_WINDOW_SAMPLES).astype(np.float32)
     dummy_t = torch.from_numpy(dummy_np).to(scorer.device)
-    with torch.inference_mode():
+    # no_grad, NOT inference_mode: the first forward caches an alibi tensor on the
+    # encoder; inference-mode tensors then can't be consumed by the export tracer
+    # ("Inference tensors cannot be saved for backward").
+    with torch.no_grad():
         ref = core(dummy_t).detach().cpu().float().numpy()
     print(f"[emotion] core output: shape={ref.shape}  rows sum to ~{float(ref.sum(axis=1).mean()):.4f}")
 
+    # Make emotion2vec exportable with a dynamic batch. Two model-side blockers:
+    #  1. get_alibi_bias() caches a [heads*batch_size, T, T] tensor in a dict and
+    #     branches on it — baking the trace batch (heads*VALIDATION_BATCH = 64) and
+    #     defeating both exporters (legacy tracer bakes it; torch.export raised
+    #     ConstraintViolationError on the cache branch).
+    #  2. contextualized_features does `alibi_scale = alibi_scale.clamp_min(0)`,
+    #     which crashes torch.onnx's type-promotion decomposition pass.
+    # Fix both: install a cache-free, batch-symbolic alibi on every encoder, and
+    # fold the (clamped) alibi_scale into it so the clamp_min branch can be
+    # disabled by nulling alibi_scale. This mirrors the model's own size(0)==1
+    # path exactly, so it is numerically identical (verified by _validate below).
+    n_alibi = n_folded = 0
+    for m in core.modules():
+        if getattr(m, "get_alibi_bias", None) is None:
+            continue
+        fold = None
+        scale = getattr(m, "alibi_scale", None)
+        if scale is not None:
+            clamped = scale.detach().clamp_min(0)
+            if clamped.size(0) == 1:
+                fold = clamped.squeeze(0)
+                m.alibi_scale = None  # skip the clamp_min branch in forward
+                n_folded += 1
+            else:
+                print(f"[emotion] WARN: alibi_scale.size(0)={clamped.size(0)} != 1 on "
+                      f"{type(m).__name__}; clamp_min NOT folded — export may still hit it")
+        m.get_alibi_bias = _make_export_alibi(fold)
+        n_alibi += 1
+    print(f"[emotion] export-safe alibi on {n_alibi} module(s); clamp_min folded on {n_folded}")
+
     out_path = output_dir / "emotion" / "1" / "model.onnx"
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    from torch.export import Dim
+
+    batch = Dim("batch_size", min=1, max=4096)
     torch.onnx.export(
         core,
         (dummy_t,),
         str(out_path),
         input_names=["input_values"],
         output_names=["scores"],
-        dynamic_axes={
-            "input_values": {0: "batch_size"},
-            "scores": {0: "batch_size"},
-        },
+        dynamic_shapes=({0: batch},),
         opset_version=opset,
-        do_constant_folding=True,
+        dynamo=True,
     )
     print(f"[emotion] exported → {out_path}")
     _validate(out_path, inputs={"input_values": dummy_np},
@@ -241,6 +309,10 @@ def export_emotion(output_dir: Path, device: str, opset: int) -> bool:
     out_path = _convert_fp16(out_path)
     _validate(out_path, inputs={"input_values": dummy_np},
               expected={"scores": ref}, atol=5e-2)
+    # Guard against batch-fragile graphs: the dynamic batch axis is worthless if
+    # a baked-in reshape only works at the export batch. Exercise several real
+    # batch sizes (Triton serves up to 256) before trusting the model.
+    _validate_batch_shapes(out_path, EMOTION_WINDOW_SAMPLES)
     print("[emotion] ✓ ONNX export + validation passed.")
     return True
 
@@ -347,6 +419,45 @@ def _validate(
             "If this is a precision issue try exporting in FP32 (no autocast)."
         )
     print(f"  validation passed ✓")
+
+
+def _validate_batch_shapes(
+    onnx_path: Path, window_samples: int, batches=(1, 3, 7, 64, 256)
+) -> None:
+    """Run the model at several batch sizes to catch batch-fragile exports.
+
+    ``_validate`` only checks the single ``VALIDATION_BATCH`` shape, so it cannot
+    see a graph that hard-codes a trace-time dimension (e.g. an attention reshape
+    baked to the export batch by constant folding) — such a graph passes
+    validation yet fails on every other batch at serving time, which is exactly
+    how the emotion model shipped broken (0 prod inferences). This asserts the
+    graph actually executes across batch sizes; numerical correctness is still
+    ``_validate``'s job.
+    """
+    try:
+        import onnxruntime as ort
+    except ImportError:
+        print("  [skip] onnxruntime not installed — skipping batch-shape validation")
+        return
+
+    sess = ort.InferenceSession(
+        str(onnx_path),
+        providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
+    )
+    in_name = sess.get_inputs()[0].name
+    for b in batches:
+        x = np.random.randn(b, window_samples).astype(np.float32)
+        try:
+            sess.run(None, {in_name: x})
+        except Exception as e:
+            raise RuntimeError(
+                f"{onnx_path.name} runs at the export batch but FAILS at batch {b}. "
+                f"The graph is batch-fragile — almost always a reshape with a "
+                f"trace-time dim baked in by constant folding. Re-export with "
+                f"do_constant_folding=False.\n  ORT error: {e}"
+            ) from e
+        print(f"  [OK  ] batch {b}: ran")
+    print("  batch-shape validation passed ✓ (generalises across batch sizes)")
 
 
 # ---------------------------------------------------------------------------
