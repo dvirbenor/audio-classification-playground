@@ -1,0 +1,20 @@
+# TensorRT serving config for affect — canonical source for the .plan model repo.
+# scripts/build_trt_engines.sh copies this to <repo>/affect/config.pbtxt next to
+# the built model.plan, then publishes to s3://riverside-build-assets/paralinguistics-trt.
+#
+# Serves the mixed-precision engine (fp16 + Softmax/Norm pinned fp32; see
+# scripts/build_trt_engine.py). The .plan is Blackwell sm_120 + TRT 10.10 locked —
+# serve with tritonserver:25.05 on a g7e (manifests/triton-trt-deployment.yaml).
+# No optimization/enable_mem_pattern block (those are ONNX-Runtime knobs); TRT
+# manages its own memory.
+name: "affect"
+platform: "tensorrt_plan"
+max_batch_size: 128
+dynamic_batching { preferred_batch_size: [128] max_queue_delay_microseconds: 10000 }
+input  [ { name: "input_values" data_type: TYPE_FP32 dims: [56000] } ]
+output [
+  { name: "arousal"   data_type: TYPE_FP32 dims: [1] },
+  { name: "valence"   data_type: TYPE_FP32 dims: [1] },
+  { name: "dominance" data_type: TYPE_FP32 dims: [1] }
+]
+instance_group [ { kind: KIND_GPU count: 1 gpus: [0] } ]

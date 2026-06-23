@@ -279,3 +279,10 @@ benchmark_audio/index.json
 scratch/
 # Generated Triton model directory (ONNX weights + copied configs) — build artifact, never commit
 triton-model-repo/
+# TRT file
+*.plan
+# TRT model repo (built engines + copied configs) — build artifact, never commit
+triton-trt-repo/
+# Triton benchmark result dumps written to repo root (regenerable via
+# scripts/benchmark_triton_throughput.py --json-out)
+triton_*.json

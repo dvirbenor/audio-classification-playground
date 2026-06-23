@@ -1,0 +1,139 @@
+# Triton Inference Server serving the mixed-precision TensorRT engines.
+#
+# Same shape as triton-server-deployment.yaml but serves .plan engines
+# (platform: tensorrt_plan) from a SEPARATE S3 model repo, for ~2.5-3x the
+# ONNX/ORT throughput (measured on Blackwell: affect 1539 / disfluency 1742 /
+# emotion 3003 win/s at batch 128 — vs ORT 588 / 705 / 977).
+#
+# *** HARD CONSTRAINT: the engines are architecture + TRT-version locked. ***
+# They were built on the Blackwell RTX PRO 6000 (sm_120) with TensorRT 10.10
+# (scripts/build_trt_engine.py, from fold-constant'd ONNX). They ONLY load on:
+#   - a Blackwell sm_120 GPU (the g7e nodeSelector below), AND
+#   - the tritonserver:25.05-py3 image (TRT 10.10). If you bump the image, the
+#     TRT version changes and the engines won't deserialize — rebuild them.
+#
+# Models: s3://riverside-build-assets/paralinguistics-trt/{affect,disfluency,emotion}/1/model.plan
+# Publish:  aws s3 sync /efs/arno/triton-trt-repo s3://riverside-build-assets/paralinguistics-trt
+# Apply:    kubectl apply -f manifests/triton-trt-deployment.yaml -n nlp-audio-understanding
+# Workers reach it at:  triton-trt.nlp-audio-understanding:8001 (gRPC) / :8000 (HTTP)
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: triton-trt
+  namespace: nlp-audio-understanding
+  labels:
+    app: triton-trt
+    team: nlp
+    project: audio-understanding
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: triton-trt
+  template:
+    metadata:
+      labels:
+        app: triton-trt
+    spec:
+      tolerations:
+        - key: karpenter
+          operator: Equal
+          value: ai-workers-gpu
+          effect: NoSchedule
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      nodeSelector:
+        # Blackwell sm_120 — REQUIRED, the .plan engines are built for this arch.
+        node.kubernetes.io/instance-type: g7e.2xlarge
+
+      containers:
+        - name: tritonserver
+          # MUST be the image the engines were built against (TRT 10.10).
+          image: nvcr.io/nvidia/tritonserver:25.05-py3
+          imagePullPolicy: Always
+          command:
+            - tritonserver
+          args:
+            - --model-repository=s3://riverside-build-assets/paralinguistics-trt
+            - --log-verbose=1
+            - --grpc-port=8001
+            - --http-port=8000
+            - --metrics-port=8002
+            - --allow-grpc=true
+            - --allow-http=true
+            - --model-control-mode=none
+
+          ports:
+            - containerPort: 8000
+              name: http
+            - containerPort: 8001
+              name: grpc
+            - containerPort: 8002
+              name: metrics
+
+          resources:
+            requests:
+              cpu: "6"
+              memory: "32Gi"
+              nvidia.com/gpu: "1"
+              # ~1.6 GB of .plan localised from S3 + TRT runtime scratch.
+              ephemeral-storage: "6Gi"
+            limits:
+              cpu: "8"
+              memory: "48Gi"
+              nvidia.com/gpu: "1"
+              ephemeral-storage: "10Gi"
+
+          env:
+            - name: AWS_DEFAULT_REGION
+              value: us-east-1
+
+          volumeMounts:
+            - name: dshm
+              mountPath: /dev/shm
+
+          readinessProbe:
+            httpGet:
+              path: /v2/health/ready
+              port: 8000
+            initialDelaySeconds: 60
+            periodSeconds: 10
+            failureThreshold: 18
+          livenessProbe:
+            httpGet:
+              path: /v2/health/live
+              port: 8000
+            initialDelaySeconds: 180
+            periodSeconds: 20
+            failureThreshold: 6
+
+      volumes:
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Gi
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: triton-trt
+  namespace: nlp-audio-understanding
+  labels:
+    app: triton-trt
+spec:
+  selector:
+    app: triton-trt
+  type: ClusterIP
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+    - name: grpc
+      port: 8001
+      targetPort: 8001
+    - name: metrics
+      port: 8002
+      targetPort: 8002

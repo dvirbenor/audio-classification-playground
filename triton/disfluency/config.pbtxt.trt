@@ -1,0 +1,13 @@
+# TensorRT serving config for disfluency — see triton/affect/config.pbtxt.trt for
+# the full rationale. Assembled by scripts/build_trt_engines.sh, served via
+# manifests/triton-trt-deployment.yaml.
+name: "disfluency"
+platform: "tensorrt_plan"
+max_batch_size: 128
+dynamic_batching { preferred_batch_size: [128] max_queue_delay_microseconds: 10000 }
+input  [ { name: "input_values" data_type: TYPE_FP32 dims: [48000] } ]
+output [
+  { name: "fluency_logits"         data_type: TYPE_FP32 dims: [2] },
+  { name: "disfluency_type_logits" data_type: TYPE_FP32 dims: [5] }
+]
+instance_group [ { kind: KIND_GPU count: 1 gpus: [0] } ]

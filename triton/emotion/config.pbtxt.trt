@@ -1,0 +1,10 @@
+# TensorRT serving config for emotion — see triton/affect/config.pbtxt.trt for the
+# full rationale. Assembled by scripts/build_trt_engines.sh, served via
+# manifests/triton-trt-deployment.yaml.
+name: "emotion"
+platform: "tensorrt_plan"
+max_batch_size: 128
+dynamic_batching { preferred_batch_size: [128] max_queue_delay_microseconds: 20000 }
+input  [ { name: "input_values" data_type: TYPE_FP32 dims: [48000] } ]
+output [ { name: "scores" data_type: TYPE_FP32 dims: [9] } ]
+instance_group [ { kind: KIND_GPU count: 1 gpus: [0] } ]
