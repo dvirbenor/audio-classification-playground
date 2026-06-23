@@ -65,19 +65,28 @@ def filter_entities_needing_work(
         permanent_errors: set of (session_id, archive_id) to exclude.
     """
     perm = permanent_errors or set()
+
+    # Load VAD-absent cache: archives verified to have no vad/ artifact.
+    # Skip their disk check entirely — they'll be filtered out anyway.
+    vad_absent_cached: set[tuple[str, str]] = set()
+    if require_vad:
+        vad_absent_cached = _load_vad_absent_cache(output_base)
+
     entity_keys = [
         (e.session_id, e.archive_id)
         for e in entities
         if (e.session_id, e.archive_id) not in perm
+        and (e.session_id, e.archive_id) not in vad_absent_cached
     ]
 
     LOGGER.info(
-        "Pre-scan: checking %d entities (require_vad=%s, tasks=%s) …",
+        "Pre-scan: %d entities to disk-check, %d skipped via VAD-absent cache (require_vad=%s, tasks=%s) …",
         len(entity_keys),
+        len(vad_absent_cached),
         require_vad,
         required_tasks,
     )
-    completed_map = completed_tasks_for_entity_keys(output_base, entity_keys)
+    completed_map = completed_tasks_for_entity_keys(output_base, entity_keys, require_vad=require_vad)
 
     required_set = frozenset(required_tasks)
     filtered = []
@@ -88,6 +97,9 @@ def filter_entities_needing_work(
         key = (entity.session_id, entity.archive_id)
         if key in perm:
             continue
+        if key in vad_absent_cached:
+            skipped_no_vad += 1
+            continue
         done = completed_map.get(key, frozenset())
         if require_vad and "vad" not in done:
             skipped_no_vad += 1
@@ -96,6 +108,23 @@ def filter_entities_needing_work(
             skipped_complete += 1
             continue
         filtered.append(entity)
+
+    # Persist newly-confirmed VAD-absent archives so future startups skip them.
+    if require_vad:
+        newly_absent = {
+            (e.session_id, e.archive_id)
+            for e in entities
+            if (e.session_id, e.archive_id) not in perm
+            and (e.session_id, e.archive_id) not in vad_absent_cached
+            and "vad" not in completed_map.get((e.session_id, e.archive_id), frozenset())
+        }
+        if newly_absent:
+            _save_vad_absent_cache(output_base, vad_absent_cached | newly_absent)
+            LOGGER.info(
+                "VAD-absent cache updated: %d newly absent, %d total",
+                len(newly_absent),
+                len(vad_absent_cached | newly_absent),
+            )
 
     LOGGER.info(
         "Pre-scan done: %d need work, %d already complete, %d missing VAD (skipped)",
@@ -462,18 +491,21 @@ def _walk_completed_tasks(output_base: Path) -> dict[tuple[str, str], set[str]]:
 # Targeted parallel entity check (manifest-backed progress)
 # ---------------------------------------------------------------------------
 
-_PARALLEL_WORKERS = 64
+_PARALLEL_WORKERS = 16
 
 
 def _check_entity_completion(
     base_str: str,
     sid: str,
     aid: str,
+    require_vad: bool = False,
 ) -> tuple[str, str, frozenset[str]]:
     """Check which tasks are complete for one ``(session_id, archive_id)``.
 
     Uses string paths and ``os.path`` to avoid ``Path`` object overhead
     when called from a thread pool over many entities.
+    When ``require_vad`` is True, stops after the VAD check if VAD is absent
+    — saves 3 readdir calls per no-VAD archive.
     """
     archive_path = f"{base_str}/{sid}/{aid}"
     try:
@@ -482,7 +514,14 @@ def _check_entity_completion(
     except OSError:
         return (sid, aid, frozenset())
     done: set[str] = set()
+    vad_complete = _is_task_complete_via_scandir(f"{archive_path}/vad")
+    if vad_complete:
+        done.add("vad")
+    elif require_vad:
+        return (sid, aid, frozenset())
     for task in TASKS:
+        if task == "vad":
+            continue
         if _is_task_complete_via_scandir(f"{archive_path}/{task}"):
             done.add(task)
     return (sid, aid, frozenset(done))
@@ -492,6 +531,7 @@ def _check_entities_parallel(
     output_base: Path,
     entity_keys: list[tuple[str, str]],
     max_workers: int = _PARALLEL_WORKERS,
+    require_vad: bool = False,
 ) -> dict[tuple[str, str], set[str]]:
     """Check task completion for known entities using parallel I/O.
 
@@ -508,10 +548,14 @@ def _check_entities_parallel(
     base_str = str(output_base)
     result: dict[tuple[str, str], set[str]] = {}
 
-    pool_size = min(max_workers, len(entity_keys))
+    total = len(entity_keys)
+    checked = 0
+    log_interval = max(10_000, total // 10)  # ~10 updates across the scan
+
+    pool_size = min(max_workers, total)
     with ThreadPoolExecutor(max_workers=pool_size) as pool:
         futures = {
-            pool.submit(_check_entity_completion, base_str, sid, aid): (sid, aid)
+            pool.submit(_check_entity_completion, base_str, sid, aid, require_vad): (sid, aid)
             for sid, aid in entity_keys
         }
         for future in as_completed(futures):
@@ -521,6 +565,12 @@ def _check_entities_parallel(
                     result[(sid, aid)] = set(done)
             except Exception:
                 pass
+            checked += 1
+            if checked % log_interval == 0:
+                LOGGER.info(
+                    "Pre-scan progress: %d/%d checked (%.0f%%), %d with tasks found",
+                    checked, total, 100 * checked / total, len(result),
+                )
 
     return result
 
@@ -530,6 +580,49 @@ def _check_entities_parallel(
 # ---------------------------------------------------------------------------
 
 _PROGRESS_CACHE = "_meta/progress_complete.txt"
+
+# Archives verified to have no VAD artifact (stable once the VAD fleet is done).
+# Avoids re-stating these on every pod restart when require_vad=True.
+_VAD_ABSENT_CACHE = "_meta/progress_vad_absent.txt"
+
+
+def _load_vad_absent_cache(output_base: Path) -> set[tuple[str, str]]:
+    cache_path = output_base / _VAD_ABSENT_CACHE
+    try:
+        text = cache_path.read_text(encoding="utf-8")
+    except (OSError, FileNotFoundError):
+        return set()
+    result: set[tuple[str, str]] = set()
+    for line in text.splitlines():
+        parts = line.split("\t", 1)
+        if len(parts) == 2:
+            result.add((parts[0], parts[1]))
+    return result
+
+
+def _save_vad_absent_cache(
+    output_base: Path,
+    absent: set[tuple[str, str]],
+) -> None:
+    cache_path = output_base / _VAD_ABSENT_CACHE
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{cache_path.name}.",
+        suffix=".tmp",
+        dir=str(cache_path.parent),
+    )
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            for sid, aid in sorted(absent):
+                f.write(f"{sid}\t{aid}\n")
+        os.replace(str(tmp), str(cache_path))
+    except OSError as exc:
+        LOGGER.warning("Could not write VAD-absent cache: %s", exc)
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def _load_completion_cache(output_base: Path) -> set[tuple[str, str]]:
@@ -583,6 +676,7 @@ def completed_tasks_for_entity_keys(
     entity_keys: list[tuple[str, str]],
     *,
     use_cache: bool = True,
+    require_vad: bool = False,
 ) -> dict[tuple[str, str], set[str]]:
     """Return completed task names for known ``(session_id, archive_id)`` keys.
 
@@ -606,7 +700,7 @@ def completed_tasks_for_entity_keys(
         len(keys_to_check),
     )
 
-    checked_map = _check_entities_parallel(output_base, keys_to_check)
+    checked_map = _check_entities_parallel(output_base, keys_to_check, require_vad=require_vad)
 
     completed_map: dict[tuple[str, str], set[str]] = {
         key: set(TASKS) for key in cached_complete
