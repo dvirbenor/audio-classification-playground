@@ -25,8 +25,8 @@ metadata:
   name: template-job
   namespace: default
 spec:
-  parallelism: 10
-  completions: 10
+  parallelism: 30
+  completions: 30
   backoffLimit: 20
   ttlSecondsAfterFinished: 86400
   template:

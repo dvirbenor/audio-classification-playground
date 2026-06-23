@@ -49,6 +49,8 @@ spec:
         # g7e nodes are Blackwell (sm_120) — matches the CUDA 12.8+ Triton image.
         node.kubernetes.io/instance-type: g7e.2xlarge
 
+      serviceAccountName: ai-dev-common-access
+
       containers:
         - name: tritonserver
           image: nvcr.io/nvidia/tritonserver:25.05-py3

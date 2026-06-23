@@ -84,6 +84,7 @@ from .task_groups import (
     TASK_GROUP_ALL,
     TASK_GROUP_EMOTION,
     TASK_GROUP_EMOTION_VAD,
+    TASK_GROUP_MODELS,
     TASK_GROUP_VAD,
     resolve_task_group,
 )
@@ -368,12 +369,13 @@ def _guard_against_mixed_lock_modes(output_base: Path, *, task_group: str) -> No
                 f"under {output_base / '_meta' / 'locks'}"
             )
         return
-    flat = flat_lock_files(output_base)
-    if flat:
-        raise RuntimeError(
-            "Refusing to start task-fleet worker: archive-level all-mode locks are "
-            f"active under {output_base / '_meta' / 'locks'}"
-        )
+    if task_group != TASK_GROUP_MODELS:
+        flat = flat_lock_files(output_base)
+        if flat:
+            raise RuntimeError(
+                "Refusing to start task-fleet worker: archive-level all-mode locks are "
+                f"active under {output_base / '_meta' / 'locks'}"
+            )
     if task_group in (TASK_GROUP_VAD, TASK_GROUP_EMOTION, TASK_GROUP_EMOTION_VAD):
         legacy_emotion_vad_locks = (
             output_base / "_meta" / "locks" / TASK_GROUP_EMOTION_VAD
