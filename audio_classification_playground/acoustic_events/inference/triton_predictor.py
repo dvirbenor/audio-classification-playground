@@ -26,7 +26,7 @@ from typing import Mapping
 import numpy as np
 
 
-_MAX_CHUNK = 256   # must not exceed max_batch_size in config.pbtxt
+_MAX_CHUNK = 128   # must not exceed max_batch_size in config.pbtxt (ONNX and TRT both serve max_batch 128)
 
 
 def _get_client(url: str):

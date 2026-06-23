@@ -77,8 +77,10 @@ experiments:
         export AUDIO_CACHE="${OUTPUT}/_meta/audio_cache"
         export CACHE_BYTES=536870912000
 
-        # Triton server address (ClusterIP Service from triton-server-deployment.yaml)
-        export TRITON_URL="triton-inference.nlp-audio-understanding:8001"
+        # Triton server address (ClusterIP Service from triton-trt-deployment.yaml).
+        # Switched from the ONNX/ORT server (triton-inference) to the TensorRT
+        # server (triton-trt) — ~2.5-3x throughput. Both serve max_batch 128.
+        export TRITON_URL="triton-trt.nlp-audio-understanding:8001"
 
         LOG_DIR="${OUTPUT}/job-logs"
         mkdir -p "$LOG_DIR"
