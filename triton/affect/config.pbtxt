@@ -2,16 +2,17 @@ name: "affect"
 backend: "onnxruntime"
 
 # Maximum batch Triton will dispatch to the ONNX model in one shot.
-# Restored to 256 (production target). Memory is kept in check not by capping
-# the batch but by taming ONNX Runtime's allocator (see the optimization block):
-# mem_pattern off + a single fixed batch shape + HEURISTIC conv search, so ORT
-# sits near its true ~15 GiB working set instead of ballooning to ~85 GiB.
-max_batch_size: 256
+# 128, not 256: even with mem_pattern off, the three ONNX models' CUDA arenas
+# together exceed the 96 GiB GPU at batch 256 (the two WavLM models alone reach
+# ~80 GiB and emotion then OOMs on a Conv node — measured 2026-06-23). 128 keeps
+# the trio well within budget (~50 GiB). mem_pattern off + a single fixed batch
+# shape (below + optimization block) keep the arena from ballooning per-shape.
+max_batch_size: 128
 
 dynamic_batching {
-  # Single preferred size → bias the batcher toward uniform 256-window batches,
-  # minimising the number of distinct input shapes ORT's arena has to retain.
-  preferred_batch_size: [256]
+  # Single preferred size → uniform batches, minimising the distinct input
+  # shapes ORT's arena has to retain.
+  preferred_batch_size: [128]
   # 10 ms — enough to accumulate requests from several concurrent workers
   # without adding perceptible latency to the per-archive pipeline.
   max_queue_delay_microseconds: 10000

@@ -1,12 +1,12 @@
 name: "disfluency"
 backend: "onnxruntime"
 
-# Batch 256 (production target); memory tamed via the optimization block, not by
-# capping the batch — see triton/affect/config.pbtxt.
-max_batch_size: 256
+# 128, not 256: the three ONNX models' CUDA arenas exceed the 96 GiB GPU at
+# batch 256 — see triton/affect/config.pbtxt.
+max_batch_size: 128
 
 dynamic_batching {
-  preferred_batch_size: [256]
+  preferred_batch_size: [128]
   max_queue_delay_microseconds: 10000
 }
 
