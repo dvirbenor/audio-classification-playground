@@ -48,6 +48,12 @@ spec:
         # Blackwell sm_120 — REQUIRED, the .plan engines are built for this arch.
         node.kubernetes.io/instance-type: g7e.2xlarge
 
+      # IRSA credentials for S3 model-repository access (same SA as the ONNX
+      # server). Without this, Triton fails at startup: "Unable to create S3
+      # filesystem client. Check account credentials." The role can read
+      # s3://riverside-build-assets/paralinguistics-trt/*.
+      serviceAccountName: ai-dev-common-access
+
       containers:
         - name: tritonserver
           # MUST be the image the engines were built against (TRT 10.10).
