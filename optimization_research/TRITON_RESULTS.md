@@ -3,8 +3,9 @@
 **What this covers:** the measured windows/second of the **deployed Triton** path (affect /
 disfluency / emotion served as ONNX models over the onnxruntime backend on one GPU), the
 config that makes all three co-exist, how it compares to the in-process PyTorch/MPS path in
-[OPTIMIZATION_REPORT.md](OPTIMIZATION_REPORT.md), and a postmortem on getting emotion2vec to
-export. Measured 2026-06-22…23 on a dedicated bench server
+[OPTIMIZATION_REPORT.md](OPTIMIZATION_REPORT.md), a postmortem on getting emotion2vec to export,
+and the **TensorRT engines that now supersede the ONNX path at ~2.5–3× the throughput**
+([TensorRT engines](#tensorrt-engines--the-faster-backend)). Measured 2026-06-22…23 on a dedicated bench server
 ([manifests/triton-bench-deployment.yaml](../manifests/triton-bench-deployment.yaml)) with
 [scripts/benchmark_triton_throughput.py](../scripts/benchmark_triton_throughput.py).
 
@@ -29,6 +30,85 @@ export. Measured 2026-06-22…23 on a dedicated bench server
   Cross-archive batching reaches the server ceiling at concurrency ≥4, but that ceiling is below PyTorch.
 - **emotion went from 0 → 1014 win/s.** Its ONNX export was batch-baked (served zero inferences in
   production); fixed via a dynamo re-export (see [Emotion export postmortem](#emotion-export-postmortem)).
+- **🚀 TensorRT engines are ~2.5–3× faster than this ONNX path *and* ~3× leaner — now the recommended
+  backend.** Served: affect **1578**, disfluency **1787**, emotion **3127** win/s; trio fits in **17 GiB**
+  (vs 52). Deployed as `triton-trt`. See [TensorRT engines](#tensorrt-engines--the-faster-backend).
+
+---
+
+## TensorRT engines — the faster backend
+
+Same models, compiled to TensorRT `.plan` engines and served via Triton's `tensorrt_plan` backend
+instead of onnxruntime. **This is the faster path and the one the backfill fleet now uses.** Built and
+measured on the real Blackwell with TRT **10.10** (matched to the `tritonserver:25.05` image, since
+engines are arch + TRT-version locked). Deploy:
+[manifests/triton-trt-deployment.yaml](../manifests/triton-trt-deployment.yaml); build:
+[scripts/build_trt_engines.sh](../scripts/build_trt_engines.sh).
+
+### Throughput (served, batch 128, 3 real archives)
+
+| task | TRT mixed-fp16 | ONNX/ORT (above) | **vs ORT** | TRT-fp32 | **vs fp32** |
+|---|---|---|---|---|---|
+| affect     | **1578** | 610  | **2.6×** | 418 | 3.7× |
+| disfluency | **1787** | 724  | **2.5×** | 483 | 3.6× |
+| emotion    | **3127** | 1014 | **3.1×** | 819 | 3.7× |
+
+Served ≈ raw single-engine compute (Triton overhead is negligible — compute-bound). Client throughput
+saturates at concurrency ≥4, same as ORT, but at a ~2.5–3× higher ceiling. With three replicas
+(`triton-trt`, 3 GPUs) the fleet aggregate is ~3× these per-GPU numbers.
+
+**No gain past batch 128** (measured, affect, single-stream): 64→1604, 128→1533, 192→1492, 256→1503
+win/s — flat, and 256 is ~2% *slower* (64 is marginally best). The short-window WavLM GEMMs saturate
+the SMs by batch ≤128, so larger batches add only latency. (The ~16% 128→256 gain seen on the ORT
+path does **not** carry to TRT — ORT's kernels were less efficient at small batch; TRT's aren't.)
+
+### Memory — TRT is ~3× leaner than ORT
+
+Trio loaded **17.3 GiB** (vs ORT's 52 at batch 128), idle or under load — TRT's engine-time memory
+planning avoids ORT's non-releasing BFC arena. **78 GiB free**, so batch 256 or multiple instances fit
+trivially; not worth it since throughput is already compute-bound at 128.
+
+### The precision recipe — fp16 except Softmax + Norm in fp32
+
+Build with `--fp16` but pin **Softmax + Normalization** layers to fp32
+([scripts/build_trt_engine.py](../scripts/build_trt_engine.py), by `trt.LayerType`). Why:
+
+- Blanket `trtexec --fp16` is **numerically broken on real audio** — the attention **Softmax** overflows
+  fp16, giving ~**0.42** absolute error in affect outputs (would flip every label; this is the report's
+  rejected "NaN"). It's **Softmax**, not LayerNorm — pinning LayerNorm alone does nothing; pinning
+  Softmax alone fixes it (3e-4). *Random* input hides this (1.5e-3) — only loud real speech exposes it.
+- **Caveat:** the catastrophic error was on A10G + TRT 10.16; on **Blackwell + TRT 10.10 blanket fp16
+  was also accurate** (1.5e-3). So the recipe's necessity is GPU/TRT-version-specific — but pinning
+  Softmax+Norm costs **0 win/s** and is guaranteed-safe across kernel/tactic/GPU changes, so we always ship it.
+
+### Build prerequisite — fold constants first
+
+TRT 10.10's ONNX parser **rejects the affect fp16 model** (`convMultiInput: input tensor shape misaligns
+with kernel shape`) because the fp16 converter left the fp32-kept Conv weights as a `Cast` output, not
+an initializer. Fold them once — `polygraphy surgeon sanitize model.onnx --fold-constants -o folded.onnx`
+(affect folds 133 nodes; disfluency/emotion fold 0). `build_trt_engines.sh` does this automatically.
+Engines are **Blackwell sm_120 + TRT 10.10 locked** — rebuild if the GPU arch or Triton image changes.
+
+### Event-safety A/B (ORT-served baseline vs TRT-served)
+
+[scripts/event_level_ab_triton.py](../scripts/event_level_ab_triton.py), 3 archives, 10-min cap:
+
+| task | result |
+|---|---|
+| affect | **0 dropped / 0 added, labels 100%** across all 3 archives ✅ |
+| disfluency | 2/3 identical; **1 dropped event of ~60** on one archive (borderline; `d_score 0.004`) |
+| emotion | not covered (separate producer — A/B it separately) |
+
+Read: **fp16-vs-fp16 boundary noise** (both ORT and TRT are fp16; neither is fp32 ground truth) — a
+single marginal disfluency event at a detection threshold. A near-pass, not a literal zero; worth a
+broader A/B (more archives + emotion) before the final cutover.
+
+### Deploy
+
+Model repo on S3 at `s3://riverside-build-assets/paralinguistics-trt/` (separate from the ONNX prefix —
+the `.plan`s are arch-locked). The Deployment needs `serviceAccountName: ai-dev-common-access` (IRSA for
+S3) — without it Triton dies at startup with "Unable to create S3 filesystem client." Rebuild + publish:
+`PUBLISH=1 bash scripts/build_trt_engines.sh`.
 
 ---
 
