@@ -146,8 +146,8 @@ experiments:
           --worklist "$OUTPUT/_meta/needs_work.txt" \
           --shard-index "${JOB_COMPLETION_INDEX:-0}" \
           --shard-count "$SHARD_COUNT" \
-          --prefetch-workers 8 \
-          --prefetch-lookahead 16 \
+          --prefetch-workers 24 \
+          --prefetch-lookahead 32 \
           --max-retries 3 \
           --audio-cache-dir "$AUDIO_CACHE" \
           --max-cache-bytes "$CACHE_BYTES"
