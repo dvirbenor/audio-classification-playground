@@ -7,6 +7,7 @@ import gc
 import json
 from pathlib import Path
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Mapping, Sequence
 
 import numpy as np
@@ -876,7 +877,8 @@ def run_all_inference(
             raise ValueError(f"Unknown tasks_filter entries: {sorted(unknown)}")
         steps = [(task, step) for task, step in steps if task in wanted]
     task_elapsed_sec: dict[str, float] = {}
-    for task, run_step in steps:
+
+    def _run_task(task: str, run_step):
         if shutdown_check is not None and shutdown_check():
             raise ShutdownRequested(f"shutdown requested before task {task!r}")
         _progress(progress, f"run-all task: {task}")
@@ -889,32 +891,61 @@ def run_all_inference(
         except Exception:
             LOGGER.info(
                 "run-all task failed: task=%s batch_size=%d elapsed=%.3fs cuda=%s",
-                task,
-                batch_for_task,
-                time.perf_counter() - task_started,
+                task, batch_for_task, time.perf_counter() - task_started,
                 _cuda_task_stats(cuda_before),
             )
             raise
         elapsed = time.perf_counter() - task_started
-        task_elapsed_sec[task] = elapsed
         LOGGER.info(
             "run-all task complete: task=%s reused=%s batch_size=%d elapsed=%.3fs cuda=%s",
-            task,
-            result.reused,
-            batch_for_task,
-            elapsed,
-            _cuda_task_stats(cuda_before),
+            task, result.reused, batch_for_task, elapsed, _cuda_task_stats(cuda_before),
         )
+        return result, elapsed
+
+    def _record(task, result, elapsed):
         artifacts[task] = result.artifact
         reused[task] = result.reused
-        if (
-            task == "vad"
-            and gating is not None
-            and gate_state["intervals"] is None
-        ):
+        task_elapsed_sec[task] = elapsed
+
+    # VAD first (sequential): the gated model tasks read its speech intervals.
+    for task, run_step in steps:
+        if task != "vad":
+            continue
+        result, elapsed = _run_task(task, run_step)
+        _record(task, result, elapsed)
+        if gating is not None and gate_state["intervals"] is None:
             gate_state["intervals"] = intervals_from_array(
                 result.artifact.arrays.get("intervals_sec")
             )
+
+    # Model tasks (affect/disfluency/emotion). When every one runs through an
+    # injected (Triton) predictor, overlap them concurrently. The win is NOT the
+    # GPU running three models at once (at batch 128 each forward already
+    # saturates the SMs, so co-resident executions just time-slice — cf. MPS
+    # co-location nets only ~1.49x); it's that each thread mostly *waits* on its
+    # own server round-trips + CPU framing, so overlapping hides those waits and
+    # the per-archive wall drops from sum(tasks) toward max(task).
+    # The in-process path (predictors=None: models run on the worker's own GPU)
+    # keeps them sequential — naive threads would serialize on the default CUDA
+    # stream and the GIL anyway, so it'd add contention with no real overlap
+    # (true packing there needs MPS, a separate mechanism).
+    model_steps = [(t, s) for t, s in steps if t != "vad"]
+    triton_mode = bool(model_steps) and all(
+        predictors.get(t) is not None for t, _ in model_steps
+    )
+    if triton_mode and len(model_steps) > 1:
+        _progress(progress, f"run-all: {len(model_steps)} model tasks concurrent (triton)")
+        with ThreadPoolExecutor(max_workers=len(model_steps)) as ex:
+            futures = {ex.submit(_run_task, t, s): t for t, s in model_steps}
+            collected = {futures[f]: f.result() for f in as_completed(futures)}
+        for task, _ in model_steps:
+            result, elapsed = collected[task]
+            _record(task, result, elapsed)
+    else:
+        for task, run_step in model_steps:
+            result, elapsed = _run_task(task, run_step)
+            _record(task, result, elapsed)
+
     return InferenceRunResult(
         artifacts=artifacts, reused=reused, task_elapsed_sec=task_elapsed_sec,
     )

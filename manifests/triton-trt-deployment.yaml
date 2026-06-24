@@ -27,10 +27,12 @@ metadata:
     team: nlp
     project: audio-understanding
 spec:
-  # 3 replicas = 3 Blackwell GPUs, each running the full trio. The ClusterIP
+  # N replicas = N Blackwell GPUs, each running the full trio. The ClusterIP
   # Service spreads the CPU backfill workers' gRPC connections across them
-  # (connection-level LB — fine for a many-worker fleet). ~3x aggregate throughput.
-  replicas: 3
+  # (connection-level LB — fine for a many-worker fleet). Karpenter provisions
+  # one g7e.2xlarge per replica. With the pipelined+overlapped workers (~4-5
+  # workers saturate one TRT GPU), 30 CPU pods feed ~7 GPUs well — see the template.
+  replicas: 7
   selector:
     matchLabels:
       app: triton-trt
