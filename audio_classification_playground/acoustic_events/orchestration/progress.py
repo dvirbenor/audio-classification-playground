@@ -135,6 +135,51 @@ def filter_entities_needing_work(
     return filtered
 
 
+_WORKLIST_DEFAULT = "_meta/needs_work.txt"
+
+
+def load_worklist(path) -> set[tuple[str, str]]:
+    """Load a needs-work list (TSV ``session_id<TAB>archive_id``) into a set."""
+    keys: set[tuple[str, str]] = set()
+    for line in Path(path).read_text(encoding="utf-8").splitlines():
+        parts = line.split("\t", 1)
+        if len(parts) == 2:
+            keys.add((parts[0], parts[1]))
+    return keys
+
+
+def build_worklist(
+    output_base: Path,
+    entities: list,
+    required_tasks: tuple[str, ...],
+    *,
+    require_vad: bool = False,
+    permanent_errors: set | None = None,
+    out_path: Path | None = None,
+) -> int:
+    """Run the EFS pre-scan ONCE and persist the (session, archive) keys still
+    needing work, so a sharded worker fleet can read a ready-made list instead of
+    every pod re-scanning EFS. Returns the number of entities written.
+    """
+    needing = filter_entities_needing_work(
+        output_base, entities, required_tasks,
+        require_vad=require_vad, permanent_errors=permanent_errors,
+    )
+    out_path = Path(out_path) if out_path is not None else output_base / _WORKLIST_DEFAULT
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{out_path.name}.", suffix=".tmp", dir=str(out_path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            for e in needing:
+                f.write(f"{e.session_id}\t{e.archive_id}\n")
+        os.replace(tmp_name, str(out_path))
+    except OSError:
+        Path(tmp_name).unlink(missing_ok=True)
+        raise
+    LOGGER.info("Worklist written: %d entities -> %s", len(needing), out_path)
+    return len(needing)
+
+
 def record_archive_complete(
     output_base: Path,
     session_id: str,

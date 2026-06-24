@@ -76,6 +76,7 @@ from .progress import (
     incomplete_tasks_by_artifact,
     is_task_artifact_complete_for_archive,
     is_task_complete_for_config,
+    load_worklist,
     record_archive_complete,
 )
 from .task_groups import (
@@ -433,6 +434,9 @@ def run_worker(
     vad_gating_tasks: tuple[str, ...] = DEFAULT_GATED_TASKS,
     require_precomputed_vad: bool = False,
     seed: int | None = None,
+    worklist_path: str | None = None,
+    shard_index: int = 0,
+    shard_count: int = 1,
     triton_url: str | None = None,
 ) -> None:
     """Entry point for a single worker pod.
@@ -577,13 +581,45 @@ def run_worker(
     LOGGER.info("Loading manifest from %s", parquet_path)
     entities = load_manifest(parquet_path)
     permanent_errors = load_permanent_error_set(output_base)
-    if not force_recompute:
+    if worklist_path and Path(worklist_path).exists():
+        # Pre-built needs-work list (from `build-worklist`): the EFS pre-scan
+        # already happened ONCE, centrally — skip the per-worker scan entirely.
+        keys = load_worklist(worklist_path)
+        entities = [
+            e for e in entities
+            if (e.session_id, e.archive_id) in keys
+            and (e.session_id, e.archive_id) not in permanent_errors
+        ]
+        LOGGER.info(
+            "Worklist %s: %d entities need work (per-worker pre-scan skipped)",
+            worklist_path, len(entities),
+        )
+    elif not force_recompute:
+        if worklist_path:
+            LOGGER.warning(
+                "Worklist %s missing — falling back to the per-worker EFS pre-scan",
+                worklist_path,
+            )
         entities = filter_entities_needing_work(
             output_base,
             entities,
             required_tasks=group.tasks,
             require_vad=enforce_vad_present,
             permanent_errors=permanent_errors,
+        )
+    # Shard across the fleet: slice the deterministic entity order so each pod
+    # owns a DISJOINT subset — no two workers scan/claim the same archives, and
+    # each pod's work-list shrinks to 1/shard_count. Sliced before the shuffle
+    # below so all pods partition the same ordering.
+    if shard_count > 1:
+        if not (0 <= shard_index < shard_count):
+            raise ValueError(
+                f"shard_index {shard_index} out of range for shard_count {shard_count}"
+            )
+        entities = entities[shard_index::shard_count]
+        LOGGER.info(
+            "Shard %d/%d: %d entities owned by this worker",
+            shard_index, shard_count, len(entities),
         )
     inference_attempts = load_inference_attempt_counts(
         output_base,

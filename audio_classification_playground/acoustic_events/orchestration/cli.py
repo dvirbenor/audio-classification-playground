@@ -114,8 +114,30 @@ def _cmd_run(args: argparse.Namespace) -> None:
         vad_gating_tasks=tuple(args.vad_gating_tasks),
         require_precomputed_vad=args.require_precomputed_vad,
         seed=args.seed,
+        worklist_path=args.worklist,
+        shard_index=args.shard_index,
+        shard_count=args.shard_count,
         triton_url=args.triton_url,
     )
+
+
+def _cmd_build_worklist(args: argparse.Namespace) -> None:
+    from .errors import load_permanent_error_set
+    from .manifest import load_manifest
+    from .progress import build_worklist
+    from .task_groups import resolve_task_group
+
+    group = resolve_task_group(args.task_group)
+    require_vad = args.require_precomputed_vad and "vad" not in group.tasks
+    output = Path(args.output)
+    out_path = Path(args.out) if args.out else output / "_meta" / "needs_work.txt"
+    entities = load_manifest(args.parquet)
+    perm = load_permanent_error_set(output)
+    n = build_worklist(
+        output, entities, required_tasks=group.tasks,
+        require_vad=require_vad, permanent_errors=perm, out_path=out_path,
+    )
+    print(f"worklist: {n} entities need work -> {out_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -620,6 +642,36 @@ def main(argv: list[str] | None = None) -> None:
              "produce vad themselves (all, vad, emotion-vad).",
     )
     p_run.add_argument("--seed", type=int, default=None)
+    p_run.add_argument(
+        "--worklist", default=None,
+        help="Path to a needs-work list (TSV session<TAB>archive) from "
+             "'build-worklist'. Skips the per-worker EFS pre-scan — the fleet "
+             "shards this ready-made list instead of every pod re-scanning EFS.",
+    )
+    p_run.add_argument(
+        "--shard-index", type=int,
+        default=int(os.environ.get("JOB_COMPLETION_INDEX", "0")),
+        help="This worker's shard (default: $JOB_COMPLETION_INDEX, set by an "
+             "Indexed Job). Each pod owns entities[shard_index::shard_count].",
+    )
+    p_run.add_argument(
+        "--shard-count", type=int, default=1,
+        help="Total shards = the Indexed Job's completions/parallelism.",
+    )
+
+    # --- build-worklist ---
+    p_wl = sub.add_parser(
+        "build-worklist",
+        help="Scan EFS once and write the needs-work list for a sharded worker fleet",
+    )
+    p_wl.add_argument("--parquet", required=True)
+    p_wl.add_argument("--output", required=True)
+    p_wl.add_argument("--task-group", default="all")
+    p_wl.add_argument("--require-precomputed-vad", action="store_true")
+    p_wl.add_argument(
+        "--out", default=None,
+        help="Worklist output path (default: <output>/_meta/needs_work.txt)",
+    )
 
     # --- progress ---
     p_progress = sub.add_parser("progress", help="Show pipeline progress")
@@ -735,6 +787,7 @@ def main(argv: list[str] | None = None) -> None:
 
     handlers = {
         "run": _cmd_run,
+        "build-worklist": _cmd_build_worklist,
         "progress": _cmd_progress,
         "errors": _cmd_errors,
         "timings": _cmd_timings,
