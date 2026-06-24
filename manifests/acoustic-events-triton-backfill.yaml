@@ -81,7 +81,7 @@ experiments:
         # pre-built worklist (no per-pod EFS scan). SHARD_COUNT MUST equal the
         # template's completions/parallelism; JOB_COMPLETION_INDEX is set per pod
         # by the Indexed Job (completionMode: Indexed in the worker template).
-        export SHARD_COUNT=30
+        export SHARD_COUNT=40
 
         # Triton server address (ClusterIP Service from triton-trt-deployment.yaml).
         # Switched from the ONNX/ORT server (triton-inference) to the TensorRT

@@ -25,17 +25,17 @@ metadata:
   name: template-job
   namespace: default
 spec:
-  # 30 pods: each worker now pipelines chunks (async) AND runs the 3 model tasks
-  # concurrently (~4-5 workers saturate one TRT GPU), so 30 pods feed ~7 GPUs.
+  # 40 pods: each worker now pipelines chunks (async) AND runs the 3 model tasks
+  # concurrently (~4-5 workers saturate one TRT GPU), so 40 pods feed ~8 GPUs.
   # Scale up only if GPU util drops.
   #
-  # completionMode: Indexed → each pod gets a distinct JOB_COMPLETION_INDEX (0..29),
-  # which the worker uses to claim a disjoint 1/30 shard of the pre-built worklist
+  # completionMode: Indexed → each pod gets a distinct JOB_COMPLETION_INDEX (0..39),
+  # which the worker uses to claim a disjoint 1/40 shard of the pre-built worklist
   # (no per-pod EFS pre-scan). KEEP completions == parallelism == the manifest's
   # SHARD_COUNT, or the shards won't tile the work-list correctly.
   completionMode: Indexed
-  parallelism: 30
-  completions: 30
+  parallelism: 40
+  completions: 40
   backoffLimit: 20
   ttlSecondsAfterFinished: 86400
   template:

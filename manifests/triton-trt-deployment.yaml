@@ -31,8 +31,8 @@ spec:
   # Service spreads the CPU backfill workers' gRPC connections across them
   # (connection-level LB — fine for a many-worker fleet). Karpenter provisions
   # one g7e.2xlarge per replica. With the pipelined+overlapped workers (~4-5
-  # workers saturate one TRT GPU), 30 CPU pods feed ~7 GPUs well — see the template.
-  replicas: 7
+  # workers saturate one TRT GPU), 30 CPU pods feed ~8 GPUs well — see the template.
+  replicas: 8
   selector:
     matchLabels:
       app: triton-trt
@@ -45,6 +45,16 @@ spec:
         - key: karpenter
           operator: Equal
           value: ai-workers-gpu
+          effect: NoSchedule
+        # g7e Blackwell capacity is in the EFA GPU nodepool — tolerate its taints
+        # too, or pods sit Pending once the plain ai-workers-gpu pool has no g7e.
+        - key: karpenter
+          operator: Equal
+          value: ai-workers-gpu-efa
+          effect: NoSchedule
+        - key: efa
+          operator: Equal
+          value: "true"
           effect: NoSchedule
         - key: nvidia.com/gpu
           operator: Exists
