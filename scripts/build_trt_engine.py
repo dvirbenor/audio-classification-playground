@@ -10,9 +10,10 @@ pinning Softmax (and LayerNorm, free) to fp32 restores fp32-level accuracy
 culprit. So we keep everything fp16 except SOFTMAX + NORMALIZATION layers.
 
 TRT engines are arch + TRT-version locked. BUILD THIS INSIDE the same image that
-serves it (nvcr.io/nvidia/tritonserver:25.05-py3 → TRT 10.10) on the TARGET GPU
+serves it (nvcr.io/nvidia/tritonserver:25.07-py3 → TRT 10.11.0.33) on the TARGET GPU
 (Blackwell g7e). It needs only the `tensorrt` module (bundled in that image) —
-no polygraphy/torch/onnxruntime.
+no polygraphy/torch/onnxruntime. (build_trt_engines.sh instead pip-pins the matching
+TRT into an isolated venv, so it can run outside the container.)
 
 PREREQUISITE — FOLD CONSTANTS FIRST. TRT 10.10's ONNX parser rejects the affect
 fp16 model ("convMultiInput: input tensor shape misaligns with kernel shape")
@@ -107,7 +108,9 @@ def main() -> int:
         return 1
     with open(args.out, "wb") as f:
         f.write(serialized)
-    print(f"  ok: {len(serialized)/1e6:.0f} MB engine in {time.perf_counter()-t0:.0f}s")
+    # .nbytes (not len()): TRT 10.11's build_serialized_network returns an
+    # IHostMemory with no __len__ (10.10 was len()-able). .nbytes works on both.
+    print(f"  ok: {serialized.nbytes/1e6:.0f} MB engine in {time.perf_counter()-t0:.0f}s")
     return 0
 
 

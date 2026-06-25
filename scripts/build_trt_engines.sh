@@ -11,9 +11,10 @@
 #
 # *** REQUIREMENTS — engines are arch + TRT-version locked ***
 #   - Run on a Blackwell sm_120 GPU (RTX PRO 6000 / g7e).
-#   - TRT is pinned to 10.10.0.31 to match the serving image (tritonserver:25.05).
+#   - TRT is pinned to 10.11.0.33 to match the serving image (tritonserver:25.07).
 #     If you change the Triton image, change TRT_VERSION and rebuild, or the
-#     engines won't deserialize.
+#     engines won't deserialize. (Image->TRT: 25.05=10.10.0.31, 25.07=10.11.0.33,
+#     25.08=10.13.2.6 — read it from the image: `docker run ... env | grep TRT_VERSION`.)
 #   - Needs `uv` + network (sets up an isolated venv with the pinned toolchain).
 #
 # Usage:
@@ -25,7 +26,7 @@ set -euo pipefail
 
 S3_ONNX="s3://riverside-build-assets/paralinguistics"
 S3_TRT="s3://riverside-build-assets/paralinguistics-trt"
-TRT_VERSION="${TRT_VERSION:-10.10.0.31}"     # must match the serving Triton image's TRT
+TRT_VERSION="${TRT_VERSION:-10.11.0.33}"     # must match the serving Triton image's TRT (25.07)
 OUT="${OUT:-/efs/triton-trt-repo}"
 MAXB="${MAXB:-128}"                          # also set max_batch_size in triton/<m>/config.pbtxt.trt
 WORK="${WORK:-$(mktemp -d)}"
@@ -40,8 +41,11 @@ command -v nvidia-smi >/dev/null && nvidia-smi --query-gpu=name,compute_cap --fo
 if [ "${SKIP_VENV:-0}" != "1" ]; then
   VENV="$WORK/trt-venv"
   uv venv "$VENV" --python 3.12
+  # onnx_graphsurgeon is REQUIRED by `polygraphy surgeon sanitize --fold-constants`;
+  # polygraphy otherwise tries to auto-fetch it at runtime and fails in an offline venv
+  # ("No module named 'onnx_graphsurgeon'").
   UV_LINK_MODE=copy uv pip install --python "$VENV/bin/python" \
-      "tensorrt-cu12==${TRT_VERSION}" polygraphy onnxruntime onnx numpy
+      "tensorrt-cu12==${TRT_VERSION}" polygraphy onnx_graphsurgeon onnxruntime onnx numpy
   PY="$VENV/bin/python"
   POLYGRAPHY="$VENV/bin/polygraphy"
 else

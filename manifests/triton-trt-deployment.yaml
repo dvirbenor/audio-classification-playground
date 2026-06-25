@@ -6,10 +6,10 @@
 # emotion 3003 win/s at batch 128 — vs ORT 588 / 705 / 977).
 #
 # *** HARD CONSTRAINT: the engines are architecture + TRT-version locked. ***
-# They were built on the Blackwell RTX PRO 6000 (sm_120) with TensorRT 10.10
+# They were built on the Blackwell RTX PRO 6000 (sm_120) with TensorRT 10.11.0.33
 # (scripts/build_trt_engine.py, from fold-constant'd ONNX). They ONLY load on:
 #   - a Blackwell sm_120 GPU (the g7e nodeSelector below), AND
-#   - the tritonserver:25.05-py3 image (TRT 10.10). If you bump the image, the
+#   - the tritonserver:25.07-py3 image (TRT 10.11.0.33). If you bump the image, the
 #     TRT version changes and the engines won't deserialize — rebuild them.
 #
 # Models: s3://riverside-build-assets/paralinguistics-trt/{affect,disfluency,emotion}/1/model.plan
@@ -74,8 +74,8 @@ spec:
 
       containers:
         - name: tritonserver
-          # MUST be the image the engines were built against (TRT 10.10).
-          image: nvcr.io/nvidia/tritonserver:25.05-py3
+          # MUST be the image the engines were built against (TRT 10.11.0.33).
+          image: nvcr.io/nvidia/tritonserver:25.07-py3
           imagePullPolicy: Always
           command:
             - tritonserver

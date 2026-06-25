@@ -39,9 +39,10 @@ and the **TensorRT engines that now supersede the ONNX path at ~2.5–3× the th
 ## TensorRT engines — the faster backend
 
 Same models, compiled to TensorRT `.plan` engines and served via Triton's `tensorrt_plan` backend
-instead of onnxruntime. **This is the faster path and the one the backfill fleet now uses.** Built and
-measured on the real Blackwell with TRT **10.10** (matched to the `tritonserver:25.05` image, since
-engines are arch + TRT-version locked). Deploy:
+instead of onnxruntime. **This is the faster path and the one the backfill fleet now uses.** Built on the
+real Blackwell, now compiled with TRT **10.11.0.33** to match the `tritonserver:25.07` image (engines are
+arch + TRT-version locked; was TRT 10.10 / `25.05`). The win/s tables below were measured on the original
+10.10 build — same arch, adjacent TRT minor, so they carry over (re-bench when convenient). Deploy:
 [manifests/triton-trt-deployment.yaml](../manifests/triton-trt-deployment.yaml); build:
 [scripts/build_trt_engines.sh](../scripts/build_trt_engines.sh).
 
@@ -87,7 +88,7 @@ TRT 10.10's ONNX parser **rejects the affect fp16 model** (`convMultiInput: inpu
 with kernel shape`) because the fp16 converter left the fp32-kept Conv weights as a `Cast` output, not
 an initializer. Fold them once — `polygraphy surgeon sanitize model.onnx --fold-constants -o folded.onnx`
 (affect folds 133 nodes; disfluency/emotion fold 0). `build_trt_engines.sh` does this automatically.
-Engines are **Blackwell sm_120 + TRT 10.10 locked** — rebuild if the GPU arch or Triton image changes.
+Engines are **Blackwell sm_120 + TRT 10.11.0.33 locked** (`tritonserver:25.07`) — rebuild if the GPU arch or Triton image changes.
 
 ### Event-safety A/B (ORT-served baseline vs TRT-served)
 
