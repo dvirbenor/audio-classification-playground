@@ -28,6 +28,7 @@ LOGGER = logging.getLogger(__name__)
 
 AUDIO_ERRORS_DIR = "_meta/audio_errors"
 INFERENCE_ERRORS_DIR = "_meta/inference_errors"
+_PERMANENT_ERRORS_CACHE = "_meta/permanent_errors.txt"
 
 PERMANENT_AUDIO_ERROR_TYPES = frozenset({"no_matching_file"})
 
@@ -137,22 +138,49 @@ def append_inference_error(
 def load_permanent_error_set(output_base: Path) -> set[tuple[str, str]]:
     """Return ``{(session_id, archive_id)}`` for all permanent audio errors.
 
-    Duplicates are naturally deduplicated by the set.
+    Loads from a single cache file on subsequent runs to avoid a slow rglob
+    over thousands of individual error JSON files on EFS.  Falls back to the
+    full rglob scan and writes the cache when no cache file exists.
     """
+    cache_path = output_base / _PERMANENT_ERRORS_CACHE
+    if cache_path.is_file():
+        result: set[tuple[str, str]] = set()
+        try:
+            for line in cache_path.read_text(encoding="utf-8").splitlines():
+                parts = line.split("\t", 1)
+                if len(parts) == 2:
+                    result.add((parts[0], parts[1]))
+            LOGGER.info("Loaded %d permanent audio errors (from cache)", len(result))
+            return result
+        except OSError:
+            pass
+
     errors_dir = output_base / AUDIO_ERRORS_DIR
     if not errors_dir.is_dir():
         return set()
-    result: set[tuple[str, str]] = set()
+    result = set()
     for f in errors_dir.rglob("*.json"):
-        if not f.name.endswith(".json"):
-            continue
         try:
             data = json.loads(f.read_text(encoding="utf-8"))
             if data.get("is_permanent", False):
                 result.add((data["session_id"], data["archive_id"]))
         except (OSError, json.JSONDecodeError, KeyError):
             continue
-    LOGGER.info("Loaded %d permanent audio errors", len(result))
+    LOGGER.info("Loaded %d permanent audio errors (scanned %s)", len(result), errors_dir)
+
+    try:
+        import tempfile
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(
+            prefix=f".{cache_path.name}.", suffix=".tmp", dir=str(cache_path.parent)
+        )
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            for sid, aid in sorted(result):
+                f.write(f"{sid}\t{aid}\n")
+        os.replace(tmp, str(cache_path))
+    except OSError as exc:
+        LOGGER.warning("Could not write permanent errors cache: %s", exc)
+
     return result
 
 
