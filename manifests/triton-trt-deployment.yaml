@@ -31,8 +31,11 @@ spec:
   # Service spreads the CPU backfill workers' gRPC connections across them
   # (connection-level LB — fine for a many-worker fleet). Karpenter provisions
   # one g7e.2xlarge per replica. With the pipelined+overlapped workers (~4-5
-  # workers saturate one TRT GPU), 30 CPU pods feed ~8 GPUs well — see the template.
-  replicas: 8
+  # workers saturate one TRT GPU), 60 CPU pods feed ~12 GPUs — see the template.
+  # NOTE: 12 g7e.2xlarge (Blackwell) is significant capacity; some replicas may sit
+  # Pending if the EFA GPU pool is short. The Service LBs across whatever is Ready,
+  # so the fleet still runs on the available subset — don't block on all 12.
+  replicas: 12
   selector:
     matchLabels:
       app: triton-trt

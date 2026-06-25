@@ -34,9 +34,15 @@ metadata:
   name: template-job
   namespace: default
 spec:
-  parallelism: 3
-  completions: 3
-  backoffLimit: 10
+  parallelism: 5
+  completions: 5
+  # backoffLimit raised from 10: a single-pod OOM or node disruption shouldn't end
+  # the whole backfill (the prior 20-pod run OOM-failed the Job). Workers loop-until-
+  # no-work and coordinate via locks, so retries are safe. NOTE: 5 pods × 8 VAD procs
+  # is above the measured ~3-pod sweet spot — VAD is EFS-metadata-bound, and a 20-pod
+  # run thrashed EFS to ~80-110 arc/h/pod and OOMed. Watch for OOMKilled and falling
+  # per-pod throughput (orchestration progress --fast); drop to 3 if so.
+  backoffLimit: 200
   ttlSecondsAfterFinished: 86400
   template:
     metadata:
