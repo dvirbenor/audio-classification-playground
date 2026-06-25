@@ -83,10 +83,13 @@ experiments:
         # by the Indexed Job (completionMode: Indexed in the worker template).
         export SHARD_COUNT=60
 
-        # Triton server address (ClusterIP Service from triton-trt-deployment.yaml).
-        # Switched from the ONNX/ORT server (triton-inference) to the TensorRT
-        # server (triton-trt) — ~2.5-3x throughput. Both serve max_batch 128.
-        export TRITON_URL="triton-trt.nlp-audio-understanding:8001"
+        # Headless service for gRPC client-side round_robin load balancing.
+        # dns:/// prefix tells gRPC to use the DNS resolver, which returns one
+        # A record per ready pod. Combined with round_robin in triton_predictor.py
+        # this distributes requests across all replicas and auto-discovers new
+        # pods within ~30s. Using the ClusterIP service instead would pin each
+        # worker to one pod for the lifetime of the connection.
+        export TRITON_URL="dns:///triton-trt-headless.nlp-audio-understanding:8001"
 
         LOG_DIR="${OUTPUT}/job-logs"
         mkdir -p "$LOG_DIR"

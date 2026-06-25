@@ -12,8 +12,8 @@
 #   - the tritonserver:25.07-py3 image (TRT 10.11.0.33). If you bump the image, the
 #     TRT version changes and the engines won't deserialize — rebuild them.
 #
-# Models: s3://riverside-build-assets/paralinguistics-trt/{affect,disfluency,emotion}/1/model.plan
-# Publish:  aws s3 sync /efs/arno/triton-trt-repo s3://riverside-build-assets/paralinguistics-trt
+# Models: s3://riverside-build-assets/paralinguistics-trt/GB202/{affect,disfluency,emotion}/1/model.plan
+# Publish:  aws s3 sync /efs/arno/triton-trt-repo s3://riverside-build-assets/paralinguistics-trt/GB202
 # Apply:    kubectl apply -f manifests/triton-trt-deployment.yaml -n nlp-audio-understanding
 # Workers reach it at:  triton-trt.nlp-audio-understanding:8001 (gRPC) / :8000 (HTTP)
 ---
@@ -80,7 +80,7 @@ spec:
           command:
             - tritonserver
           args:
-            - --model-repository=s3://riverside-build-assets/paralinguistics-trt
+            - --model-repository=s3://riverside-build-assets/paralinguistics-trt/GB202
             - --log-verbose=1
             - --grpc-port=8001
             - --http-port=8000
@@ -140,6 +140,8 @@ spec:
             sizeLimit: 16Gi
 
 ---
+# ClusterIP service — kept for HTTP health checks, metrics scraping, and any
+# non-gRPC access. Workers do NOT use this for inference (see headless service).
 apiVersion: v1
 kind: Service
 metadata:
@@ -161,3 +163,24 @@ spec:
     - name: metrics
       port: 8002
       targetPort: 8002
+---
+# Headless service for gRPC client-side load balancing.
+# ClusterIP: None makes Kubernetes DNS return one A record per ready pod.
+# Workers connect to this with round_robin LB policy so requests are
+# distributed across all replicas at the RPC level (not connection level),
+# and new pods are discovered automatically within ~30s of becoming Ready.
+apiVersion: v1
+kind: Service
+metadata:
+  name: triton-trt-headless
+  namespace: nlp-audio-understanding
+  labels:
+    app: triton-trt
+spec:
+  selector:
+    app: triton-trt
+  clusterIP: None
+  ports:
+    - name: grpc
+      port: 8001
+      targetPort: 8001

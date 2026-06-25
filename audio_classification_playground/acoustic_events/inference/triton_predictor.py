@@ -19,8 +19,16 @@ is thread-safe), which hides the round-trip latency and lets a single worker
 drive far more windows/s. Combined with the runner overlapping the three model
 tasks, one CPU worker fills much more of the GPU than before.
 
+LOAD BALANCING: pass the headless service name (triton-trt-headless.*) rather
+than the ClusterIP service. The ``dns:///`` scheme + ``round_robin`` policy make
+gRPC resolve all pod A records and distribute requests across them at the RPC
+level. DNS is re-resolved every ~30 s, so new replicas are picked up
+automatically without restarting workers. With a plain ClusterIP URL, kube-proxy
+picks one pod per TCP connection and all requests from a worker go to that pod
+forever — new replicas are invisible.
+
 Usage (set via --triton-url flag on the orchestration worker):
-    triton_url = "triton-inference.nlp-audio-understanding:8001"  # gRPC
+    triton_url = "dns:///triton-trt-headless.nlp-audio-understanding:8001"
 """
 from __future__ import annotations
 
@@ -46,6 +54,13 @@ def _get_client(url: str):
             "Install with: pip install tritonclient[grpc]"
         ) from e
     return grpcclient
+
+
+# gRPC channel options for client-side round-robin load balancing.
+# Requires the headless service (dns:///triton-trt-headless.*) so DNS returns
+# one A record per pod. With a ClusterIP URL this has no effect — only one IP
+# is returned and round_robin degenerates to pick_first.
+_ROUND_ROBIN_CHANNEL_ARGS = [("grpc.lb_policy_name", "round_robin")]
 
 
 def _run_pipeline(infer_chunk, chunks: list[np.ndarray]) -> list:
@@ -77,7 +92,7 @@ class TritonAffectPredictor:
 
     def __init__(self, url: str) -> None:
         grpcclient = _get_client(url)
-        self._client = grpcclient.InferenceServerClient(url=url)
+        self._client = grpcclient.InferenceServerClient(url=url, channel_args=_ROUND_ROBIN_CHANNEL_ARGS)
 
     def _infer_chunk(self, chunk: np.ndarray):
         import tritonclient.grpc as grpcclient
@@ -118,7 +133,7 @@ class TritonDisfluencyPredictor:
 
     def __init__(self, url: str) -> None:
         grpcclient = _get_client(url)
-        self._client = grpcclient.InferenceServerClient(url=url)
+        self._client = grpcclient.InferenceServerClient(url=url, channel_args=_ROUND_ROBIN_CHANNEL_ARGS)
 
     def _infer_chunk(self, chunk: np.ndarray):
         import tritonclient.grpc as grpcclient
@@ -163,7 +178,7 @@ class TritonEmotionPredictor:
 
     def __init__(self, url: str) -> None:
         grpcclient = _get_client(url)
-        self._client = grpcclient.InferenceServerClient(url=url)
+        self._client = grpcclient.InferenceServerClient(url=url, channel_args=_ROUND_ROBIN_CHANNEL_ARGS)
 
     def _infer_chunk(self, chunk: np.ndarray):
         import tritonclient.grpc as grpcclient
