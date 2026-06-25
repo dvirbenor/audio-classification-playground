@@ -76,6 +76,7 @@ from .progress import (
     incomplete_tasks_by_artifact,
     is_task_artifact_complete_for_archive,
     is_task_complete_for_config,
+    load_completed_archive_set,
     load_worklist,
     record_archive_complete,
 )
@@ -625,6 +626,10 @@ def run_worker(
         output_base,
         task_group=None if group.name == TASK_GROUP_ALL else group.name,
     )
+    completed_archives: set[tuple[str, str]] = load_completed_archive_set(
+        output_base,
+        required_tasks=group.tasks,
+    )
 
     expected_wavlm_preset = (
         None if wavlm_settings.preset == "custom" else wavlm_settings.preset
@@ -849,6 +854,11 @@ def run_worker(
             entity_key = (sid, aid)
 
             if entity_key in permanent_errors:
+                skipped += 1
+                continue
+
+            # Fast in-memory skip: all required tasks already completed.
+            if entity_key in completed_archives:
                 skipped += 1
                 continue
 
@@ -1139,6 +1149,7 @@ def run_worker(
                     output_base, sid, aid, tasks_to_run, worker_id,
                     datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                 )
+                completed_archives.add(entity_key)
                 processed += 1
                 if processed % 50 == 0:
                     LOGGER.info(

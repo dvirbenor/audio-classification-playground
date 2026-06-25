@@ -127,6 +127,9 @@ def append_inference_error(
     directory = output_base / INFERENCE_ERRORS_DIR
     if task_group and task_group != "all":
         directory = directory / task_group
+    # Write under a per-archive subdirectory so count_inference_attempts_for
+    # can glob just one small directory instead of scanning all error files.
+    directory = directory / session_id / archive_id
     path = _write_error_json(directory, payload)
     LOGGER.info(
         "Inference error [%s]: %s/%s — %s",
@@ -234,10 +237,36 @@ def count_inference_attempts_for(
 
     Re-reads the error directory to avoid stale in-memory caches across
     pods.  Called after an archive is claimed (lock held).
+
+    New errors are written under a per-archive subdirectory
+    (``{task_group}/{session_id}/{archive_id}/``), so this function globs
+    just that small directory — O(errors_per_archive) instead of O(N_total).
+    Legacy flat files (written before per-archive subdirs were adopted)
+    are handled by the fallback rglob path.
     """
     errors_dir = output_base / INFERENCE_ERRORS_DIR
     if not errors_dir.is_dir():
         return 0
+
+    # Fast path: per-archive subdirectory (new layout).
+    if task_group is None or task_group == "all":
+        per_archive_dir = errors_dir / session_id / archive_id
+    else:
+        per_archive_dir = errors_dir / task_group / session_id / archive_id
+
+    if per_archive_dir.is_dir():
+        count = 0
+        for f in per_archive_dir.glob("*.json"):
+            try:
+                data = json.loads(f.read_text(encoding="utf-8"))
+                if data.get("is_deterministic", False):
+                    return 9999
+                count += 1
+            except (OSError, json.JSONDecodeError):
+                continue
+        return count
+
+    # Legacy fallback: flat directory written before per-archive layout.
     count = 0
     if task_group is None:
         files = errors_dir.rglob("*.json")

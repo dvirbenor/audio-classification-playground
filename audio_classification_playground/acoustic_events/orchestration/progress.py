@@ -180,6 +180,52 @@ def build_worklist(
     return len(needing)
 
 
+def load_completed_archive_set(
+    output_base: Path,
+    *,
+    required_tasks: tuple[str, ...] | None = None,
+) -> set[tuple[str, str]]:
+    """Return ``{(session_id, archive_id)}`` for archives with all required tasks.
+
+    Reads per-worker completion JSONL logs rather than stat-checking every
+    artifact directory on EFS.  Used at worker startup to build an in-memory
+    skip-set so ``_fill_claimed_queue`` can bypass the per-archive manifest
+    reads for archives already fully processed in earlier runs.
+
+    When ``required_tasks`` is given, only archives whose union of completed
+    task sets covers *all* required tasks are included.
+    """
+    completions_dir = output_base / COMPLETIONS_DIR
+    if not completions_dir.is_dir():
+        return set()
+
+    tasks_by_archive: dict[tuple[str, str], set] = {}
+    for jsonl_file in completions_dir.glob("*.jsonl"):
+        try:
+            for line in jsonl_file.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                data = json.loads(line)
+                key = (data["session_id"], data["archive_id"])
+                tasks_by_archive.setdefault(key, set()).update(data.get("tasks", []))
+        except (OSError, json.JSONDecodeError, KeyError):
+            continue
+
+    if required_tasks is None:
+        result = set(tasks_by_archive.keys())
+    else:
+        required = set(required_tasks)
+        result = {k for k, tasks in tasks_by_archive.items() if required.issubset(tasks)}
+
+    LOGGER.info(
+        "Loaded %d completed archives from completion logs (%d with any tasks)",
+        len(result),
+        len(tasks_by_archive),
+    )
+    return result
+
+
 def record_archive_complete(
     output_base: Path,
     session_id: str,
