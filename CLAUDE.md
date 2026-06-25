@@ -49,6 +49,21 @@ This project uses **`uv`** (not pip/poetry). A frozen `uv.lock` is committed. Th
 
 When running on a pod, `source env.shared.sh` first so all frameworks resolve weights from the shared EFS model cache (`HF_HOME`, `MODELSCOPE_CACHE`, `TORCH_HOME`).
 
+### Interactive Kubernetes Access
+
+There are usually idle pods running in the **`arno-dev` namespace** with EFS mounted. These are useful for quick interactive experiments, debugging, or running inference without launching a full job. The repository is checked out at `/efs/arno/audio-classification-playground` on those pods.
+
+To exec into one:
+
+```
+kubectl -n arno-dev get pods          # find a running pod
+kubectl -n arno-dev exec -it <pod> -- bash
+cd /efs/arno/audio-classification-playground
+source env.shared.sh
+```
+
+Because the repo on EFS is shared across pods, changes made there are immediately visible to all of them — be careful about running concurrent writes or modifying code that another pod is actively using.
+
 ### Launching Cloud Jobs (`experiment-launcher`)
 
 The `manifests/*.yaml` specs are launched onto the k8s fleet with the Riverside `experiment-launcher` CLI (not `kubectl apply`). Usage:

@@ -19,6 +19,7 @@ Usage:
     uv run python -m scripts.restore_glacier --csv wav_glacier_keys.csv
     uv run python -m scripts.restore_glacier --csv wav_glacier_keys.csv --status   # poll readiness
     uv run python -m scripts.restore_glacier --csv wav_glacier_keys.csv --dry-run
+    uv run python -m scripts.restore_glacier --csv wav_glacier_keys.csv
 """
 
 from __future__ import annotations
@@ -209,9 +210,15 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     s3 = _s3_client(args.workers)
+    print(
+        f"submitting {len(pending)} restore requests  "
+        f"(workers={args.workers}, tier={args.tier}, days={args.days})",
+        file=sys.stderr,
+    )
     counts: dict[str, int] = {}
     lock = threading.Lock()
     processed = 0
+    interval = max(100, min(500, len(pending) // 20))
     with ThreadPoolExecutor(max_workers=args.workers) as ex:
         futs = {ex.submit(restore_one, s3, k, args.bucket, args.days, args.tier): k for k in pending}
         for fut in as_completed(futs):
@@ -223,8 +230,9 @@ def main(argv: list[str] | None = None) -> int:
                 if not status.startswith("error"):
                     done.add(key)
                 processed += 1
-                if processed % 500 == 0:
-                    print(f"  processed {processed}/{len(pending)}", file=sys.stderr)
+                if processed % interval == 0:
+                    summary = "  ".join(f"{k}={v}" for k, v in sorted(counts.items()))
+                    print(f"  {processed}/{len(pending)}  {summary}", file=sys.stderr)
                     _save_state(state_path, done)
             if status.startswith("error"):
                 print(f"  {status}  {key}", file=sys.stderr)
