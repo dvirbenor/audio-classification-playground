@@ -114,14 +114,27 @@ class SharedAudioCache:
         self.bucket = bucket
         self.poll_sec = float(poll_sec)
         self.s3_max_pool_connections = int(s3_max_pool_connections)
-        # TTL cache for the expensive rglob-based byte count.  With dozens of
-        # workers × dozens of prefetch threads all calling _current_cache_bytes()
-        # simultaneously, re-scanning on every call hammers EFS and takes minutes
-        # per call under load.  Re-scan at most once per minute per worker.
+        # Non-blocking byte-count cache.  rglob over a full cache takes 30+ minutes;
+        # running it in-band blocks all 24 prefetch threads per pod indefinitely.
+        #
+        # Strategy: start pessimistic (assume cache is full) and run a background
+        # scan that corrects the value downward if the cache actually has space.
+        # The _load_ready_object fast path (cache hit) is unaffected — it never
+        # calls _current_cache_bytes.  Once we confirm >= max_cache_bytes we stop
+        # scanning entirely (cache only grows — no eviction).
         self._bytes_cache_lock = threading.Lock()
-        self._bytes_cache_ts: float = -1e9
-        self._bytes_cached: int = 0
+        # Pessimistic initial value: assumes cache is full until the background
+        # scan completes.  This prevents all 24 prefetch threads from piling into
+        # _try_reserve (EFS capacity lock + rglob) on a fresh worker start.
+        self._bytes_cached: int = int(max_cache_bytes)
+        self._bytes_cache_ts: float = time.monotonic()
         self._bytes_cache_ttl: float = 60.0
+        self._bytes_scan_running: bool = True
+        threading.Thread(
+            target=self._run_bytes_scan,
+            daemon=True,
+            name="audio-cache-bytes-scan",
+        ).start()
 
     def get_decoded_audio(
         self,
@@ -881,6 +894,11 @@ class SharedAudioCache:
             tmp_object.unlink(missing_ok=True)
 
     def _try_reserve(self, object_key: str, decoded_bytes: int) -> bool:
+        # Fast-path: use the in-memory cached byte count to skip the EFS lock
+        # entirely when capacity is already exhausted.  This avoids serialising
+        # all prefetch threads on the EFS capacity lock + a blocking rglob.
+        if self._current_cache_bytes() + int(decoded_bytes) > self.max_cache_bytes:
+            return False
         reservation_path = self._reservation_path(object_key)
         capacity_lock = self._capacity_lock_path()
         self._wait_and_acquire_lock(capacity_lock, payload={
@@ -888,7 +906,9 @@ class SharedAudioCache:
             "created_at": time.time(),
         })
         try:
-            current = self._ready_object_bytes() + self._reservation_bytes()
+            # Re-check with the current cached value under the EFS lock to catch
+            # concurrent reservations since the fast-path check above.
+            current = self._current_cache_bytes()
             if current + int(decoded_bytes) > self.max_cache_bytes:
                 return False
             self._write_json_atomic(reservation_path, {
@@ -904,16 +924,33 @@ class SharedAudioCache:
         self._reservation_path(object_key).unlink(missing_ok=True)
 
     def _current_cache_bytes(self) -> int:
-        # Serialise under the lock so at most one thread runs the expensive
-        # rglob at a time; all concurrent callers share the cached result.
         with self._bytes_cache_lock:
+            # Cache only grows (no eviction). Once full, skip all future scans.
+            if self._bytes_cached >= self.max_cache_bytes:
+                return self._bytes_cached
             now = time.monotonic()
             if now - self._bytes_cache_ts < self._bytes_cache_ttl:
                 return self._bytes_cached
-            val = self._ready_object_bytes() + self._reservation_bytes()
+            if self._bytes_scan_running:
+                # Background scan in progress; return stale value without blocking.
+                return self._bytes_cached
+            # Schedule async scan and return the stale value immediately.
+            # rglob over a full EFS cache can take 30+ minutes — never block callers.
+            self._bytes_scan_running = True
+            self._bytes_cache_ts = now  # Prevent re-triggering before scan completes.
+        threading.Thread(
+            target=self._run_bytes_scan,
+            daemon=True,
+            name="audio-cache-bytes-scan",
+        ).start()
+        return self._bytes_cached
+
+    def _run_bytes_scan(self) -> None:
+        val = self._ready_object_bytes() + self._reservation_bytes()
+        with self._bytes_cache_lock:
             self._bytes_cached = val
-            self._bytes_cache_ts = now
-            return val
+            self._bytes_scan_running = False
+            self._bytes_cache_ts = time.monotonic()
 
     def _ready_object_bytes(self) -> int:
         total = 0
