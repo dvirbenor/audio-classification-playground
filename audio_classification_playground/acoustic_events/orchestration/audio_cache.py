@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import tempfile
+import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -113,6 +114,14 @@ class SharedAudioCache:
         self.bucket = bucket
         self.poll_sec = float(poll_sec)
         self.s3_max_pool_connections = int(s3_max_pool_connections)
+        # TTL cache for the expensive rglob-based byte count.  With dozens of
+        # workers × dozens of prefetch threads all calling _current_cache_bytes()
+        # simultaneously, re-scanning on every call hammers EFS and takes minutes
+        # per call under load.  Re-scan at most once per minute per worker.
+        self._bytes_cache_lock = threading.Lock()
+        self._bytes_cache_ts: float = -1e9
+        self._bytes_cached: int = 0
+        self._bytes_cache_ttl: float = 60.0
 
     def get_decoded_audio(
         self,
@@ -895,7 +904,16 @@ class SharedAudioCache:
         self._reservation_path(object_key).unlink(missing_ok=True)
 
     def _current_cache_bytes(self) -> int:
-        return self._ready_object_bytes() + self._reservation_bytes()
+        # Serialise under the lock so at most one thread runs the expensive
+        # rglob at a time; all concurrent callers share the cached result.
+        with self._bytes_cache_lock:
+            now = time.monotonic()
+            if now - self._bytes_cache_ts < self._bytes_cache_ttl:
+                return self._bytes_cached
+            val = self._ready_object_bytes() + self._reservation_bytes()
+            self._bytes_cached = val
+            self._bytes_cache_ts = now
+            return val
 
     def _ready_object_bytes(self) -> int:
         total = 0
