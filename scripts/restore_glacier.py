@@ -19,7 +19,6 @@ Usage:
     uv run python -m scripts.restore_glacier --csv wav_glacier_keys.csv
     uv run python -m scripts.restore_glacier --csv wav_glacier_keys.csv --status   # poll readiness
     uv run python -m scripts.restore_glacier --csv wav_glacier_keys.csv --dry-run
-    uv run python -m scripts.restore_glacier --csv wav_glacier_keys.csv
 """
 
 from __future__ import annotations
