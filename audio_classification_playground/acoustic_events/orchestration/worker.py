@@ -439,6 +439,7 @@ def run_worker(
     shard_index: int = 0,
     shard_count: int = 1,
     triton_url: str | None = None,
+    preserve_worklist_order: bool = False,
 ) -> None:
     """Entry point for a single worker pod.
 
@@ -755,6 +756,8 @@ def run_worker(
         rng = random.Random(seed)
         rng.shuffle(entities)
         LOGGER.info("Entity ordering: shuffled (seed=%d)", seed)
+    elif preserve_worklist_order and worklist_path and Path(worklist_path).exists():
+        LOGGER.info("Entity ordering: preserved from worklist (--preserve-worklist-order)")
     else:
         entities = sort_manifest_by_session(entities)
         LOGGER.info("Entity ordering: session-grouped sort (date, session_id)")

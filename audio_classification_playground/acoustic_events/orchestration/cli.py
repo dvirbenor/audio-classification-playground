@@ -118,6 +118,7 @@ def _cmd_run(args: argparse.Namespace) -> None:
         shard_index=args.shard_index,
         shard_count=args.shard_count,
         triton_url=args.triton_url,
+        preserve_worklist_order=args.preserve_worklist_order,
     )
 
 
@@ -136,6 +137,7 @@ def _cmd_build_worklist(args: argparse.Namespace) -> None:
     n = build_worklist(
         output, entities, required_tasks=group.tasks,
         require_vad=require_vad, permanent_errors=perm, out_path=out_path,
+        prioritize_partial_sessions=not args.no_prioritize_partial,
     )
     print(f"worklist: {n} entities need work -> {out_path}")
 
@@ -658,6 +660,12 @@ def main(argv: list[str] | None = None) -> None:
         "--shard-count", type=int, default=1,
         help="Total shards = the Indexed Job's completions/parallelism.",
     )
+    p_run.add_argument(
+        "--preserve-worklist-order", action="store_true",
+        help="Skip the default session-grouped re-sort and process entities in "
+             "the order written by build-worklist (e.g. partial-sessions-first). "
+             "Only effective when --worklist is also provided.",
+    )
 
     # --- build-worklist ---
     p_wl = sub.add_parser(
@@ -671,6 +679,12 @@ def main(argv: list[str] | None = None) -> None:
     p_wl.add_argument(
         "--out", default=None,
         help="Worklist output path (default: <output>/_meta/needs_work.txt)",
+    )
+    p_wl.add_argument(
+        "--no-prioritize-partial", action="store_true",
+        help="Disable partial-sessions-first ordering (default: partial sessions "
+             "with fewest remaining archives are written first so the fleet "
+             "completes sessions before starting new ones).",
     )
 
     # --- progress ---

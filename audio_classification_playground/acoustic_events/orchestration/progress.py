@@ -156,15 +156,49 @@ def build_worklist(
     require_vad: bool = False,
     permanent_errors: set | None = None,
     out_path: Path | None = None,
+    prioritize_partial_sessions: bool = True,
 ) -> int:
     """Run the EFS pre-scan ONCE and persist the (session, archive) keys still
     needing work, so a sharded worker fleet can read a ready-made list instead of
     every pod re-scanning EFS. Returns the number of entities written.
+
+    When prioritize_partial_sessions=True (default), sessions with some archives
+    already done are sorted before untouched sessions, and within partial sessions
+    those closest to completion (fewest remaining) come first. This maximises the
+    rate at which the session_store can emit complete sessions.
+    Pass --preserve-worklist-order to `orchestration run` so workers honour this
+    ordering instead of re-sorting by (date, session_id).
     """
     needing = filter_entities_needing_work(
         output_base, entities, required_tasks,
         require_vad=require_vad, permanent_errors=permanent_errors,
     )
+
+    if prioritize_partial_sessions and needing:
+        # remaining per session in the needing-work list
+        session_remaining: dict[str, int] = {}
+        for e in needing:
+            session_remaining[e.session_id] = session_remaining.get(e.session_id, 0) + 1
+        # total per session across the full manifest
+        session_total: dict[str, int] = {}
+        for e in entities:
+            session_total[e.session_id] = session_total.get(e.session_id, 0) + 1
+
+        def _sort_key(e):
+            remaining = session_remaining[e.session_id]
+            total = session_total.get(e.session_id, remaining)
+            is_partial = remaining < total
+            # partial first (0), then fewest-remaining-first within partial,
+            # then total-count-ascending for untouched, stable by ids.
+            return (0 if is_partial else 1, remaining, e.session_id, e.archive_id)
+
+        needing = sorted(needing, key=_sort_key)
+        partial = sum(1 for e in needing if session_remaining[e.session_id] < session_total.get(e.session_id, session_remaining[e.session_id] + 1))
+        LOGGER.info(
+            "Worklist sorted: %d partial-session archives first, %d untouched",
+            partial, len(needing) - partial,
+        )
+
     out_path = Path(out_path) if out_path is not None else output_base / _WORKLIST_DEFAULT
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(prefix=f".{out_path.name}.", suffix=".tmp", dir=str(out_path.parent))

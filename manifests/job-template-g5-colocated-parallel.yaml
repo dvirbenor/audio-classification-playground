@@ -1,0 +1,80 @@
+# Job template for g5.8xlarge MPS-colocated inference as a SINGLE multi-pod Job.
+#
+# Use this instead of job-template-with-github-ssh.yaml when you want ONE Job
+# that runs N pods rather than N separate Jobs. The launcher deep-copies the
+# template without touching parallelism/completions, so they pass through.
+#
+# Workers are interchangeable: they claim archives via per-task file locks and
+# loop until no work remains. No run_id-based sharding — N pods under one Job
+# behave exactly like N single-pod Jobs, minus N-1 Job objects to track.
+# backoffLimit is high: a spot-interruption killing several pods must not end
+# the whole Job.
+#
+# POD COUNT = parallelism/completions below. Each pod occupies one A10G GPU
+# (g5.8xlarge). Tune to available GPU budget — start with 5, monitor throughput.
+#
+# Launch:
+#   experiment-launcher launch manifests/acoustic-events-g5-colocated.yaml \
+#       --template ./manifests/job-template-g5-colocated-parallel.yaml
+#
+# Keep the manifest's grid: at a single entry (run_id: [1]) when using this
+# template; pod count is controlled by parallelism/completions here.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: template-job
+  namespace: default
+spec:
+  parallelism: 5
+  completions: 5
+  backoffLimit: 200
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app: ml-experiment
+    spec:
+      restartPolicy: Never
+      terminationGracePeriodSeconds: 600
+      nodeSelector:
+        karpenter: ai-workers-gpu
+        node.kubernetes.io/instance-type: g5.8xlarge
+        karpenter.sh/capacity-type: on-demand
+      tolerations:
+        - key: karpenter
+          operator: Equal
+          value: ai-workers-gpu
+          effect: NoSchedule
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: experiment-container
+          image: python:3.11-slim
+          imagePullPolicy: IfNotPresent
+          env: []
+          volumeMounts:
+            - name: ai-efs
+              mountPath: /efs
+            - name: shm
+              mountPath: /dev/shm
+            - name: github-ssh
+              mountPath: /mnt/github-ssh
+              readOnly: true
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+              nvidia.com/gpu: "1"
+      volumes:
+        - name: ai-efs
+          persistentVolumeClaim:
+            claimName: ai-efs-pvc
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 200Gi
+        - name: github-ssh
+          secret:
+            secretName: audio-playground-github-ssh
+            defaultMode: 256
