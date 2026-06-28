@@ -1,0 +1,209 @@
+# Self-contained inference on g7e.4xlarge: local Triton sidecar (Blackwell) + 3 CPU workers.
+#
+# Architecture
+# ------------
+# Same localhost-gRPC pattern as acoustic-events-g5-colocated.yaml, but:
+#   - Blackwell B200 GPU (TRT sm_120 engines from paralinguistics-trt/GB202)
+#   - 3 worker processes per pod to keep the much-faster B200 GPU saturated
+#   - 6 pods × 3 workers = 18 total shards (SHARD_COUNT below)
+#
+# Per-pod layout (g7e.4xlarge: 16 vCPU, 128 GB RAM, 1 × B200):
+#
+#   [triton-sidecar]         ~4 CPU  24 Gi  1 B200
+#     tritonserver TRT/GB202 — affect + disfluency + emotion
+#     loaded from s3://riverside-build-assets/paralinguistics-trt/GB202
+#     serves gRPC on localhost:8001, batches across all in-flight worker requests
+#
+#   [experiment-container]  ~10 CPU  64 Gi  no GPU
+#     3 orchestration workers running in parallel (background + wait)
+#     each: --device cpu --triton-url localhost:8001 --prefetch-workers 8 --prefetch-lookahead 16
+#     combined 24 prefetch threads keep a deep concurrent gRPC queue into Triton
+#
+# Shard scheme
+# ------------
+# 6 pods (JOB_COMPLETION_INDEX 0-5) × 3 workers each = 18 shards total.
+# Pod P spawns workers with shard indices P*3, P*3+1, P*3+2.
+# SHARD_COUNT=18 MUST equal parallelism*3 in job-template-g7e-triton-local-parallel.yaml.
+#
+# PREREQUISITES:
+#   - VAD already computed; worker gates on --require-precomputed-vad.
+#   - Pre-built worklist at $OUTPUT/_meta/needs_work.txt.
+#     Rebuild before launching (excludes already-completed archives):
+#       python -m audio_classification_playground.acoustic_events.orchestration \
+#           build-worklist --output $OUTPUT --parquet $PARQUET
+#
+# Launch:
+#   experiment-launcher launch manifests/acoustic-events-g7e-colocated.yaml \
+#       --template ./manifests/job-template-g7e-triton-local-parallel.yaml
+#
+# Keep grid.run_id at [1] — pod count is parallelism/completions in the template.
+config:
+  namespace: nlp-audio-understanding
+  team: nlp
+  project: audio-understanding
+  # CPU image — workers run --device cpu, all GPU work goes to the Triton sidecar.
+  # Nodepool routing is handled via explicit tolerations on the experiment (below),
+  # not via image name (experiment-launcher misses g7e as a GPU family otherwise).
+  image: 690765672468.dkr.ecr.us-east-1.amazonaws.com/ml-dev-containers:cpu-1.0.6
+  capacityType: on-demand
+  env:
+    CLEARML_WEB_HOST: http://clearml-webserver.clearml:8080
+    CLEARML_API_HOST: http://clearml-apiserver.clearml:8008
+    CLEARML_FILES_HOST: https://clearml-fileserver.ai-dev.riverside.fm
+    RS_OWNER: dvirbenor
+  ebs:
+    enabled: false
+  s3Access:
+    enabled: true
+
+experiments:
+  - name: g7e-triton-local-models
+    category: inference
+    description: >
+      3 CPU workers + co-located Triton sidecar (TRT Blackwell/GB202) on g7e.4xlarge.
+      Workers send gRPC to localhost:8001 — no cross-node network.
+      Task-group "models" (affect + disfluency + emotion), gated on precomputed VAD.
+      6 pods × 3 workers = 18 shards.
+    # Explicit tolerations so experiment-launcher uses them verbatim (bypasses
+    # auto-detection, which misses g7e as a GPU family). The karpenter toleration
+    # value also controls which nodePool label is set in the pod's nodeSelector.
+    tolerations:
+      - key: karpenter
+        operator: Equal
+        value: ai-workers-gpu
+        effect: NoSchedule
+      - key: karpenter
+        operator: Equal
+        value: ai-workers-gpu-efa
+        effect: NoSchedule
+      - key: efa
+        operator: Equal
+        value: "true"
+        effect: NoSchedule
+      - key: nvidia.com/gpu
+        operator: Exists
+        effect: NoSchedule
+    resources:
+      requests:
+        # Worker container (holds all 3 worker processes). Triton sidecar (~4 CPU, 24 Gi, 1 B200)
+        # is declared in job-template-g7e-triton-local-parallel.yaml.
+        cpu: "10"
+        memory: "64Gi"
+      limits:
+        cpu: "14"
+        memory: "96Gi"
+    cmd: /bin/bash
+    args:
+      - -lc
+      - |
+        set -euo pipefail
+
+        export RUN_ID="{run_id}"
+        export PYTHONUNBUFFERED=1
+        export UV_LINK_MODE=copy
+
+        export PARQUET="/efs/dvir/data/magic-clips-research/dataset-reference/all_archives.parquet"
+        export OUTPUT="/efs/dvir/data/magic-clips-research/acoustic-understanding/models-inference"
+        export AUDIO_CACHE="${OUTPUT}/_meta/audio_cache"
+        export CACHE_BYTES=536870912000
+
+        # SHARD_COUNT = parallelism (6) × workers_per_pod (3).
+        # MUST match parallelism/completions in job-template-g7e-triton-local-parallel.yaml × 3.
+        export SHARD_COUNT=18
+        export WORKERS_PER_POD=3
+        export TRITON_URL="localhost:8001"
+
+        POD_INDEX="${JOB_COMPLETION_INDEX:-0}"
+
+        LOG_DIR="${OUTPUT}/job-logs"
+        mkdir -p "$LOG_DIR"
+        POD_LOG="$LOG_DIR/g7e-triton-local-${RUN_ID}-${HOSTNAME:-unknown}.log"
+        exec > >(tee -a "$POD_LOG") 2>&1
+
+        echo "[$(date -Iseconds)] Starting g7e-triton-local run ${RUN_ID} on ${HOSTNAME:-unknown} (pod ${POD_INDEX})"
+
+        mkdir -p /tmp/workspace/.ssh
+        cp /mnt/github-ssh/id_ed25519 /tmp/workspace/.ssh/id_ed25519
+        cp /mnt/github-ssh/known_hosts /tmp/workspace/.ssh/known_hosts
+        chmod 700 /tmp/workspace/.ssh
+        chmod 400 /tmp/workspace/.ssh/id_ed25519
+        chmod 444 /tmp/workspace/.ssh/known_hosts
+        export GIT_SSH_COMMAND="ssh -i /tmp/workspace/.ssh/id_ed25519 -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=/tmp/workspace/.ssh/known_hosts"
+
+        cd /tmp/workspace
+        rm -rf audio-classification-playground
+        git clone --branch feature/inference-optimization --single-branch \
+            git@github.com:dvirbenor/audio-classification-playground.git
+        cd audio-classification-playground
+        echo "Git commit: $(git rev-parse HEAD)"
+        uv sync --frozen
+        source .venv/bin/activate
+
+        # Wait for the Triton sidecar to finish loading Blackwell TRT models from S3.
+        # TRT engine loading on B200 typically 60-180s; allow up to 300s.
+        echo "[$(date -Iseconds)] Waiting for Triton sidecar at ${TRITON_URL} …"
+        for i in $(seq 1 30); do
+          if curl -sf "http://localhost:8000/v2/health/ready" >/dev/null 2>&1; then
+            echo "[$(date -Iseconds)] Triton ready (attempt ${i})"
+            break
+          fi
+          [ "$i" -eq 30 ] && { echo "ERROR: Triton not ready after 300s"; exit 1; }
+          sleep 10
+        done
+
+        # Confirm models loaded correctly and report their names.
+        python - <<'PYEOF'
+        import tritonclient.grpc as grpcclient, os, sys
+        url = os.environ["TRITON_URL"]
+        try:
+            c = grpcclient.InferenceServerClient(url=url, verbose=False)
+            models = [m.name for m in c.get_model_repository_index().models]
+            print(f"Triton ready at {url}. Models: {models}")
+        except Exception as e:
+            print(f"ERROR: cannot reach Triton at {url}: {e}", file=sys.stderr)
+            sys.exit(1)
+        PYEOF
+
+        # Launch 3 workers in parallel, each claiming a disjoint worklist shard.
+        # Shard indices: pod P → P*3+0, P*3+1, P*3+2.
+        # Each worker gets 8 prefetch threads (24 total per pod) and 16-archive lookahead
+        # (48 total in-flight) to keep the Blackwell GPU's Triton batcher well-fed.
+        PIDS=()
+        for WORKER_OFFSET in 0 1 2; do
+          SHARD_INDEX=$(( POD_INDEX * WORKERS_PER_POD + WORKER_OFFSET ))
+          WORKER_LOG="$LOG_DIR/g7e-triton-local-${RUN_ID}-${HOSTNAME:-unknown}-shard${SHARD_INDEX}.log"
+          echo "[$(date -Iseconds)] Launching worker shard ${SHARD_INDEX}/${SHARD_COUNT} → ${WORKER_LOG}"
+
+          python -m audio_classification_playground.acoustic_events.orchestration run \
+            --parquet "$PARQUET" \
+            --output "$OUTPUT" \
+            --task-group models \
+            --affect-backbone wavlm \
+            --disfluency-backbone wavlm \
+            --completion-policy exists \
+            --device cpu \
+            --triton-url "$TRITON_URL" \
+            --hop-sec 0.5 \
+            --vad-gating \
+            --require-precomputed-vad \
+            --worklist "$OUTPUT/_meta/needs_work.txt" \
+            --shard-index "$SHARD_INDEX" \
+            --shard-count "$SHARD_COUNT" \
+            --prefetch-workers 8 \
+            --prefetch-lookahead 16 \
+            --preserve-worklist-order \
+            --max-retries 3 \
+            --audio-cache-dir "$AUDIO_CACHE" \
+            --max-cache-bytes "$CACHE_BYTES" \
+            >> "$WORKER_LOG" 2>&1 &
+
+          PIDS+=($!)
+        done
+
+        echo "[$(date -Iseconds)] All 3 workers launched (shards $((POD_INDEX*WORKERS_PER_POD))-$((POD_INDEX*WORKERS_PER_POD+2))). Waiting …"
+        wait "${PIDS[@]}"
+        echo "[$(date -Iseconds)] All workers finished — pod ${POD_INDEX} done."
+
+    # Single entry — pod count is parallelism/completions in the template.
+    grid:
+      run_id: [1]
